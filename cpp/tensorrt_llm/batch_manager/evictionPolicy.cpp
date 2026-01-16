@@ -137,6 +137,16 @@ bool LRUEvictionPolicy::verifyQueueIntegrity() const
     return !queueCompromised;
 }
 
+bool LRUEvictionPolicy::isBlockFree(BlockPtr const& block) const
+{
+    auto const id = block->getBlockId();
+    if (!mFreeBlockIterators.contains(id))
+    {
+        return false;
+    }
+    return mFreeBlockIterators[id] != std::nullopt;
+}
+
 std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
     SizeType32 const level = wantPlaceholder ? kPlaceholderLevel : cacheLevel;

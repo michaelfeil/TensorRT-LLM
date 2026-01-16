@@ -55,6 +55,9 @@ public:
     virtual void refresh() = 0;
 
     virtual bool verifyQueueIntegrity() const = 0;
+
+    /// @brief Check if a block is currently in a free queue
+    virtual bool isBlockFree(BlockPtr const& block) const = 0;
 };
 
 struct ExpiringBlockComparator
@@ -97,6 +100,8 @@ public:
 
     bool verifyQueueIntegrity() const override;
 
+    bool isBlockFree(BlockPtr const& block) const override;
+
 private:
     /// @brief A fixed-size container supporting both non-negative and negative indexing.
     ///        Non-negative IDs index directly into positive.
@@ -107,7 +112,27 @@ private:
         std::vector<T> positive;
         std::vector<T> negative;
 
+        [[nodiscard]] bool contains(KVCacheBlock::IdType id) const
+        {
+            if (id >= 0)
+            {
+                return static_cast<size_t>(id) < positive.size();
+            }
+            if (id == KVCacheBlock::kPlaceholderBlockId)
+            {
+                return false;
+            }
+            return static_cast<size_t>(-id) < negative.size();
+        }
+
         T& operator[](KVCacheBlock::IdType id)
+        {
+            TLLM_CHECK_WITH_INFO(id != KVCacheBlock::kPlaceholderBlockId,
+                "SWA sentinel placeholders are not part of the indexed free queues");
+            return id >= 0 ? positive[id] : negative[-id];
+        }
+
+        T const& operator[](KVCacheBlock::IdType id) const
         {
             TLLM_CHECK_WITH_INFO(id != KVCacheBlock::kPlaceholderBlockId,
                 "SWA sentinel placeholders are not part of the indexed free queues");

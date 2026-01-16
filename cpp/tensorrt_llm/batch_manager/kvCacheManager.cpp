@@ -2950,7 +2950,15 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
             block->decRefCount();
             if (!block->hasRefs())
             {
-                mEvictionPolicy->releaseBlock(block);
+                if (mEvictionPolicy->isBlockFree(block))
+                {
+                    TLLM_LOG_WARNING("%s::unpinBlocksById - Block %d already free, skipping release",
+                        mLogPrefix.c_str(), block->getBlockId());
+                }
+                else
+                {
+                    mEvictionPolicy->releaseBlock(block);
+                }
             }
         }
     }
@@ -3130,7 +3138,15 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            if (mEvictionPolicy->isBlockFree(block))
+            {
+                TLLM_LOG_WARNING("%s::releaseBlocks - Block %d already free, skipping release", mLogPrefix.c_str(),
+                    block->getBlockId());
+            }
+            else
+            {
+                mEvictionPolicy->releaseBlock(block);
+            }
         }
     }
     // Remove stored block ids in sequence
