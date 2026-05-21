@@ -524,6 +524,9 @@ class RequestBroadcaster:
             new_requests, "py_scheduling_params"
         )
         py_num_logprobs = collect_py_objects_from_requests(new_requests, "py_num_logprobs")
+        py_dynamic_temperature_rules = collect_py_objects_from_requests(
+            new_requests, "py_dynamic_temperature_rules"
+        )
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
@@ -537,6 +540,7 @@ class RequestBroadcaster:
                     py_multimodal_data,
                     py_scheduling_params,
                     py_num_logprobs,
+                    py_dynamic_temperature_rules,
                     py_disaggregated_params,
                     py_lora_path,
                 ],

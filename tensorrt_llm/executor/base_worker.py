@@ -603,6 +603,8 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
+            executor_request.py_dynamic_temperature_rules = getattr(
+                request.sampling_params, "dynamic_temperature_rules", None)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:

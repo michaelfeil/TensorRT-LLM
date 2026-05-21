@@ -644,7 +644,9 @@ class SpecMetadata:
 
         for request in requests:
             sampling_config = request.sampling_config
-            temp_val = _first_or_none(sampling_config.temperature)
+            temp_val = getattr(request, "py_dynamic_temperature_override", None)
+            if temp_val is None:
+                temp_val = _first_or_none(sampling_config.temperature)
             tk_val = _first_or_none(sampling_config.top_k)
             tp_val = _first_or_none(sampling_config.top_p)
 
