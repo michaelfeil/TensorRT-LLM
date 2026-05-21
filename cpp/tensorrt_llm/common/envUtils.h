@@ -36,6 +36,10 @@ std::optional<float> getFloatEnv(char const* name);
 
 bool getBoolEnv(char const* name);
 
+size_t parseMemorySize(std::string const& input);
+
+std::optional<size_t> getMemorySizeEnv(char const* name);
+
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
 

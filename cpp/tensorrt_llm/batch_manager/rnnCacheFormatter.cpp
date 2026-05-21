@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -184,7 +184,8 @@ void RnnCacheFormatter::formatSlotMode(TransferSession& session)
             / targetInfo.mDomainTPSize;
     }
 
-    auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
+    auto sendBufferLease = mRnnCacheTransBufferManager->assignBufferIndexForSendLease();
+    auto cacheBufferId = sendBufferLease.get();
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
     auto& outputBuffers = std::get<0>(allocationResult);
@@ -227,7 +228,7 @@ void RnnCacheFormatter::formatSlotMode(TransferSession& session)
 
     session.setTime(TransferSession::kTimeTransmissions);
 
-    mRnnCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+    sendBufferLease.reset();
     session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(
@@ -351,13 +352,15 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
 
     auto preAssignedRnnId
         = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
+    std::optional<BaseTransBufferManager::BufferLease> recvBufferLease;
     if (preAssignedRnnId.has_value())
     {
         cacheBufferId = static_cast<int>(*preAssignedRnnId);
     }
     else
     {
-        cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+        recvBufferLease.emplace(mRnnCacheTransBufferManager->assignBufferIndexForRecvLease());
+        cacheBufferId = recvBufferLease->get();
     }
 
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
@@ -504,8 +507,11 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
         sourceConvBytesPerLayer, destConfig, selfConfig, selfIdx, bufferManager);
 
     bufferManager.getStream().synchronize();
-
-    if (cacheBufferId.has_value())
+    if (recvBufferLease.has_value())
+    {
+        recvBufferLease->reset();
+    }
+    else if (cacheBufferId.has_value())
     {
         mRnnCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
     }
