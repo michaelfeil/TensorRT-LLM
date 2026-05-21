@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/batch_manager/radixBlockTree.h"
+#include "tensorrt_llm/batch_manager/tpHostOffloadTopology.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -844,12 +845,15 @@ public:
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
         CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
         std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+        bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
         radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        SizeType32 numPlaceholderBlocks = 0);
+        SizeType32 numPlaceholderBlocks = 0,
+        std::optional<TpHostOffloadTopology> tpHostOffloadTopology = std::nullopt,
+        std::optional<int> worldRankOverride = std::nullopt);
 
     ~WindowBlockManager();
 
@@ -1400,6 +1404,14 @@ private:
     bool mEnablePartialReuse;
     // Whether partially matched blocks that are already in use should be copied and reused.
     bool mCopyOnPartialReuse;
+    // Whether replicated host offload is enabled for plain-TP MLA.
+    bool mEnableTpMlaReplicatedHostOffload;
+    // TP ranks participating in replicated host offload.
+    std::set<int> mTpGroupRanks;
+    // Secondary host offload ownership topology for TP replicated mode.
+    std::optional<TpHostOffloadTopology> mTpHostOffloadTopology;
+    // Current world rank or testing override when communicator setup is bypassed.
+    int mWorldRank;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
 
@@ -1449,7 +1461,8 @@ public:
         SizeType32 chunkSize, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnPartialReuse = true,
+        bool copyOnPartialReuse = true, bool enableTpMlaReplicatedHostOffload = false,
+        std::vector<SizeType32> const& tpGroupRanks = {},
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
@@ -2245,7 +2258,8 @@ public:
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true,
+        bool copyOnpartialReuse = true, bool enableTpMlaReplicatedHostOffload = false,
+        std::vector<SizeType32> const& tpGroupRanks = {},
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
@@ -2259,7 +2273,8 @@ public:
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true,
+        bool copyOnpartialReuse = true, bool enableTpMlaReplicatedHostOffload = false,
+        std::vector<SizeType32> const& tpGroupRanks = {},
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
@@ -2273,7 +2288,8 @@ public:
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true,
+        bool copyOnpartialReuse = true, bool enableTpMlaReplicatedHostOffload = false,
+        std::vector<SizeType32> const& tpGroupRanks = {},
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
@@ -2285,6 +2301,7 @@ public:
         std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
         int64_t stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = false,
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
+        bool enableTpMlaReplicatedHostOffload = false, std::vector<SizeType32> const& tpGroupRanks = {},
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,

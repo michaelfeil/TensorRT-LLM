@@ -530,6 +530,22 @@ class KVCacheManager(BaseResourceManager):
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
         logger.info(f"[KVCacheManager] blocks_per_window: {blocks_per_window}")
 
+        enable_tp_mla_replicated_host_offload = (
+            kv_cache_config.enable_tp_mla_replicated_host_offload)
+        if enable_tp_mla_replicated_host_offload:
+            if mapping.enable_attention_dp:
+                raise ValueError(
+                    "enable_tp_mla_replicated_host_offload is only supported with "
+                    "enable_attention_dp=False")
+            if mapping.tp_size <= 1:
+                raise ValueError(
+                    "enable_tp_mla_replicated_host_offload requires tensor_parallel_size > 1"
+                )
+            if kv_cache_type != CacheTypeCpp.SELFKONLY:
+                raise ValueError(
+                    "enable_tp_mla_replicated_host_offload is only supported for MLA models"
+                )
+
         # The Python @dataclass PoolConfiguration is a distinct type from the
         # nanobind C++ PoolConfiguration (Python uses ``head_dim``; C++ uses
         # ``size_per_head``).  Translate at the C++ boundary so nanobind can
@@ -560,6 +576,10 @@ class KVCacheManager(BaseResourceManager):
             kv_cache_config.secondary_offload_min_priority,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
+            'enable_tp_mla_replicated_host_offload':
+            enable_tp_mla_replicated_host_offload,
+            'tp_group_ranks':
+            mapping.tp_group if enable_tp_mla_replicated_host_offload else [],
             'kv_connector_manager': self.kv_connector_manager,
             'enable_indexer_k_cache': enable_indexer_k_cache,
             'indexer_k_cache_quant_block_size':

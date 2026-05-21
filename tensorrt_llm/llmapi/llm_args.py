@@ -3028,6 +3028,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Whether partially matched blocks that are in use can be reused after copying them."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_tp_mla_replicated_host_offload: bool = Field(
+        default=False,
+        description=
+        "Whether to enable replicated host offload for MLA models in plain tensor parallel mode. "
+        "Only supported by the Pytorch backend with the KV cache manager v1.")
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
     max_gpu_total_bytes: NonNegativeInt = Field(
@@ -3138,6 +3144,28 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
         return config
+
+    @model_validator(mode="after")
+    def validate_tp_mla_replicated_host_offload(self):
+        if not self.enable_tp_mla_replicated_host_offload:
+            return self
+
+        if self.enable_partial_reuse:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload does not support "
+                "kv_cache_config.enable_partial_reuse=True")
+
+        if self.use_kv_cache_manager_v2:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload is only supported with "
+                "kv_cache_config.use_kv_cache_manager_v2=False")
+
+        if self.host_cache_size is None or self.host_cache_size <= 0:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload requires "
+                "kv_cache_config.host_cache_size > 0")
+
+        return self
 
     @field_validator('free_gpu_memory_fraction')
     @classmethod
@@ -4150,6 +4178,10 @@ class TrtLlmArgs(BaseLlmArgs):
     @model_validator(mode="after")
     def validate_kv_cache_dtype(self):
         assert self.kv_cache_config.dtype == "auto", "KvCacheConfig.dtype is not supported by the TensorRT backend."
+        if self.kv_cache_config.enable_tp_mla_replicated_host_offload:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload is only supported by the PyTorch backend."
+            )
         return self
 
 

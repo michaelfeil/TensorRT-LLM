@@ -19,6 +19,13 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <unordered_map>
+#include <vector>
+
 namespace tr = tensorrt_llm::runtime;
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
@@ -52,8 +59,10 @@ struct KvCacheTransferStats
 class KVCacheTransferManager
 {
 public:
-    explicit KVCacheTransferManager(
-        tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr);
+    explicit KVCacheTransferManager(tr::BufferManager const& bufferManager,
+        std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr, bool enableTpMlaReplicatedHostOffload = false,
+        std::set<int> tpGroupRanks = {}, std::optional<TpHostOffloadTopology> tpHostOffloadTopology = std::nullopt,
+        int worldRank = 0);
 
     //! \brief Onboard a block to gpu memory.
     void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools,
@@ -83,12 +92,36 @@ public:
 private:
     friend class ::tensorrt_llm::testing::KVCacheTransferManagerTestAccess;
 
+    struct PendingTransferKey
+    {
+        //! getMemoryPoolBlockIndex() is unique within its primary/secondary pool only; primary and
+        //! secondary blocks can share the same numeric index.
+        kernels::KVCacheIndex::UnderlyingType offset;
+        bool isPrimary;
+
+        [[nodiscard]] bool operator==(PendingTransferKey const& other) const
+        {
+            return offset == other.offset && isPrimary == other.isPrimary;
+        }
+    };
+
+    struct PendingTransferKeyHash
+    {
+        [[nodiscard]] std::size_t operator()(PendingTransferKey const& key) const;
+    };
+
+    using PendingTransferMap = std::unordered_map<PendingTransferKey, tr::CudaEvent, PendingTransferKeyHash>;
+
     //! \brief Get pointer to pool specified by cache block.
-    static tr::ITensor::SharedPtr computeBlockPointer(
+    tr::ITensor::SharedPtr computeBlockPointer(
         BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
 
-    //! \brief Get pool-qualified index for pending transfer tracking.
-    [[nodiscard]] static kernels::KVCacheIndex::UnderlyingType getPendingTransferIndex(BlockPtr const& block);
+    [[nodiscard]] static PendingTransferKey computePendingTransferKey(BlockPtr const& block);
+
+    [[nodiscard]] TpHostOffloadBlockMapping blockMappingForSecondaryBlock(BlockPtr const& block) const;
+
+    //! \brief Convert a world rank to its rank index inside the TP communicator used as NCCL root.
+    [[nodiscard]] int tpGroupRankForWorldRank(int worldRank) const;
 
     /*!
      * \brief The key method that copies the src block to the dst block.
@@ -113,14 +146,36 @@ private:
     [[nodiscard]] std::size_t computeBlockTransferBytes(
         std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy) const;
 
+    void broadcastBlock(BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, int rootWorldRank);
+
+    void waitForPendingRead(PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait);
+
+    void waitForPendingWrite(PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait);
+
+    static void waitForPendingTransfer(
+        PendingTransferMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream,
+        bool eraseAfterWait);
+
+    void recordPendingRead(PendingTransferKey const& key, tr::CudaStream const& stream);
+
+    void recordPendingWrite(PendingTransferKey const& key, tr::CudaStream const& stream);
+
+    static void recordPendingTransfer(
+        PendingTransferMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream);
+
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;
     runtime::BufferManager mOffloadManager;
+    std::shared_ptr<tr::CudaStream> mBroadcastStream;
 
-    // Track reads and writes for blocks. Note that it is the pool-qualified memory pool index
-    // that identifies the raw memory blocks involved in I/O, not the block Id.
-    std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
-    std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
+    // Track reads and writes for blocks. The key identifies a raw memory block
+    // by both offset and memory level so primary and secondary blocks do not alias.
+    PendingTransferMap mPendingReads;
+    PendingTransferMap mPendingWrites;
+    bool mEnableTpMlaReplicatedHostOffload;
+    std::set<int> mTpGroupRanks;
+    std::optional<TpHostOffloadTopology> mTpHostOffloadTopology;
+    int mWorldRank;
     // Reference to parent loopback agent
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;

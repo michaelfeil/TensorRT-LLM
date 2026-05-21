@@ -579,6 +579,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     nvinfer1::DataType dtype, SizeType32 sinkBubbleLength, SizeType32 chunkSize, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+    bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     std::optional<BaseAgentConfig> agentConfig, bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize,
     SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
@@ -682,8 +683,9 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             numKvHeadsPerLayer, windowSizePerHead, tokensPerBlock,
             /*isSWA=*/(windowSize < maxSequenceLength) && (windowSize >= 0), allottedPrimaryBlocks,
             allottedSecondaryBlocks, maxNumSequences, stream, cacheType, secondaryOffloadMinPriority, mEventManager,
-            enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager, mLookupTree, mLoopbackAgent,
-            enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
+            enablePartialReuse, copyOnPartialReuse, enableTpMlaReplicatedHostOffload, tpGroupRanks,
+            kvCacheConnectorManager, mLookupTree, mLoopbackAgent, enableIndexerKCache, indexerKCacheQuantBlockSize,
+            indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
             LinearAttentionMetadata::hasLinearCache(windowSize) ? linearAttentionMetadata : std::nullopt,
             numPlaceholderBlocks);
     }
@@ -736,11 +738,13 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
     CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+    bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
     bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
-    SizeType32 numPlaceholderBlocks)
+    SizeType32 numPlaceholderBlocks, std::optional<TpHostOffloadTopology> tpHostOffloadTopology,
+    std::optional<int> worldRankOverride)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -757,7 +761,6 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mCacheType{cacheType}
     , mEventManager(std::move(eventManager))
     , mLoopbackAgent{loopbackAgent}
-    , mTransferManager{std::make_shared<KVCacheTransferManager>(mBufferManager, mLoopbackAgent)}
     , mAllocTotalBlocks{0}
     , mAllocNewBlocks{0}
     , mFullReusedBlocks{0}
@@ -775,6 +778,9 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mTotalInputTokens{0.0}
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
+    , mEnableTpMlaReplicatedHostOffload{enableTpMlaReplicatedHostOffload}
+    , mTpHostOffloadTopology{std::move(tpHostOffloadTopology)}
+    , mWorldRank{worldRankOverride.value_or(0)}
     , mKvCacheConnectorManager{std::move(kvCacheConnectorManager)}
     , mEnableIndexerKCache{enableIndexerKCache}
     , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
@@ -783,6 +789,42 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mLinearAttentionMetadata{std::move(linearAttentionMetadata)}
 {
     TLLM_LOG_DEBUG("Creating WindowBlockManager for windowSize=%d", windowSize);
+    if (mEnableTpMlaReplicatedHostOffload)
+    {
+        TLLM_CHECK_WITH_INFO(!mEnablePartialReuse,
+            "Replicated TP MLA host offload does not support partial reuse. Set enable_partial_reuse to false.");
+        TLLM_CHECK_WITH_INFO(!tpGroupRanks.empty(), "Replicated TP MLA host offload requires explicit TP group ranks.");
+        for (auto const rank : tpGroupRanks)
+        {
+            mTpGroupRanks.insert(static_cast<int>(rank));
+        }
+        TLLM_CHECK_WITH_INFO(mTpGroupRanks.size() > 1, "Replicated TP MLA host offload requires tp_size > 1.");
+        if (!mTpHostOffloadTopology.has_value())
+        {
+            // This path needs COMM_SESSION and NCCL communicator setup, which are compiled only with multi-device.
+#if ENABLE_MULTI_DEVICE
+            mWorldRank = worldRankOverride.value_or(COMM_SESSION.getRank());
+            TLLM_CHECK_WITH_INFO(mTpGroupRanks.count(mWorldRank) == 1,
+                "Rank %d is not a member of the TP group configured for replicated host offload.", mWorldRank);
+            mTpHostOffloadTopology = TpHostOffloadTopology::fromTpGroupRanks(tpGroupRanks, mNumSecondaryBlocks);
+            (void) ::tensorrt_llm::getComm(mTpGroupRanks);
+#else
+            TLLM_THROW("Replicated TP MLA host offload requires TensorRT-LLM to be built with multi-device support.");
+#endif
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(worldRankOverride.has_value(),
+                "Replicated TP MLA host offload topology override requires worldRankOverride.");
+            mWorldRank = worldRankOverride.value();
+        }
+        TLLM_CHECK_WITH_INFO(mTpGroupRanks.count(mWorldRank) == 1,
+            "Rank %d is not a member of the TP group configured for replicated host offload.", mWorldRank);
+    }
+
+    mTransferManager = std::make_shared<KVCacheTransferManager>(mBufferManager, mLoopbackAgent,
+        mEnableTpMlaReplicatedHostOffload, mTpGroupRanks, mTpHostOffloadTopology, mWorldRank);
+
     std::map<SizeType32, SizeType32> numLayersPerPool;
 
     for (auto const layerIdx : managedLayers)
@@ -1119,14 +1161,24 @@ void WindowBlockManager::allocatePools(bool useUvm)
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
         else
             pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
-        if (mNumSecondaryBlocks > 0)
+
+        auto secondaryBlockCount = mNumSecondaryBlocks;
+        if (mEnableTpMlaReplicatedHostOffload && mTpHostOffloadTopology.has_value())
+        {
+            secondaryBlockCount = mTpHostOffloadTopology->localOwnedBlockCount(mWorldRank);
+        }
+        if (secondaryBlockCount > 0)
         {
             nvinfer1::Dims cacheShapeOffload = isRecurrentState()
-                ? ITensor::makeShape({pool.numLayers, mNumSecondaryBlocks, mKVFactor, blockSize})
-                : ITensor::makeShape({mNumSecondaryBlocks, pool.numLayers, mKVFactor, blockSize});
+                ? ITensor::makeShape({pool.numLayers, secondaryBlockCount, mKVFactor, blockSize})
+                : ITensor::makeShape({secondaryBlockCount, pool.numLayers, mKVFactor, blockSize});
             TLLM_LOG_DEBUG("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
-                mLogPrefix.c_str(), mNumSecondaryBlocks, pool.numLayers, pool.numKvHeads);
+                mLogPrefix.c_str(), secondaryBlockCount, pool.numLayers, pool.numKvHeads);
             pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
+        }
+        else if (mEnableTpMlaReplicatedHostOffload)
+        {
+            TLLM_LOG_DEBUG("[%s] Skipping secondary pool allocation on non-owner TP rank", mLogPrefix.c_str());
         }
     }
 }
@@ -3187,15 +3239,16 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype,
     SizeType32 sinkTokenLength, int64_t stream, runtime::SizeType32 maxSequenceLength, SizeType32 chunkSize,
     bool enableBlockReuse, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse,
+    bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
     bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
     std::vector<PoolConfiguration> const& poolConfigurations)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
-        enableBlockReuse, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse, nullptr,
-        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
-        linearAttentionMetadata, poolConfigurations)
+        enableBlockReuse, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse,
+        enableTpMlaReplicatedHostOffload, tpGroupRanks, nullptr, enableIndexerKCache, indexerKCacheQuantBlockSize,
+        indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations)
 {
 }
 
@@ -3205,6 +3258,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     SizeType32 sinkTokenLength, int64_t stream, runtime::SizeType32 maxSequenceLength, SizeType32 chunkSize,
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+    bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
@@ -3213,8 +3267,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
         maxAttentionWindowVec, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse, copyOnPartialReuse,
-        kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
-        indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations)
+        enableTpMlaReplicatedHostOffload, tpGroupRanks, kvCacheConnectorManager, enableIndexerKCache,
+        indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata,
+        poolConfigurations)
 {
 }
 
@@ -3224,6 +3279,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     SizeType32 sinkTokenLength, CudaStreamPtr stream, runtime::SizeType32 maxSequenceLength, SizeType32 chunkSize,
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+    bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
@@ -3238,9 +3294,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     , mBlockManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
           std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec, dtype, mSinkBubbleLength,
           mChunkSize, cacheType, secondaryOffloadMinPriority, std::move(eventManager), enablePartialReuse,
-          copyOnPartialReuse, std::move(kvCacheConnectorManager), std::nullopt, enableIndexerKCache,
-          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata,
-          poolConfigurations)
+          copyOnPartialReuse, enableTpMlaReplicatedHostOffload, tpGroupRanks, std::move(kvCacheConnectorManager),
+          std::nullopt, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
+          indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
@@ -3266,6 +3322,7 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 sinkTokenLength, CudaStreamPtr stream, runtime::SizeType32 maxSequenceLength, SizeType32 chunkSize,
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+    bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
@@ -3273,9 +3330,9 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength, std::move(stream),
         maxSequenceLength, chunkSize, enableBlockReuse, cacheType, secondaryOffloadMinPriority, std::move(eventManager),
-        enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager), enableIndexerKCache,
-        indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata,
-        poolConfigurations)
+        enablePartialReuse, copyOnPartialReuse, enableTpMlaReplicatedHostOffload, tpGroupRanks,
+        std::move(kvCacheConnectorManager), enableIndexerKCache, indexerKCacheQuantBlockSize,
+        indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations)
 {
 }
 
