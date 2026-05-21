@@ -404,12 +404,10 @@ class MTPWorker(SpecWorkerBase):
 
         batch_size = attn_metadata.num_seqs
 
-        raw_logits = logits
-
         self._execute_guided_decoder_if_present(logits)
 
         # Sample and verify draft tokens
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+        accepted_tokens, num_accepted_tokens, sampled_log_probs = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
 
         # Update MTP past hidden states
@@ -496,13 +494,14 @@ class MTPWorker(SpecWorkerBase):
             accepted_tokens, next_draft_tokens,
             spec_metadata.batch_indices_cuda, batch_size, num_accepted_tokens)
 
-        return {
-            'logits': raw_logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens
-        }
+        return self._build_forward_outputs(
+            logits=logits,
+            new_tokens=accepted_tokens,
+            new_tokens_lens=num_accepted_tokens,
+            next_draft_tokens=next_draft_tokens,
+            next_new_tokens=next_new_tokens,
+            sampled_log_probs=sampled_log_probs,
+        )
 
     def skip_forward(
         self,
@@ -851,7 +850,7 @@ class MTPWorker(SpecWorkerBase):
                     num_gens, mtp_num_modules)
 
                 # Use base implementation for strict acceptance
-                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+                accepted_tokens, num_accepted_tokens, sampled_log_probs = self._sample_and_accept_draft_tokens_base(
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 
@@ -868,7 +867,12 @@ class MTPWorker(SpecWorkerBase):
                 max_draft_len=mtp_num_modules,
             )
 
-        return accepted_tokens, num_accepted_tokens
+        if self.is_thop or self.spec_config.use_relaxed_acceptance_for_thinking:
+            sampled_log_probs = self._compute_log_probs_for_accepted_tokens(
+                logits, accepted_tokens, num_contexts, batch_size,
+                mtp_num_modules)
+
+        return accepted_tokens, num_accepted_tokens, sampled_log_probs
 
     def change_attn_metadata(self, num_accepted_tokens: torch.Tensor,
                              attn_metadata: AttentionMetadata):

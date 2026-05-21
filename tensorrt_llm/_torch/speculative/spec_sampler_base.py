@@ -19,6 +19,7 @@ This module provides a common base class for MTPSampler, SASampler, and
 Eagle3OneModelSampler.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -148,6 +149,12 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """
         return True
 
+    def validate_request(self, request: LlmRequest) -> None:
+        if request.py_return_log_probs and (request.py_num_logprobs or 0) > 1:
+            raise ValueError(
+                "Speculative sampler only supports returning the sampled logprob per token"
+            )
+
     def _request_common_handling(
         self,
         request: LlmRequest,
@@ -165,11 +172,6 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             logger.warning(
                 "return_generation_logits not supported with speculative decoding, "
                 "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_log_probs:
-            logger.warning(
-                "return_log_probs not supported with speculative decoding, skipping for request %s",
                 request.py_request_id,
             )
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
@@ -194,19 +196,29 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
+        raw_log_probs_list = None if state.host.log_probs is None else state.host.log_probs.tolist()
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
-        for req in state.requests:
+        for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
+            want_logprobs = req.py_return_log_probs and raw_log_probs_list is not None
+            simple_logprobs: list[float] = []
+            req_logprob_row = raw_log_probs_list[req_idx] if want_logprobs else None
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
+                if want_logprobs:
+                    simple_logprobs.append(req_logprob_row[i])
                 if TorchSampler._handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break
+            if simple_logprobs:
+                req.py_result.append_log_probs([simple_logprobs])
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
@@ -248,6 +260,13 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
+        sampled_log_probs = outputs.get("sampled_log_probs")
+        if sampled_log_probs is not None:
+            sampled_log_probs = sampled_log_probs[num_skip : num_skip + num_sampling_requests]
+        elif any(req.py_return_log_probs for req in sampling_requests):
+            raise RuntimeError(
+                "Speculative logprob requests require sampled_log_probs in worker outputs"
+            )
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # Use actual store buffer dimensions (which may differ from draft_len
@@ -285,12 +304,14 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens=self.store.next_new_tokens,
             new_tokens_lens=self.store.new_tokens_lens,
             next_draft_tokens=self.store.next_draft_tokens,
+            log_probs=sampled_log_probs,
         )
 
         host_tensors = SampleStateTensorsSpec(
             new_tokens=self._copy_to_host(self.store.new_tokens),
             new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
             next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+            log_probs=None if sampled_log_probs is None else self._copy_to_host(sampled_log_probs),
         )
         sampler_event = self._record_sampler_event()
 

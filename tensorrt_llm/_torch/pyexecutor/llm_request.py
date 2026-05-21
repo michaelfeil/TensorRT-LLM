@@ -218,14 +218,35 @@ class LogitsStorage:
 
 
 class LogProbStorage:
+    """Stores per-token logprobs.
+
+    ``log_probs`` stores one list per beam. Each per-token entry is either a
+    ``dict[int, Logprob]`` (top-k/default format) or a ``float`` (simple
+    sampled-token format).
+    """
+
     beam_width: int = -1
-    log_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs]
     cum_log_probs: list[float]
+
+    def __init__(self):
+        self.beam_width = -1
+        self._log_probs_data: list[TokenLogprobs] | list[
+            SimpleTokenLogprobs] = []
+        self.cum_log_probs = []
+
+    @property
+    def log_probs(self) -> list[TokenLogprobs] | list[SimpleTokenLogprobs]:
+        return self._log_probs_data
+
+    @log_probs.setter
+    def log_probs(self, value: list[TokenLogprobs]
+                  | list[SimpleTokenLogprobs]):
+        self._log_probs_data = value
 
     def _init(self, first_input: list[TokenLogprobs]
               | list[SimpleTokenLogprobs]):
         self.beam_width = len(first_input)
-        self.log_probs = [[] for _ in range(self.beam_width)]
+        self._log_probs_data = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
 
     def append(self,
@@ -241,7 +262,7 @@ class LogProbStorage:
 
         assert len(new_probs) == self.beam_width, "Beam width mismatch"
         for beam_idx, probs in enumerate(new_probs):
-            self.log_probs[beam_idx].extend(probs)
+            self._log_probs_data[beam_idx].extend(probs)
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             elif probs:
@@ -283,6 +304,9 @@ class PyResult:
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
+        log_probs_list: list[tuple[list[TokenLogprobs]
+                                   | list[SimpleTokenLogprobs], list[float]
+                                   | None]] = field(default_factory=list)
         first_gen_log_probs: TokenLogprobs | None = None
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
@@ -366,6 +390,9 @@ class PyResult:
                 self._generation_logits.append(generation_logits)
         if diff.reset_log_probs is not None:
             self._log_probs.set_log_probs(*diff.reset_log_probs)
+        if len(diff.log_probs_list) > 0:
+            for log_probs, cum_log_probs in diff.log_probs_list:
+                self._log_probs.append(log_probs, cum_log_probs)
         if diff.first_gen_log_probs is not None:
             self._first_gen_log_probs = diff.first_gen_log_probs
         if diff.mm_embeddings is not None:
@@ -405,6 +432,7 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+            self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              mm_embedding_lengths: List[int]):
@@ -470,6 +498,7 @@ class PyResult:
         if self._log_probs:
             self._log_probs.set_log_probs(log_probs, cum_log_probs)
             self.diff.reset_log_probs = (log_probs, cum_log_probs)
+            self.diff.log_probs_list.clear()
 
     def set_first_gen_log_probs(self, log_probs: TokenLogprobs):
         self._first_gen_log_probs = log_probs
@@ -515,13 +544,18 @@ class PyResult:
     @property
     def log_probs(
             self) -> list[TokenLogprobs] | list[SimpleTokenLogprobs] | None:
-        if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
+        # Storage eagerly initializes cum_log_probs/_log_probs_data to empty
+        # lists in __init__ (unlike the original), so ``hasattr`` no longer
+        # distinguishes "pre-init" from "post-init". Gate on ``beam_width``
+        # instead so callers don't see an empty list where they expected
+        # ``None``.
+        if not self._log_probs or self._log_probs.beam_width == -1:
             return None
         return self._log_probs.log_probs
 
     @property
     def cum_log_probs(self) -> list[float] | None:
-        if not self._log_probs or not hasattr(self._log_probs, 'cum_log_probs'):
+        if not self._log_probs or self._log_probs.beam_width == -1:
             return None
         return self._log_probs.cum_log_probs
 
@@ -879,7 +913,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.
-        need_deep_copy_logprobs = self.py_result.log_probs and self.py_beam_width <= 1
+        # Check against the raw beam width (cheap) rather than the property
+        # ``log_probs`` which would trigger flat-mode materialization.
+        has_log_probs = (self.py_result._log_probs is not None
+                         and self.py_result._log_probs.beam_width != -1)
+        need_deep_copy_logprobs = has_log_probs and self.py_beam_width <= 1
         need_deep_copy_generation_logits = self.py_result._generation_logits is not None
         need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
         # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
@@ -890,11 +928,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             # Move _log_probs to py_result and create a new empty LogProbStorage in self.py_result
             # This avoids performing a deepcopy
             if need_deep_copy_logprobs:
-                py_result._log_probs = self.py_result._log_probs
+                old_storage = self.py_result._log_probs
+                py_result._log_probs = old_storage
                 self.py_result._log_probs = LogProbStorage()
-                # Initialize the storage and adjust the cum_log_probs to the previous value
-                self.py_result._log_probs._init(py_result.log_probs)
-                self.py_result._log_probs.cum_log_probs = py_result.cum_log_probs
+                # Reinitialize the fresh storage. We only need the beam_width
+                # and previous cum_log_probs to continue accumulating.
+                self.py_result._log_probs._init(
+                    [[] for _ in range(old_storage.beam_width)])
+                self.py_result._log_probs.cum_log_probs = list(
+                    old_storage.cum_log_probs)
 
             # Perform copies of py_result._generation_logits
             if need_deep_copy_generation_logits:

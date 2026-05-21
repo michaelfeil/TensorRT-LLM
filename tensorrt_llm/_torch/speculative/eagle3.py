@@ -667,13 +667,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        raw_logits = logits
-
         self._execute_guided_decoder_if_present(logits)
 
         # Sample and accept tokens. ``input_ids`` is required by the relaxed-
         # acceptance path (scans for thinking-phase tokens); ignored otherwise.
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+        accepted_tokens, num_accepted_tokens, sampled_log_probs = self.sample_and_accept_draft_tokens(
             input_ids, logits, attn_metadata, spec_metadata)
 
         # Mamba hybrid models need state updates after token acceptance because
@@ -743,13 +741,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         attn_metadata.use_spec_decoding = True
 
-        return {
-            'logits': raw_logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens,
-        }
+        return self._build_forward_outputs(
+            logits=logits,
+            new_tokens=accepted_tokens,
+            new_tokens_lens=num_accepted_tokens,
+            next_draft_tokens=next_draft_tokens,
+            next_new_tokens=next_new_tokens,
+            sampled_log_probs=sampled_log_probs,
+        )
 
     def _forward_draft_loop(self, inputs, attn_metadata, spec_metadata,
                             draft_model, draft_kv_cache_manager, num_contexts,
@@ -1161,7 +1160,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             num_accepted_tokens = self._apply_force_accepted_tokens(
                 num_accepted_tokens, num_contexts, runtime_draft_len)
 
-            return accepted_tokens, num_accepted_tokens
+            sampled_log_probs = self._compute_log_probs_for_accepted_tokens(
+                logits, accepted_tokens, num_contexts, batch_size,
+                runtime_draft_len)
+
+            return accepted_tokens, num_accepted_tokens, sampled_log_probs
 
         # Strict acceptance — common path for Eagle3 and MTP Eagle. Both modes
         # use runtime_draft_len for dynamic draft length support.
