@@ -20,12 +20,27 @@
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include <limits>
 #include <random>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <utility>
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+namespace
+{
+
+std::string makeTransportFailureMessage(
+    std::string const& agentName, char const* operation, std::exception const& error)
+{
+    std::ostringstream message;
+    message << "AgentConnectionManager transport failure while " << operation << " for local agent " << agentName
+            << ": " << error.what();
+    return message.str();
+}
+
+} // namespace
 
 std::string genUniqueAgentName()
 {
@@ -165,6 +180,7 @@ size_t MemoryDesc::serializedSize(MemoryDesc const& memoryDesc)
 
 void AgentConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
+    mAgentConnectionManager->throwIfTransportFailed();
     MemoryDesc srcDesc{
         reinterpret_cast<uintptr_t>(data), size, static_cast<uint32_t>(mAgentConnectionManager->getDeviceId())};
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
@@ -197,7 +213,7 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
 
 void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
-
+    mAgentConnectionManager->throwIfTransportFailed();
     NotificationSyncInfo syncInfo{mAgentName, ctx};
     mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
 }
@@ -205,6 +221,7 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
     std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx)
 {
+    mAgentConnectionManager->throwIfTransportFailed();
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
 
     TLLM_CHECK(!cacheBufferIds.empty());
@@ -283,6 +300,7 @@ bool AgentConnection::hasLoadRemoteAgent() const
 
 void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) const
 {
+    mAgentConnectionManager->throwIfTransportFailed();
     ReadySignalInfo readySignalInfo{mRemoteAgentName, ctx, isReady};
     NotificationInfo notificationInfo{readySignalInfo};
     std::stringstream ss;
@@ -292,6 +310,7 @@ void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) cons
 
 bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 {
+    mAgentConnectionManager->throwIfTransportFailed();
     ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
     mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo, ctx.getTransferTerminate());
     return readySignalInfo.mIsReady;
@@ -333,9 +352,30 @@ AgentConnectionManager::AgentConnectionManager(
     TLLM_CHECK(mDeviceId != -1);
 
     mAgentName = genUniqueAgentName();
-    // Create Agent
     BaseAgentConfig config{mAgentName, true, false, true};
     m_Agent = makeTransferAgent(backendType, &config);
+    initialize();
+}
+
+AgentConnectionManager::AgentConnectionManager(
+    std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
+    std::string agentName, std::unique_ptr<BaseTransferAgent> agent,
+    std::optional<CacheState::RnnCacheState> rnnCacheState)
+    : mCacheState(std::move(cacheState))
+    , mRnnCacheState(std::move(rnnCacheState))
+    , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
+    , m_Agent(std::move(agent))
+    , mAgentName(std::move(agentName))
+    , mRegMemDescs(MemoryType::kVRAM, {})
+{
+    TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
+    TLLM_CHECK(mDeviceId != -1);
+    initialize();
+}
+
+void AgentConnectionManager::initialize()
+{
+    TLLM_CHECK(m_Agent != nullptr);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     mBufferKinds.reserve(mCacheTransBufferManagers.size());
     std::vector<MemoryDesc> memDescs;
@@ -410,6 +450,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
 {
     while (!terminateFlag.load())
     {
+        throwIfTransportFailed();
         if (!mIsRunning)
         {
             return nullptr;
@@ -578,7 +619,16 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
 
 void AgentConnectionManager::updateUnhandledNotifications()
 {
-    auto notifiedSyncMessages = m_Agent->getNotifiedSyncMessages();
+    std::unordered_map<std::string, std::vector<SyncMessage>> notifiedSyncMessages;
+    try
+    {
+        notifiedSyncMessages = m_Agent->getNotifiedSyncMessages();
+    }
+    catch (std::exception const& error)
+    {
+        recordTransportFailure(makeTransportFailureMessage(mAgentName, "polling notifications", error));
+        throwIfTransportFailed();
+    }
     std::lock_guard<std::mutex> lock(mNotificationMutex);
 
     // Merge new notifications with existing ones
@@ -621,7 +671,7 @@ std::vector<uint8_t> const& AgentConnectionManager::getBufferKinds() const
 AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connectionInfo,
     std::optional<std::string> metadata, bool isSender)
 {
-
+    throwIfTransportFailed();
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
     std::scoped_lock lock(mConnectionsMutex);
@@ -697,7 +747,7 @@ void AgentConnectionManager::waitForNotification(
 {
     while (!terminateFlag.load())
     {
-
+        throwIfTransportFailed();
         if (!mIsRunning)
         {
             return;
@@ -791,6 +841,37 @@ void AgentConnectionManager::waitForReadySignal(
     std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag)
 {
     waitForNotification(remoteAgentName, readySignalInfo, terminateFlag);
+}
+
+void AgentConnectionManager::recordTransportFailure(std::string message)
+{
+    bool firstFailure = false;
+    {
+        std::scoped_lock lock(mTransportFailureMutex);
+        if (!mTransportFailure.has_value())
+        {
+            mTransportFailure = std::move(message);
+            firstFailure = true;
+        }
+    }
+    mIsRunning = false;
+    if (firstFailure)
+    {
+        TLLM_LOG_ERROR("%s", mTransportFailure->c_str());
+    }
+}
+
+void AgentConnectionManager::throwIfTransportFailed() const
+{
+    std::optional<std::string> transportFailure;
+    {
+        std::scoped_lock lock(mTransportFailureMutex);
+        transportFailure = mTransportFailure;
+    }
+    if (transportFailure.has_value())
+    {
+        TLLM_THROW("%s", transportFailure->c_str());
+    }
 }
 
 std::string const& AgentConnectionManager::getAgentName() const

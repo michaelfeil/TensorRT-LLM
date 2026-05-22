@@ -207,6 +207,10 @@ class Distributed(ABC):
         pass
 
     @abstractmethod
+    def tp_allgather_int64(self, values: List[int]) -> List[List[int]]:
+        pass
+
+    @abstractmethod
     def cp_allgather(self, obj):
         pass
 
@@ -332,6 +336,20 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
             return pickle.loads(dst_buf)  # nosec B301
         except Exception as e:
             raise RuntimeError(f"Deserialization failed: {str(e)}") from e
+
+
+def _allgather_int64_values(comm, values: List[int], size: int) -> np.ndarray:
+    sendbuf = np.asarray(values, dtype=np.int64).reshape(-1)
+    recvbuf = np.empty(size * sendbuf.size, dtype=np.int64)
+    mpi_int64 = getattr(MPI, "INT64_T", None)
+    if mpi_int64 is None:
+        mpi_int64 = MPI.LONG_LONG
+    comm.Allgather([sendbuf, mpi_int64], [recvbuf, mpi_int64])
+    return recvbuf.reshape(size, sendbuf.size)
+
+
+def _allgather_int64(comm, value: int, size: int) -> np.ndarray:
+    return _allgather_int64_values(comm, [value], size)[:, 0]
 
 
 def _serialize_and_exchange_lengths(
@@ -743,6 +761,10 @@ class MPIDist(Distributed):
         comm = self.tp_comm
         return safe_allgather(comm, obj, chunk_size=chunk_size)
 
+    def tp_allgather_int64(self, values: List[int]) -> List[List[int]]:
+        return _allgather_int64_values(self.tp_comm, values,
+                                       self.tp_size).tolist()
+
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = self.tp_comm
         return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
@@ -1041,6 +1063,17 @@ class TorchDist(Distributed):
                                    obj,
                                    group=self.mapping.tp_group_pg)
             return output_list
+
+    @log_op
+    def tp_allgather_int64(self, values: List[int]) -> List[List[int]]:
+        tensor = torch.tensor(values, dtype=torch.int64,
+                              device="cpu").reshape(-1)
+        output_list = [
+            torch.empty_like(tensor)
+            for _ in range(self.mapping.tp_group_pg.size())
+        ]
+        dist.all_gather(output_list, tensor, group=self.mapping.tp_group_pg)
+        return [output.tolist() for output in output_list]
 
     @log_op
     def tp_gather(self, obj, dst=0):

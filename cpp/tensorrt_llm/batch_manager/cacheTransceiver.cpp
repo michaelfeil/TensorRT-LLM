@@ -45,7 +45,6 @@
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
@@ -210,6 +209,114 @@ void eraseLocalTransferOutcome(RequestIdType requestId, std::unordered_set<Reque
     completedRequestIds.erase(requestId);
     failedRequestIds.erase(requestId);
     requestsAwaitingConsensus.erase(requestId);
+}
+
+bool drainTransferFuture(std::vector<detail::TransferFuture>& futures, LlmRequest::RequestIdType const requestId)
+{
+    auto it = std::find_if(futures.begin(), futures.end(),
+        [requestId](auto const& transferFuture) { return transferFuture.requestId == requestId; });
+    if (it == futures.end())
+    {
+        return false;
+    }
+
+    auto request = it->request;
+    auto future = std::move(it->future);
+    futures.erase(it);
+    // A drained cancellation still becomes a transfer error so Python can retire exactly this request.
+    try
+    {
+        future.get();
+        if (request != nullptr)
+        {
+            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_DEBUG(
+            "Cancelled generation transfer future for request %zu completed with error: %s", requestId, e.what());
+        if (request != nullptr)
+        {
+            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        }
+    }
+    catch (...)
+    {
+        TLLM_LOG_DEBUG(
+            "Cancelled generation transfer future for request %zu completed with an unknown error.", requestId);
+        if (request != nullptr)
+        {
+            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        }
+    }
+    return true;
+}
+
+bool drainReadyTransferFuture(std::vector<detail::TransferFuture>& futures, LlmRequest::RequestIdType const requestId)
+{
+    auto it = std::find_if(futures.begin(), futures.end(),
+        [requestId](auto const& transferFuture) { return transferFuture.requestId == requestId; });
+    if (it == futures.end())
+    {
+        return true;
+    }
+    if (it->future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+    {
+        return false;
+    }
+
+    return drainTransferFuture(futures, requestId);
+}
+
+size_t drainReadyFailedGenerationTransferFutures(std::vector<detail::TransferFuture>& futures)
+{
+    size_t drainedCount = 0;
+    for (auto it = futures.begin(); it != futures.end();)
+    {
+        // Only consume futures that have already signaled failure and are ready.
+        // Pending futures still own transport work.
+        if (it->hasError == nullptr || !it->hasError->load()
+            || it->future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+        {
+            ++it;
+            continue;
+        }
+
+        auto const requestId = it->requestId;
+        auto request = it->request;
+        try
+        {
+            it->future.get();
+            TLLM_LOG_ERROR("Generation transfer for request %zu reported an error but completed successfully.",
+                static_cast<size_t>(requestId));
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("Error occurred during generation transfer for request %zu: %s",
+                static_cast<size_t>(requestId), e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR(
+                "Unknown error occurred during generation transfer for request %zu", static_cast<size_t>(requestId));
+        }
+
+        if (request != nullptr)
+        {
+            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        }
+        it = futures.erase(it);
+        drainedCount++;
+    }
+    return drainedCount;
+}
+
+std::vector<LlmRequest::RequestIdType> deduplicateRequestIds(
+    std::vector<LlmRequest::RequestIdType> const& requestIds)
+{
+    std::unordered_set<LlmRequest::RequestIdType> uniqueRequestIds(requestIds.begin(), requestIds.end());
+    return std::vector<LlmRequest::RequestIdType>(uniqueRequestIds.begin(), uniqueRequestIds.end());
 }
 
 } // namespace
@@ -590,17 +697,16 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
 
     auto const requestId = llmRequest->mRequestId;
     if (std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
-            [requestId](auto const& pair) { return pair.first->mRequestId == requestId; })
+            [requestId](auto const& transferFuture) { return transferFuture.requestId == requestId; })
         != mRequesterFutures.end())
     {
         TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", requestId);
         return;
     }
 
-    auto future = mCacheReceiver->receiveAsync(llmRequest);
-    auto* requestPtr = llmRequest.get();
-    mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
-    requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto statusFuture = mCacheReceiver->receiveAsyncWithStatus(llmRequest);
+    mRequesterFutures.emplace_back(llmRequest, std::move(statusFuture.future), std::move(statusFuture.hasError));
+    llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -716,19 +822,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     }
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
-    std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
-    for (auto&& [request, future] : mSenderFutures)
-    {
-        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
-        {
-            contextCompleteRequestIds.push_back(request->mRequestId);
-        }
-    }
+    int syncSize = (syncComm != nullptr) ? syncComm->getSize() : 1;
+    auto contextCompleteRequestIds = detail::getReadyTransferRequestIds(mSenderFutures);
+    auto dedupedContextCompleteRequestIds = deduplicateRequestIds(contextCompleteRequestIds);
+    std::unordered_set<LlmRequest::RequestIdType> localReadyIdSet(
+        dedupedContextCompleteRequestIds.begin(), dedupedContextCompleteRequestIds.end());
 
+    // Count ready reports across ranks because each rank can finish request futures in a different order.
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
     if ((syncComm) && syncComm->getSize() > 1)
     {
-        auto gatherRequestIdVec = gatherRequestIds(syncComm, contextCompleteRequestIds);
+        auto gatherRequestIdVec = gatherRequestIds(syncComm, dedupedContextCompleteRequestIds);
         for (auto&& requestId : gatherRequestIdVec)
         {
             frequencyMap[requestId]++;
@@ -736,7 +840,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     }
     else
     {
-        for (auto&& requestId : contextCompleteRequestIds)
+        for (auto&& requestId : dedupedContextCompleteRequestIds)
         {
             frequencyMap[requestId]++;
         }
@@ -760,8 +864,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     for (auto it = mSenderFutures.begin();
          atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mSenderFutures.end(); ++it)
     {
-        auto& [request, future] = *it;
-        toCompleteIdSet.insert(request->mRequestId);
+        toCompleteIdSet.insert(it->requestId);
     }
 
     // Record local terminal outcomes for requests selected this round. The
@@ -769,23 +872,27 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     // request reached a terminal state.
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
-        auto& [request, future] = *it;
-        if (kvTransferTimeoutMs.has_value())
+        auto const requestId = it->requestId;
+        auto request = it->request;
+        auto& future = it->future;
+        bool const isSelected = blockAll || (toCompleteIdSet.find(requestId) != toCompleteIdSet.end());
+        int const syncFreq = frequencyMap.count(requestId) > 0 ? frequencyMap.at(requestId) : 0;
+        bool const localReady = localReadyIdSet.find(requestId) != localReadyIdSet.end();
+        if (request != nullptr && kvTransferTimeoutMs.has_value())
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
             auto elapsedMs = static_cast<long>(elapsed.count());
-            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(request->mRequestId).second)
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(requestId).second)
             {
                 TLLM_LOG_WARNING(
                     "Context KV cache transfer for request %ld exceeded configured timeout: "
                     "elapsed %ld ms > limit %d ms (observe-only).",
-                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                    requestId, elapsedMs, kvTransferTimeoutMs.value());
             }
         }
-        if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
+        if (isSelected)
         {
-            auto const requestId = request->mRequestId;
             try
             {
                 // Wait for up to a specified timeout
@@ -793,32 +900,50 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
-                    recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    if (request != nullptr)
+                    {
+                        bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                        recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
+                            mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    }
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
+                    TLLM_LOG_WARNING(
+                        "Timed out waiting for context KV cache transfer after %d milliseconds. request_id=%zu "
+                        "local_ready=%d sync_freq=%d sync_size=%d selected=%d",
+                        senderFutureTimeoutMs.value(), requestId, localReady, syncFreq, syncSize, isSelected);
                     ++it;
                 }
                 else
                 {
                     TLLM_LOG_ERROR(
-                        "Future returned unexpected status for request %ld. Recording as failed.", requestId);
+                        "Future returned unexpected status for request %ld. Marking as error. local_ready=%d "
+                        "sync_freq=%d sync_size=%d",
+                        requestId, localReady, syncFreq, syncSize);
 
-                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    if (request != nullptr)
+                    {
+                        request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                        recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
+                            mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    }
                     it = mSenderFutures.erase(it);
                 }
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR("Error occurred during context transfer for request %ld: %s", requestId, e.what());
-                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                    mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                TLLM_LOG_ERROR(
+                    "Error occurred during context transfer for request %ld: %s local_ready=%d "
+                    "sync_freq=%d sync_size=%d",
+                    requestId, e.what(), localReady, syncFreq, syncSize);
+                if (request != nullptr)
+                {
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
+                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                }
                 it = mSenderFutures.erase(it);
             }
         }
@@ -866,22 +991,28 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
-    bool blockAll = !atLeastRequestNum.has_value();
-    std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
-    for (auto&& [request, future] : mRequesterFutures)
+    auto const drainedFailedFutureCount = drainReadyFailedGenerationTransferFutures(mRequesterFutures);
+    auto effectiveAtLeastRequestNum = atLeastRequestNum;
+    if (effectiveAtLeastRequestNum.has_value())
     {
-        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
-        {
-            genTransferReadyRequestIds.push_back(request->mRequestId);
-        }
+        effectiveAtLeastRequestNum
+            = std::max(0, effectiveAtLeastRequestNum.value() - static_cast<int>(drainedFailedFutureCount));
     }
+
+    bool blockAll = !effectiveAtLeastRequestNum.has_value();
+    auto genTransferReadyRequestIds = detail::getReadyTransferRequestIds(mRequesterFutures);
+    auto dedupedGenTransferReadyRequestIds = deduplicateRequestIds(genTransferReadyRequestIds);
+    std::unordered_set<LlmRequest::RequestIdType> localReadyIdSet(
+        dedupedGenTransferReadyRequestIds.begin(), dedupedGenTransferReadyRequestIds.end());
+
+    // Count ready reports across ranks because each rank can finish request futures in a different order.
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
 
     std::vector<LlmRequest::RequestIdType> toBlockRequestIds;
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
     if ((syncComm) && syncComm->getSize() > 1)
     {
-        auto gatherRequestIdVec = gatherRequestIds(syncComm, genTransferReadyRequestIds);
+        auto gatherRequestIdVec = gatherRequestIds(syncComm, dedupedGenTransferReadyRequestIds);
         for (auto&& requestId : gatherRequestIdVec)
         {
             frequencyMap[requestId]++;
@@ -889,7 +1020,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     }
     else
     {
-        for (auto&& requestId : genTransferReadyRequestIds)
+        for (auto&& requestId : dedupedGenTransferReadyRequestIds)
         {
             frequencyMap[requestId]++;
         }
@@ -902,7 +1033,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             std::pair<LlmRequest::RequestIdType, int> const& right) { return left.second > right.second; });
     std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
     size_t idx = 0;
-    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
+    while (effectiveAtLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
     {
         if (idx >= freqVec.size())
         {
@@ -924,26 +1055,26 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     idx = 0;
 
     // insert order
-    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
+    while (effectiveAtLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
     {
         if (idx >= mRequesterFutures.size())
         {
             break;
         }
-        if (toCompleteIdSet.find(mRequesterFutures.at(idx).first->mRequestId) == toCompleteIdSet.end())
+        if (toCompleteIdSet.find(mRequesterFutures.at(idx).requestId) == toCompleteIdSet.end())
         {
-            toCompleteIdSet.insert(mRequesterFutures.at(idx).first->mRequestId);
+            toCompleteIdSet.insert(mRequesterFutures.at(idx).requestId);
             if (useMPI())
             {
                 TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                     " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
-                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
+                    mRequesterFutures.at(idx).requestId, effectiveAtLeastRequestNum.value_or(0));
             }
             else
             {
                 TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
                     " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
-                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
+                    mRequesterFutures.at(idx).requestId, effectiveAtLeastRequestNum.value_or(0));
             }
         }
         idx++;
@@ -969,13 +1100,13 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     {
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
-            atLeastRequestNum.value_or(0));
+            effectiveAtLeastRequestNum.value_or(0));
     }
     else
     {
         TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
-            atLeastRequestNum.value_or(0));
+            effectiveAtLeastRequestNum.value_or(0));
     }
     // Observe-only: gen-side mirror of the context-side timeout WARN.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
@@ -985,53 +1116,58 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     }
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
-        auto& request = it->first;
-        auto const requestId = request->mRequestId;
-        if (kvTransferTimeoutMs.has_value())
+        auto const requestId = it->requestId;
+        auto request = it->request;
+        if (request != nullptr && kvTransferTimeoutMs.has_value())
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
             auto elapsedMs = static_cast<long>(elapsed.count());
-            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(request->mRequestId).second)
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(requestId).second)
             {
                 TLLM_LOG_WARNING(
                     "Generation KV cache transfer for request %ld exceeded configured timeout: "
                     "elapsed %ld ms > limit %d ms (observe-only).",
-                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                    requestId, elapsedMs, kvTransferTimeoutMs.value());
             }
         }
         if (blockAll || toCompleteIdSet.find(requestId) != toCompleteIdSet.end())
         {
             try
             {
-                it->second.get();
-                bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                it->future.get();
+                bool const failed = request != nullptr && request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
                 if (failed)
                 {
                     // The receiver uses the error state as a local transfer-failed signal.
                     // Keep that signal local until the consensus outcome commits it globally.
                     request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
                 }
-                recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
-                    mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+                if (request != nullptr)
+                {
+                    recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
+                        mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+                }
             }
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR("Error occurred during generation transfer for request %ld: %s", requestId, e.what());
-                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedRequesterRequestIds,
-                    mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+                if (request != nullptr)
+                {
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedRequesterRequestIds,
+                        mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+                }
             }
             if (useMPI())
             {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                    "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***", requestId,
-                    request->getContextPhaseParams().value().getReqId());
+                TLLM_LOG_DEBUG(
+                    mpi::MpiComm::world().getRank(), "**** requestId: %ld ******** get feature ***", requestId);
             }
             else
             {
                 TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                    "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***", requestId,
-                    request->getContextPhaseParams().value().getReqId());
+                    "**** requestId: %ld ******** get feature ***", requestId);
             }
             it = mRequesterFutures.erase(it);
         }
@@ -1080,15 +1216,35 @@ bool CacheTransceiver::checkGenTransferComplete() const
     return mRequesterFutures.empty() && mCompletedRequesterRequestIds.empty() && mFailedRequesterRequestIds.empty();
 }
 
+bool CacheTransceiver::hasPendingGenTransfer(std::shared_ptr<LlmRequest> llmRequest) const
+{
+    TLLM_CHECK(llmRequest != nullptr);
+    auto it = std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
+        [llmRequest](auto const& transferFuture) { return transferFuture.requestId == llmRequest->mRequestId; });
+    return it != mRequesterFutures.end();
+}
+
 bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
 {
+    TLLM_CHECK(llmRequest != nullptr);
     if (llmRequest->isContextOnlyRequest())
     {
-        return mCacheSender->cancelRequest(*llmRequest);
+        bool const isCancelled = mCacheSender->cancelRequest(*llmRequest);
+        if (isCancelled)
+        {
+            detail::detachTransferRequests(mSenderFutures, llmRequest->mRequestId);
+        }
+        return isCancelled;
     }
     else if (llmRequest->isGenerationOnlyRequest())
     {
-        return mCacheReceiver->cancelRequest(*llmRequest);
+        bool const isCancelled = mCacheReceiver->cancelRequest(*llmRequest);
+        if (isCancelled)
+        {
+            static_cast<void>(drainReadyTransferFuture(mRequesterFutures, llmRequest->mRequestId));
+            return true;
+        }
+        return drainReadyTransferFuture(mRequesterFutures, llmRequest->mRequestId);
     }
     return false;
 }

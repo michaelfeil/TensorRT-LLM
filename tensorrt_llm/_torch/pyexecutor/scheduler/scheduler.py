@@ -9,7 +9,7 @@ from typing import Any, Callable, Optional, Set, TypeAlias, TypeVar
 from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, PythonCapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
@@ -110,6 +110,19 @@ def _get_lora_task_id(req: LlmRequest):
     if lora_id is None:
         return (0, 0)
     return (1, lora_id)
+
+
+def get_kv_cache_window_sizes(kv_cache_manager) -> list[int]:
+    max_attention_window_vec = getattr(kv_cache_manager, "max_attention_window_vec", None)
+    if max_attention_window_vec is not None:
+        return sorted(set(max_attention_window_vec))
+
+    stats = kv_cache_manager.get_kv_cache_stats()
+    num_free_blocks_per_window_size = getattr(stats, "num_free_blocks_per_window_size", None)
+    if num_free_blocks_per_window_size is not None:
+        return sorted(dict(num_free_blocks_per_window_size).keys())
+
+    return [0]
 
 
 class ScheduledRequests:
@@ -344,6 +357,142 @@ class BindCapacityScheduler(CapacityScheduler):
             self.peft_cache_manager,
             self.cross_kv_cache_manager,
         )
+
+
+class KVCacheV2DummyScheduler(CapacityScheduler):
+    # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
+    no_schedule_until_state = LlmRequestState.CONTEXT_INIT
+    no_schedule_after_state = LlmRequestState.GENERATION_COMPLETE
+
+    def __init__(
+        self,
+        max_num_requests: int,
+        kv_cache_manager,
+        peft_cache_manager=None,
+        python_capacity_scheduler_policy: Optional[PythonCapacitySchedulerPolicy] = None,
+    ):
+        super(KVCacheV2DummyScheduler, self).__init__()
+        self.max_num_requests = max_num_requests
+        self.kv_cache_manager = kv_cache_manager
+        self.peft_cache_manager = peft_cache_manager
+        self.python_capacity_scheduler_policy = python_capacity_scheduler_policy
+
+    def _sort_context_requests_by_remaining_blocks(self, requests: RequestList) -> RequestList:
+        if (
+            self.python_capacity_scheduler_policy
+            != PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+        ):
+            return requests
+
+        context_requests = [req for req in requests if req.is_context_init_state]
+        if len(context_requests) < 2:
+            return requests
+
+        sorted_context_requests = sorted(
+            context_requests,
+            key=lambda req: self.kv_cache_manager.get_needed_resource_to_completion(req),
+        )
+        sorted_context_iter = iter(sorted_context_requests)
+
+        return [next(sorted_context_iter) if req.is_context_init_state else req for req in requests]
+
+    def _get_max_peft_pages(self) -> int:
+        if self.peft_cache_manager is None:
+            return 2**31 - 1
+        return self.peft_cache_manager.max_device_pages
+
+    def _get_peft_task_info(
+        self, req: LlmRequest, seen_task_ids: set[int]
+    ) -> tuple[Optional[int], bool, int]:
+        lora_task_id = getattr(req, "lora_task_id", None)
+        is_new_task = lora_task_id is not None and lora_task_id not in seen_task_ids
+        if is_new_task and self.peft_cache_manager is not None:
+            required_pages = self.peft_cache_manager.determine_num_pages(req)
+        else:
+            required_pages = 0
+        return lora_task_id, is_new_task, required_pages
+
+    def schedule_request(
+        self, active_requests: RequestList
+    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
+        scheduled_requests = []
+        scheduled_disagg_gen_init_requests = []
+        pending_requests = []
+        reserved_blocks = 0
+        max_blocks = self.kv_cache_manager.get_max_resource_count()
+
+        has_peft = self.peft_cache_manager is not None
+        claimed_peft_pages = 0
+        available_peft_pages = self._get_max_peft_pages() if has_peft else 0
+        uniq_task_ids: set[int] = set() if has_peft else None
+
+        for request in active_requests:
+            req_state = request.state
+            # if request cannot be scheduled yet or request should no longer be scheduled, skip
+            if not req_state == LlmRequestState.DISAGG_GENERATION_INIT and (
+                req_state.value < self.no_schedule_until_state.value
+                or req_state.value >= self.no_schedule_after_state.value
+            ):
+                continue
+
+            if len(scheduled_requests) >= self.max_num_requests or reserved_blocks >= max_blocks:
+                break
+            elif request.is_generation_in_progress_state:
+                scheduled_requests.append(request)
+                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(request)
+
+                if has_peft:
+                    lora_task_id, is_new_task, peft_pages = self._get_peft_task_info(
+                        request, uniq_task_ids
+                    )
+                    if is_new_task:
+                        claimed_peft_pages += peft_pages
+                        uniq_task_ids.add(lora_task_id)
+
+            elif req_state == LlmRequestState.DISAGG_GENERATION_INIT:
+                scheduled_disagg_gen_init_requests.append(request)
+                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(request)
+            else:
+                pending_requests.append(request)
+
+        if has_peft:
+            available_peft_pages -= claimed_peft_pages
+
+        available_blocks = max_blocks - reserved_blocks
+        for request in self._sort_context_requests_by_remaining_blocks(pending_requests):
+            req_state = request.state
+            if len(scheduled_requests) >= self.max_num_requests:
+                break
+            elif req_state == LlmRequestState.CONTEXT_INIT:
+                needed_blocks = self.kv_cache_manager.get_needed_resource_to_completion(request)
+                if needed_blocks <= available_blocks:
+                    if has_peft:
+                        lora_task_id, is_new_task, needed_peft_pages = self._get_peft_task_info(
+                            request, uniq_task_ids
+                        )
+                        if needed_peft_pages > available_peft_pages:
+                            continue
+                        available_peft_pages -= needed_peft_pages
+                        if is_new_task:
+                            uniq_task_ids.add(lora_task_id)
+
+                    scheduled_requests.append(request)
+                    available_blocks -= needed_blocks
+                elif needed_blocks > available_blocks:
+                    if (
+                        self.python_capacity_scheduler_policy
+                        == PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+                    ):
+                        continue
+                    # If one requests fails to be scheduled, break
+                    break
+
+        if len(scheduled_requests) + len(scheduled_disagg_gen_init_requests) == 0:
+            logger.warning(
+                "no pending request can get enough resource to complete, "
+                "please increase KV cache pool size."
+            )
+        return scheduled_requests, scheduled_disagg_gen_init_requests, []
 
 
 class MicroBatchScheduler(ABC):
@@ -1077,7 +1226,10 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
             if has_peft:
                 available_peft_pages -= claimed_peft_pages
 
-            for requests in [pending_dis_gen_init_requests, pending_requests]:
+            for requests in [
+                pending_dis_gen_init_requests,
+                scheduler._sort_context_requests_by_remaining_blocks(pending_requests),
+            ]:
                 for req in requests:
                     if req.is_encoder_init_state and reserved_cross_blocks is None:
                         raise RuntimeError(
@@ -1142,6 +1294,12 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             )
 
                         if not enough_blocks or not enough_cross_blocks:
+                            if (
+                                scheduler.python_capacity_scheduler_policy
+                                == PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+                                and req.is_context_init_state
+                            ):
+                                continue
                             break
 
                         # PEFT check only when needed
@@ -1220,7 +1378,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
-        requests_list = list(active_requests)
+        requests_list = scheduler._sort_context_requests_by_remaining_blocks(list(active_requests))
         req_it_end = len(requests_list)
         req_it = 0
 
@@ -1283,6 +1441,12 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                         f"MaxUtilizationScheduler: request ID {paused_req.request_id} -> pause"
                     )
                     req_it_end = last_started_idx
+                elif (
+                    scheduler.python_capacity_scheduler_policy
+                    == PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+                    and req.is_context_init_state
+                ):
+                    req_it += 1
                 else:
                     break
 
@@ -1422,7 +1586,7 @@ class MaxUtilizationScheduledBlocksManager:
         """
         self.kv_cache_manager = kv_cache_manager
         self.two_steps_look_ahead = two_steps_look_ahead
-        window_sizes = set(kv_cache_manager.max_attention_window_vec)
+        window_sizes = set(get_kv_cache_window_sizes(kv_cache_manager))
         self.num_scheduled_blocks: dict[int, int] = {ws: 0 for ws in window_sizes}
 
     def prepare_blocks_if_schedulable(
@@ -1499,6 +1663,7 @@ class PyCapacityScheduler:
         two_step_lookahead: bool = False,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_COMPLETE,
+        python_capacity_scheduler_policy: Optional[PythonCapacitySchedulerPolicy] = None,
     ):
         """
         Initialize the capacity scheduler.
@@ -1521,6 +1686,7 @@ class PyCapacityScheduler:
         self.two_step_lookahead = two_step_lookahead
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
+        self.python_capacity_scheduler_policy = python_capacity_scheduler_policy
         # Cache state values to avoid repeated .value access (optimization)
         self._no_schedule_until_state_value = no_schedule_until_state.value
         self._no_schedule_after_state_value = no_schedule_after_state.value
@@ -1720,6 +1886,42 @@ class PyCapacityScheduler:
             return True
         return self._can_be_scheduled(req)
 
+    def _get_request_remaining_blocks_sort_key(self, req: LlmRequest) -> tuple[int, ...]:
+        key: list[int] = []
+
+        if self.kv_cache_manager is not None:
+            for window_size in get_kv_cache_window_sizes(self.kv_cache_manager):
+                key.append(
+                    self.kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
+                )
+
+        if self.cross_kv_cache_manager is not None:
+            for window_size in get_kv_cache_window_sizes(self.cross_kv_cache_manager):
+                key.append(
+                    self.cross_kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
+                )
+
+        return tuple(key)
+
+    def _sort_context_requests_by_remaining_blocks(self, requests: RequestList) -> RequestList:
+        if (
+            self.python_capacity_scheduler_policy
+            != PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+        ):
+            return requests
+
+        context_requests = [req for req in requests if req.is_context_init_state]
+        if len(context_requests) < 2:
+            return requests
+
+        sorted_context_requests = sorted(
+            context_requests,
+            key=self._get_request_remaining_blocks_sort_key,
+        )
+        sorted_context_iter = iter(sorted_context_requests)
+
+        return [next(sorted_context_iter) if req.is_context_init_state else req for req in requests]
+
     def schedule_request(
         self, active_requests: RequestList
     ) -> tuple[RequestList, RequestList, RequestList]:
@@ -1773,6 +1975,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         two_step_lookahead: bool = False,
         scheduler_capacity: Optional[int] = None,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        python_capacity_scheduler_policy: Optional[PythonCapacitySchedulerPolicy] = None,
     ):
         # Use scheduler_capacity if provided, otherwise fall back to max_batch_size
         # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
@@ -1788,6 +1991,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
             cross_kv_cache_manager=cross_kv_cache_manager,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=no_schedule_until_state,
+            python_capacity_scheduler_policy=python_capacity_scheduler_policy,
         )
 
         # 2. Initialize Python MicroBatch Scheduler

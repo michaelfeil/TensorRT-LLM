@@ -26,6 +26,8 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <atomic>
+#include <chrono>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -51,6 +53,63 @@ namespace kv_cache_manager
 {
 class BaseKVCacheManager;
 } // namespace kv_cache_manager
+
+namespace detail
+{
+
+struct TransferFuture
+{
+    //! Keep a stable request id because the request object can be cleaned up
+    //! before the async transfer future is drained from mSenderFutures.
+    TransferFuture(LlmRequest::RequestIdType requestId_, std::shared_ptr<LlmRequest> request_,
+        std::future<void>&& future_,
+        std::shared_ptr<std::atomic<bool>> hasError_ = nullptr)
+        : requestId(requestId_)
+        , request(std::move(request_))
+        , future(std::move(future_))
+        , hasError(std::move(hasError_))
+    {
+    }
+
+    TransferFuture(std::shared_ptr<LlmRequest> request_, std::future<void>&& future_,
+        std::shared_ptr<std::atomic<bool>> hasError_ = nullptr)
+        : TransferFuture(request_->mRequestId, std::move(request_), std::move(future_), std::move(hasError_))
+    {
+    }
+
+    LlmRequest::RequestIdType requestId;
+    std::shared_ptr<LlmRequest> request;
+    std::future<void> future;
+    std::shared_ptr<std::atomic<bool>> hasError;
+};
+
+template <typename FutureContainer>
+std::vector<LlmRequest::RequestIdType> getReadyTransferRequestIds(FutureContainer const& futures)
+{
+    std::vector<LlmRequest::RequestIdType> readyRequestIds;
+    for (auto const& transferFuture : futures)
+    {
+        if (transferFuture.future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+        {
+            readyRequestIds.push_back(transferFuture.requestId);
+        }
+    }
+    return readyRequestIds;
+}
+
+template <typename FutureContainer>
+void detachTransferRequests(FutureContainer& futures, LlmRequest::RequestIdType requestId)
+{
+    for (auto& transferFuture : futures)
+    {
+        if (transferFuture.requestId == requestId)
+        {
+            transferFuture.request.reset();
+        }
+    }
+}
+
+} // namespace detail
 
 class CacheSender;
 class CacheReceiver;
@@ -226,6 +285,8 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    [[nodiscard]] virtual bool hasPendingGenTransfer(std::shared_ptr<LlmRequest> llmRequest) const = 0;
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -273,6 +334,8 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
+    [[nodiscard]] bool hasPendingGenTransfer(std::shared_ptr<LlmRequest> llmRequest) const override;
+
 private:
     void initializeCommState();
 
@@ -283,8 +346,8 @@ private:
     // shared_ptr (not raw LlmRequest*) so the futures hold a strong reference for
     // the transfer lifetime; otherwise Python's _terminate_request can drop the
     // request while a C++ status check still dereferences it.
-    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
-    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
+    std::vector<detail::TransferFuture> mSenderFutures;
+    std::vector<detail::TransferFuture> mRequesterFutures;
     // Dedup sets so observe-only timeout WARN logs fire at most once per stuck request.
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;

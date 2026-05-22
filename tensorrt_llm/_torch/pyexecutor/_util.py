@@ -2085,6 +2085,10 @@ def create_py_executor_instance(
     no_schedule_until_state = (LlmRequestState.ENCODER_INIT
                                if cross_kv_cache_manager is not None else
                                LlmRequestState.CONTEXT_INIT)
+    use_python_scheduler = scheduler_config.use_python_scheduler if scheduler_config is not None else False
+    python_capacity_scheduler_policy = (
+        scheduler_config.python_capacity_scheduler_policy
+        if scheduler_config is not None else None)
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -2106,8 +2110,7 @@ def create_py_executor_instance(
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
         )
-    elif (scheduler_config is not None
-          and scheduler_config.use_python_scheduler):
+    elif use_python_scheduler:
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -2119,6 +2122,7 @@ def create_py_executor_instance(
             ctx_chunk_config=ctx_chunk_config,
             cross_kv_cache_manager=cross_kv_cache_manager.impl
             if cross_kv_cache_manager is not None else None,
+            python_capacity_scheduler_policy=python_capacity_scheduler_policy,
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity,
             no_schedule_until_state=no_schedule_until_state)
