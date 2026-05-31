@@ -46,7 +46,31 @@ meson setup builddir \
 
 cd builddir && ninja install
 cd ../..
-rm -rf nixl*  # Remove NIXL source tree to save space
+if [ "${KEEP_SOURCE:-1}" = "1" ]; then
+    # Preserve pristine source (with the POSIX-backend sed applied)
+    # so downstream dev images can bind-mount or symlink it.
+    # NIXL has meson subprojects with nested .git dirs — recurse.
+    #
+    # Trim regenerable meson artifacts before saving (~200MB savings):
+    #   builddir/                       compile output
+    #   subprojects/<extracted-dir>/    meson re-extracts from
+    #                                   packagecache without network
+    # Keep: subprojects/packagecache/   the tarballs to re-extract from
+    #       subprojects/packagefiles/   wrap metadata
+    #       subprojects/<git-wrap>/     no tarball in packagecache
+    rm -rf nixl/builddir
+    for d in nixl/subprojects/*/; do
+        base=$(basename "$d")
+        case "$base" in packagecache|packagefiles) continue ;; esac
+        if compgen -G "nixl/subprojects/packagecache/${base}.*" > /dev/null 2>&1; then
+            rm -rf "$d"
+        fi
+    done
+    mkdir -p /opt/src && mv nixl /opt/src/nixl
+    find /opt/src/nixl -name .git -prune -exec rm -rf {} +
+else
+    rm -rf nixl*  # Remove NIXL source tree to save space
+fi
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
 
 echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"

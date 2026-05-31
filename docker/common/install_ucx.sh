@@ -31,5 +31,17 @@ cd ucx
   --enable-mt
 make install -j$(nproc)
 cd ..
-rm -rf ucx  # Remove UCX source to save space
+if [ "${KEEP_SOURCE:-1}" = "1" ]; then
+    # Preserve pristine source so downstream dev images can bind-mount
+    # or symlink it. Recursive .git removal — UCX submodules carry
+    # nested .git dirs. `make distclean` wipes the autotools build
+    # artifacts (.libs/, *.o, generated configure outputs — typically
+    # ~half the post-install tree) and leaves the source ready to
+    # re-run ./autogen.sh in-pod.
+    ( cd ucx && make distclean >/dev/null 2>&1 || true )
+    mkdir -p /opt/src && mv ucx /opt/src/ucx
+    find /opt/src/ucx -name .git -prune -exec rm -rf {} +
+else
+    rm -rf ucx  # Remove UCX source to save space
+fi
 echo "export LD_LIBRARY_PATH=${UCX_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"

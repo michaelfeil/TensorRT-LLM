@@ -107,6 +107,8 @@ base_pull:
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
 		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
 		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
+		$(if $(KEEP_SOURCE), --build-arg KEEP_SOURCE="$(KEEP_SOURCE)") \
+		$(if $(image_src_key), --build-arg image_src_key="$(image_src_key)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \

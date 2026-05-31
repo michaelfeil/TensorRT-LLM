@@ -4,6 +4,19 @@ ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=26.02-py3
 ARG TRITON_BASE_TAG=26.02-py3
 ARG DEVEL_IMAGE=devel
+# KEEP_SOURCE=1 (default) preserves the trt-llm wheel-stage source
+# + UCX/NIXL/UCXX in the release image as ONE encrypted+compressed
+# bundle at /opt/src/source-bundle.tar.zst.enc (~500MB-1GB).
+# Set --build-arg KEEP_SOURCE=0 to disable — release becomes
+# byte-identical to upstream (no bundle, no extra layers, smaller image).
+#
+# Bundle internal layout (paths relative to "/"):
+#   ./app/tensorrt_llm/   wheel-stage source minus excludes
+#   ./opt/src/ucx/        pristine UCX (.git stripped)
+#   ./opt/src/nixl/       pristine NIXL (.git stripped)
+#   ./opt/src/ucxx/       pristine UCXX from FetchContent
+# Extracted in-pod via init_trtllm_build.sh (decrypts with --key flag).
+ARG KEEP_SOURCE=1
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
 
@@ -64,12 +77,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
+ARG KEEP_SOURCE
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
+    KEEP_SOURCE=${KEEP_SOURCE} GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
+    KEEP_SOURCE=${KEEP_SOURCE} GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
     bash /opt/docker/common/install_etcd.sh && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
@@ -129,13 +143,21 @@ WORKDIR /app/tensorrt_llm
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
     pip install /tmp/wheel/tensorrt_llm*.whl
 
+ARG KEEP_SOURCE
+ARG image_src_key=b10labs@2026
+
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=docs,target=/mnt/ctx/docs \
     --mount=type=bind,source=cpp/include,target=/mnt/ctx/include \
     --mount=type=bind,source=examples,target=/mnt/ctx/examples \
+    --mount=type=bind,source=docker/common/build_source_bundle.sh,target=/tmp/build_source_bundle.sh \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/mnt/wheel \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/benchmarks,target=/mnt/benchmarks \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/cpp/build/benchmarks,target=/mnt/cpp_benchmarks \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm,target=/tmp/_wheel_src,ro \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/cpp/build/_deps/ucxx-src,target=/tmp/_keep_ucxx,ro \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
     # Copy build context files
     cp /mnt/ctx/README.md ./ && \
     cp -r /mnt/ctx/docs ./docs && \
@@ -150,6 +172,12 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
        /mnt/cpp_benchmarks/gptManagerBenchmark \
        /mnt/cpp_benchmarks/disaggServerBenchmark \
        benchmarks/cpp/ && \
+    if [ "${KEEP_SOURCE:-1}" = "1" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends zstd openssl && \
+        image_src_key="$image_src_key" bash /tmp/build_source_bundle.sh && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi && \
     rm -v \
       benchmarks/cpp/bertBenchmark.cpp \
       benchmarks/cpp/gptManagerBenchmark.cpp \
