@@ -193,7 +193,7 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
     if (!req->isCompleted())
     {
         waitForUcxRequestCompletion(req, future, ctx, mManager->getRank(), "sendConnectionId", true, buffer,
-            buffer->size(), getHostControlRequestTimeoutMs(mManager->getRank()));
+            buffer->size(), getHostControlRequestTimeoutMs(mManager->getRank()), mEndpoint.get());
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "sendConnectionId should be completed");
     req->checkError();
@@ -242,7 +242,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
     if (!req->isCompleted())
     {
         waitForUcxRequestCompletion(req, future, ctx, rank, "send", true, callbackData, hostControlBuffer->size(),
-            getHostControlRequestTimeoutMs(rank));
+            getHostControlRequestTimeoutMs(rank), mEndpoint.get());
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
     req->checkError();
@@ -279,12 +279,12 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
     auto hostControlBuffer = std::make_shared<std::vector<char>>(size);
     ucxx::RequestCallbackUserData callbackData = hostControlBuffer;
-    auto req = mEndpoint->tagRecv(
-        hostControlBuffer->data(), size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback, callbackData);
+    auto req = mEndpoint->tagRecv(hostControlBuffer->data(), size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false,
+        completionCallback, callbackData);
     if (!req->isCompleted())
     {
         waitForUcxRequestCompletion(req, future, ctx, rank, "recv", true, callbackData, hostControlBuffer->size(),
-            getHostControlRequestTimeoutMs(rank));
+            getHostControlRequestTimeoutMs(rank), mEndpoint.get());
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
     req->checkError();

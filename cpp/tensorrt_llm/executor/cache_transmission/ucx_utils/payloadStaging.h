@@ -35,7 +35,8 @@ int getUcxRequestTimeoutMs(int rank, char const* envName, int defaultTimeoutMs, 
 
 void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std::future<void>& future,
     DataContext const& ctx, int rank, char const* operation, bool stagedBuffer,
-    ucxx::RequestCallbackUserData const& callbackData, size_t stagedBytes, int timeoutMs = 0);
+    ucxx::RequestCallbackUserData const& callbackData, size_t stagedBytes, int timeoutMs = 0,
+    ucxx::Endpoint* endpoint = nullptr);
 
 void sendPayloadWithStaging(
     ucxx::Endpoint& endpoint, uint64_t sendTag, DataContext const& ctx, void const* data, size_t size, int rank);

@@ -29,6 +29,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <exception>
@@ -67,9 +68,8 @@ constexpr int32_t kTagTypeMask = (1 << kTagTypeBits) - 1;
 constexpr size_t kPayloadChunkTagStartOffset = 1;
 
 template <typename EnvGetter>
-size_t getSizeEnvOrDefault(
-    int rank, char const* envName, size_t defaultValue, char const* description, char const* unitSuffix,
-    EnvGetter&& envGetter)
+size_t getSizeEnvOrDefault(int rank, char const* envName, size_t defaultValue, char const* description,
+    char const* unitSuffix, EnvGetter&& envGetter)
 {
     try
     {
@@ -585,6 +585,78 @@ void cancelRequestWithLog(std::shared_ptr<ucxx::Request> const& req, DataContext
     req->cancel();
 }
 
+std::string captureUcpEndpointInfo(ucxx::Endpoint& endpoint)
+{
+    ucp_ep_h const handle = endpoint.getHandle();
+    if (handle == nullptr)
+    {
+        return "<ucp_ep_h is null>";
+    }
+    char* buf = nullptr;
+    size_t size = 0;
+    FILE* stream = ::open_memstream(&buf, &size);
+    if (stream == nullptr)
+    {
+        return "<failed to open_memstream>";
+    }
+    ucp_ep_print_info(handle, stream);
+    std::fflush(stream);
+    std::fclose(stream);
+    std::string result(buf != nullptr ? buf : "", size);
+    std::free(buf);
+    return result;
+}
+
+void dumpUcxConnectionDiagnostics(
+    int rank, ucxx::Endpoint* endpoint, char const* operation, int tag, char const* cancelReason, char const* ucsStatus)
+{
+    if (endpoint == nullptr)
+    {
+        return;
+    }
+    size_t cancelingSize = 0;
+    try
+    {
+        cancelingSize = endpoint->getCancelingSize();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING(rank, "UCX diagnostics: getCancelingSize() threw: %s", e.what());
+    }
+    std::string epInfo;
+    std::string workerInfo;
+    try
+    {
+        epInfo = captureUcpEndpointInfo(*endpoint);
+    }
+    catch (std::exception const& e)
+    {
+        epInfo = std::string("<exception capturing ucp_ep_print_info: ") + e.what() + ">";
+    }
+    try
+    {
+        auto worker = endpoint->getWorker();
+        if (worker)
+        {
+            workerInfo = worker->getInfo();
+        }
+        else
+        {
+            workerInfo = "<no worker>";
+        }
+    }
+    catch (std::exception const& e)
+    {
+        workerInfo = std::string("<exception capturing worker info: ") + e.what() + ">";
+    }
+    TLLM_LOG_WARNING(rank,
+        "UCX diagnostics dump: operation=%s tag=%d ucsStatus=%s cancelReason=\"%s\" "
+        "endpointCancelingSize=%zu\n"
+        "--- ucp_ep_print_info ---\n%s"
+        "--- ucp_worker_print_info ---\n%s",
+        operation, tag, ucsStatus, cancelReason, cancelingSize, epInfo.c_str(), workerInfo.c_str());
+}
+
 std::chrono::steady_clock::time_point getRequestDeadline(int timeoutMs)
 {
     if (timeoutMs <= 0)
@@ -637,10 +709,10 @@ struct PayloadDeviceCopy
 };
 
 void waitForPayloadChunk(PayloadChunkRequest& chunk, DataContext const& ctx, int rank, char const* operation,
-    std::chrono::steady_clock::time_point deadline)
+    std::chrono::steady_clock::time_point deadline, ucxx::Endpoint* endpoint = nullptr)
 {
     waitForUcxRequestCompletion(chunk.request, chunk.future, ctx, rank, operation, chunk.stagedBuffer,
-        chunk.callbackData, chunk.stagedBytes, getRemainingTimeoutMs(deadline));
+        chunk.callbackData, chunk.stagedBytes, getRemainingTimeoutMs(deadline), endpoint);
     TLLM_CHECK_WITH_INFO(chunk.request->isCompleted(), "UCX payload chunk should be completed");
     chunk.request->checkError();
 }
@@ -671,8 +743,8 @@ void quarantineActivePayloadChunks(
     }
 }
 
-void sendPayloadChunks(ucxx::Endpoint& endpoint, uint64_t sendTag, DataContext const& ctx, void const* data,
-    size_t size, int rank)
+void sendPayloadChunks(
+    ucxx::Endpoint& endpoint, uint64_t sendTag, DataContext const& ctx, void const* data, size_t size, int rank)
 {
     size_t const chunkBytes = getPayloadStagingChunkBytes(rank);
     size_t const chunkCount = ceilDiv(size, chunkBytes);
@@ -693,7 +765,7 @@ void sendPayloadChunks(ucxx::Endpoint& endpoint, uint64_t sendTag, DataContext c
         {
             auto chunk = std::move(activeChunks.front());
             activeChunks.pop_front();
-            waitForPayloadChunk(chunk, ctx, rank, "send", deadline);
+            waitForPayloadChunk(chunk, ctx, rank, "send", deadline, &endpoint);
         };
         auto submitPendingSendCopy = [&](bool force) -> bool
         {
@@ -725,7 +797,7 @@ void sendPayloadChunks(ucxx::Endpoint& endpoint, uint64_t sendTag, DataContext c
                 req, std::move(future), callbackData, copy.buffer, 0, copy.transferBytes, copy.stagedBytes, true};
             if (req->isCompleted())
             {
-                waitForPayloadChunk(chunk, ctx, rank, "send", deadline);
+                waitForPayloadChunk(chunk, ctx, rank, "send", deadline, &endpoint);
             }
             else
             {
@@ -894,7 +966,7 @@ void recvPayloadChunks(
 
             auto chunk = std::move(activeChunks.front());
             activeChunks.pop_front();
-            waitForPayloadChunk(chunk, ctx, rank, "recv", deadline);
+            waitForPayloadChunk(chunk, ctx, rank, "recv", deadline, &endpoint);
             auto copyDone = makeCudaEvent(rank);
             pendingCopyBuffer = chunk.buffer;
             TLLM_CUDA_CHECK(cudaMemcpyAsync(
@@ -969,7 +1041,7 @@ void preallocatePayloadStagingBufferPool(int rank)
 
 void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std::future<void>& future,
     DataContext const& ctx, int rank, char const* operation, bool stagedBuffer,
-    ucxx::RequestCallbackUserData const& callbackData, size_t stagedBytes, int timeoutMs)
+    ucxx::RequestCallbackUserData const& callbackData, size_t stagedBytes, int timeoutMs, ucxx::Endpoint* endpoint)
 {
     bool cancelRequested = false;
     bool operationTimedOut = false;
@@ -1016,6 +1088,7 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
                 operation, ctx.getTag(), kRequestCancelGraceMs, ucsStatus, static_cast<int>(req->isCompleted()),
                 stagedBytes, cancelReason, static_cast<long long>(elapsedSinceStartMs),
                 static_cast<long long>(elapsedSinceCancelMs));
+            dumpUcxConnectionDiagnostics(rank, endpoint, operation, ctx.getTag(), cancelReason, ucsStatus);
             quarantineStagedRequest(req, callbackData, stagedBytes, rank, operation, ctx.getTag());
             TLLM_THROW(
                 "Timed out waiting for canceled UCX %s for tag %d to complete after %d ms "
@@ -1027,15 +1100,16 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
     }
     if (operationTimedOut && timeoutMs > 0)
     {
-        auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - operationStart)
-                                   .count();
+        auto const elapsedMs
+            = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - operationStart)
+                  .count();
         char const* const ucsStatus = ucs_status_string(req->getStatus());
         TLLM_LOG_ERROR(rank,
             "Timed out waiting for UCX %s for tag %d after %d ms; "
             "ucsStatus=%s isCompleted=%d cancelReason=\"%s\" elapsedMs=%lld",
             operation, ctx.getTag(), timeoutMs, ucsStatus, static_cast<int>(req->isCompleted()), cancelReason,
             static_cast<long long>(elapsedMs));
+        dumpUcxConnectionDiagnostics(rank, endpoint, operation, ctx.getTag(), cancelReason, ucsStatus);
         TLLM_THROW(
             "Timed out waiting for UCX %s for tag %d after %d ms "
             "(ucsStatus=%s cancelReason=\"%s\" elapsedMs=%lld)",
@@ -1065,7 +1139,7 @@ void sendPayloadWithStaging(
     if (!req->isCompleted())
     {
         waitForUcxRequestCompletion(
-            req, future, ctx, rank, "send", true, callbackData, buffer->capacity(), timeoutMs);
+            req, future, ctx, rank, "send", true, callbackData, buffer->capacity(), timeoutMs, &endpoint);
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
     req->checkError();
@@ -1088,12 +1162,12 @@ void recvPayloadWithStaging(
     auto promise = std::make_shared<std::promise<void>>();
     std::future<void> future = promise->get_future();
     auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
-    auto req = endpoint.tagRecv(recvBuffer, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback,
-        callbackData);
+    auto req = endpoint.tagRecv(
+        recvBuffer, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback, callbackData);
     if (!req->isCompleted())
     {
         waitForUcxRequestCompletion(
-            req, future, ctx, rank, "recv", true, callbackData, buffer->capacity(), timeoutMs);
+            req, future, ctx, rank, "recv", true, callbackData, buffer->capacity(), timeoutMs, &endpoint);
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
     req->checkError();
