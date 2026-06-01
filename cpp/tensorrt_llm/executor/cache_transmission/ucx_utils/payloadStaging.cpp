@@ -973,9 +973,11 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
 {
     bool cancelRequested = false;
     bool operationTimedOut = false;
-    auto const operationDeadline = timeoutMs > 0
-        ? std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs)
-        : std::chrono::steady_clock::time_point::max();
+    char const* cancelReason = "none";
+    auto const operationStart = std::chrono::steady_clock::now();
+    auto const operationDeadline = timeoutMs > 0 ? operationStart + std::chrono::milliseconds(timeoutMs)
+                                                 : std::chrono::steady_clock::time_point::max();
+    std::chrono::steady_clock::time_point cancelStart{};
     std::chrono::steady_clock::time_point cancelDeadline{};
     while (!req->isCompleted())
     {
@@ -985,31 +987,59 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
             operationTimedOut = true;
             if (!cancelRequested)
             {
-                cancelRequestWithLog(req, ctx, rank, operation, "operation timeout");
+                cancelReason = "operation timeout";
+                cancelRequestWithLog(req, ctx, rank, operation, cancelReason);
                 cancelRequested = true;
+                cancelStart = now;
                 cancelDeadline = now + std::chrono::milliseconds(kRequestCancelGraceMs);
             }
         }
         else if (ctx.getTransferTerminate().load() && !cancelRequested)
         {
-            cancelRequestWithLog(req, ctx, rank, operation, "transfer terminated");
+            cancelReason = "transfer terminated";
+            cancelRequestWithLog(req, ctx, rank, operation, cancelReason);
             cancelRequested = true;
+            cancelStart = now;
             cancelDeadline = now + std::chrono::milliseconds(kRequestCancelGraceMs);
         }
         if (cancelRequested && stagedBuffer && now >= cancelDeadline)
         {
-            TLLM_LOG_ERROR(rank, "Timed out waiting for canceled UCX %s for tag %d to complete after %d ms", operation,
-                ctx.getTag(), kRequestCancelGraceMs);
+            auto const elapsedSinceStartMs
+                = std::chrono::duration_cast<std::chrono::milliseconds>(now - operationStart).count();
+            auto const elapsedSinceCancelMs
+                = std::chrono::duration_cast<std::chrono::milliseconds>(now - cancelStart).count();
+            char const* const ucsStatus = ucs_status_string(req->getStatus());
+            TLLM_LOG_ERROR(rank,
+                "Timed out waiting for canceled UCX %s for tag %d to complete after %d ms; "
+                "ucsStatus=%s isCompleted=%d stagedBytes=%zu cancelReason=\"%s\" "
+                "elapsedSinceStartMs=%lld elapsedSinceCancelMs=%lld",
+                operation, ctx.getTag(), kRequestCancelGraceMs, ucsStatus, static_cast<int>(req->isCompleted()),
+                stagedBytes, cancelReason, static_cast<long long>(elapsedSinceStartMs),
+                static_cast<long long>(elapsedSinceCancelMs));
             quarantineStagedRequest(req, callbackData, stagedBytes, rank, operation, ctx.getTag());
-            TLLM_THROW("Timed out waiting for canceled UCX %s for tag %d to complete after %d ms", operation,
-                ctx.getTag(), kRequestCancelGraceMs);
+            TLLM_THROW(
+                "Timed out waiting for canceled UCX %s for tag %d to complete after %d ms "
+                "(ucsStatus=%s cancelReason=\"%s\" stagedBytes=%zu elapsedSinceStartMs=%lld elapsedSinceCancelMs=%lld)",
+                operation, ctx.getTag(), kRequestCancelGraceMs, ucsStatus, cancelReason, stagedBytes,
+                static_cast<long long>(elapsedSinceStartMs), static_cast<long long>(elapsedSinceCancelMs));
         }
         future.wait_for(std::chrono::milliseconds(kRequestPollMs));
     }
     if (operationTimedOut && timeoutMs > 0)
     {
-        TLLM_LOG_ERROR(rank, "Timed out waiting for UCX %s for tag %d after %d ms", operation, ctx.getTag(), timeoutMs);
-        TLLM_THROW("Timed out waiting for UCX %s for tag %d after %d ms", operation, ctx.getTag(), timeoutMs);
+        auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - operationStart)
+                                   .count();
+        char const* const ucsStatus = ucs_status_string(req->getStatus());
+        TLLM_LOG_ERROR(rank,
+            "Timed out waiting for UCX %s for tag %d after %d ms; "
+            "ucsStatus=%s isCompleted=%d cancelReason=\"%s\" elapsedMs=%lld",
+            operation, ctx.getTag(), timeoutMs, ucsStatus, static_cast<int>(req->isCompleted()), cancelReason,
+            static_cast<long long>(elapsedMs));
+        TLLM_THROW(
+            "Timed out waiting for UCX %s for tag %d after %d ms "
+            "(ucsStatus=%s cancelReason=\"%s\" elapsedMs=%lld)",
+            operation, ctx.getTag(), timeoutMs, ucsStatus, cancelReason, static_cast<long long>(elapsedMs));
     }
 }
 
