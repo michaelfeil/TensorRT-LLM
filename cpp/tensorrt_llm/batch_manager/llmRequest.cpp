@@ -76,7 +76,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
         return std::nullopt;
     }
 
-    TLLM_LOG_DEBUG("Creating response for request %lu", mRequestId);
+    TLLM_LOG_REQ_DEBUG(mRequestId, "Creating response");
 
     executor::Result result;
     result.sequenceIndex = mSequenceIndex;

@@ -288,18 +288,15 @@ size_t drainReadyFailedGenerationTransferFutures(std::vector<detail::TransferFut
         try
         {
             it->future.get();
-            TLLM_LOG_ERROR("Generation transfer for request %zu reported an error but completed successfully.",
-                static_cast<size_t>(requestId));
+            TLLM_LOG_REQ_ERROR(requestId, "Generation transfer reported an error but completed successfully.");
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("Error occurred during generation transfer for request %zu: %s",
-                static_cast<size_t>(requestId), e.what());
+            TLLM_LOG_REQ_ERROR(requestId, "Error occurred during generation transfer: %s", e.what());
         }
         catch (...)
         {
-            TLLM_LOG_ERROR(
-                "Unknown error occurred during generation transfer for request %zu", static_cast<size_t>(requestId));
+            TLLM_LOG_REQ_ERROR(requestId, "Unknown error occurred during generation transfer");
         }
 
         if (request != nullptr)
@@ -312,8 +309,7 @@ size_t drainReadyFailedGenerationTransferFutures(std::vector<detail::TransferFut
     return drainedCount;
 }
 
-std::vector<LlmRequest::RequestIdType> deduplicateRequestIds(
-    std::vector<LlmRequest::RequestIdType> const& requestIds)
+std::vector<LlmRequest::RequestIdType> deduplicateRequestIds(std::vector<LlmRequest::RequestIdType> const& requestIds)
 {
     std::unordered_set<LlmRequest::RequestIdType> uniqueRequestIds(requestIds.begin(), requestIds.end());
     return std::vector<LlmRequest::RequestIdType>(uniqueRequestIds.begin(), uniqueRequestIds.end());
@@ -655,7 +651,7 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
     {
         if (llmRequest->getContextProgress() == nullptr)
         {
-            TLLM_LOG_WARNING("Request %ld is already responding", llmRequest->mRequestId);
+            TLLM_LOG_REQ_WARNING(llmRequest->mRequestId, "Request is already responding");
         }
         return;
     }
@@ -672,7 +668,7 @@ void CacheTransceiver::respondAndSendLayerWise(
         TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
         TLLM_CHECK(!llmRequest->getContextPhaseParams().has_value());
         llmRequest->setContextProgress(progress);
-        TLLM_LOG_DEBUG("Request %ld is being sent layer-wise.", llmRequest->mRequestId);
+        TLLM_LOG_REQ_DEBUG(llmRequest->mRequestId, "Request is being sent layer-wise.");
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
@@ -700,7 +696,7 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
             [requestId](auto const& transferFuture) { return transferFuture.requestId == requestId; })
         != mRequesterFutures.end())
     {
-        TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", requestId);
+        TLLM_LOG_REQ_WARNING(requestId, "Request is already in mRequestFutures.");
         return;
     }
 
@@ -1151,7 +1147,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR("Error occurred during generation transfer for request %ld: %s", requestId, e.what());
+                TLLM_LOG_REQ_ERROR(requestId, "Error occurred during generation transfer: %s", e.what());
                 if (request != nullptr)
                 {
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);

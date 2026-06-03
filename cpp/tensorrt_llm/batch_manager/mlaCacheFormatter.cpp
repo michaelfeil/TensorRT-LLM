@@ -145,7 +145,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
-        TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_REQ_DEBUG(llmRequest.mRequestId, "No targets to send KV cache to");
         return;
     }
 
@@ -410,7 +410,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto localRankIndices = std::get<1>(pickRecvConnResult);
     if (pickUpConnections.empty())
     {
-        TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_REQ_DEBUG(llmRequest.mRequestId, "No targets to receive KV cache");
         return;
     }
     bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;

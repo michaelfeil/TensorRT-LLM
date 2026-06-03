@@ -102,7 +102,7 @@ void RnnCacheFormatter::formatSlotMode(TransferSession& session)
     auto const targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
-        TLLM_LOG_DEBUG("No targets to send RNN state to for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_REQ_DEBUG(llmRequest.mRequestId, "No targets to send RNN state to");
         return;
     }
 
@@ -263,7 +263,7 @@ void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
 
     if (sourceNum == 0)
     {
-        TLLM_LOG_DEBUG("No sources to receive RNN state from for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_REQ_DEBUG(llmRequest.mRequestId, "No sources to receive RNN state from");
         return;
     }
 

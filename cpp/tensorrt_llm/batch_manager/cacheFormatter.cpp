@@ -378,7 +378,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     size_t targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
-        TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_REQ_DEBUG(llmRequest.mRequestId, "No targets to send KV cache to");
         return;
     }
 
@@ -638,7 +638,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto localRankIndices = std::get<1>(pickRecvConnResult);
     if (pickUpConnections.empty())
     {
-        TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: %ld", llmRequest.mRequestId);
+        TLLM_LOG_REQ_DEBUG(llmRequest.mRequestId, "No targets to receive KV cache");
         return;
     }
 

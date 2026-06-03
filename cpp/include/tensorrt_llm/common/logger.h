@@ -415,3 +415,14 @@ TRTLLM_NAMESPACE_END
 #define TLLM_LOG_WARNING(...) TLLM_LOG(tensorrt_llm::common::Logger::WARNING, __VA_ARGS__)
 #define TLLM_LOG_ERROR(...) TLLM_LOG(tensorrt_llm::common::Logger::ERROR, __VA_ARGS__)
 #define TLLM_LOG_EXCEPTION(ex, ...) tensorrt_llm::common::Logger::getLogger()->log(ex, ##__VA_ARGS__)
+
+// Request-scoped logging: prefixes every line with "[request_id=<id>] " so log
+// lines emitted from request-scoped code paths can be located via a single grep.
+// Use whenever a request id is already in scope at the log site.
+#define TLLM_LOG_REQ(level, requestId, fmt, ...)                                                                       \
+    TLLM_LOG(level, "[request_id=%zu] " fmt, static_cast<std::size_t>(requestId), ##__VA_ARGS__)
+#define TLLM_LOG_REQ_TRACE(requestId, ...) TLLM_LOG_REQ(tensorrt_llm::common::Logger::TRACE, requestId, __VA_ARGS__)
+#define TLLM_LOG_REQ_DEBUG(requestId, ...) TLLM_LOG_REQ(tensorrt_llm::common::Logger::DEBUG, requestId, __VA_ARGS__)
+#define TLLM_LOG_REQ_INFO(requestId, ...) TLLM_LOG_REQ(tensorrt_llm::common::Logger::INFO, requestId, __VA_ARGS__)
+#define TLLM_LOG_REQ_WARNING(requestId, ...) TLLM_LOG_REQ(tensorrt_llm::common::Logger::WARNING, requestId, __VA_ARGS__)
+#define TLLM_LOG_REQ_ERROR(requestId, ...) TLLM_LOG_REQ(tensorrt_llm::common::Logger::ERROR, requestId, __VA_ARGS__)

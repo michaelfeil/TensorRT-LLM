@@ -352,8 +352,9 @@ public:
             }
             if (duplicateRequestId)
             {
-                TLLM_LOG_ERROR("Duplicate ready response request_id=%zu current_request=%ld ready_responses=%zu",
-                    llmRequest->mRequestId, currentRequestId, readyResponsesSize);
+                TLLM_LOG_REQ_ERROR(llmRequest->mRequestId,
+                    "Duplicate ready response current_request=%ld ready_responses=%zu", currentRequestId,
+                    readyResponsesSize);
                 auto err = TLLM_REQUEST_EXCEPTION(llmRequest->mRequestId, common::RequestErrorCode::kUNKNOWN_ERROR,
                     "Duplicate ready response insertion for request %zu", llmRequest->mRequestId);
                 promise.set_exception(std::make_exception_ptr(err));
@@ -587,7 +588,7 @@ public:
         }
         if (!isCancelled)
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            TLLM_LOG_REQ_WARNING(llmRequest.mRequestId, "Cannot cancel request");
         }
         return isCancelled;
     }
@@ -664,7 +665,7 @@ private:
 
     void logDiscardedRequestInfo(RequestIdType requestId, char const* reason) const
     {
-        TLLM_LOG_WARNING("Discarding stale context transfer request info request_id=%zu reason=%s", requestId, reason);
+        TLLM_LOG_REQ_WARNING(requestId, "Discarding stale context transfer request info reason=%s", reason);
     }
 
     void handleAsyncSend(AsyncSendResource& resource)
@@ -708,12 +709,11 @@ private:
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_WARNING(
-                    "Failed to release transfer session after send failure for request %zu: %s", id, e.what());
+                TLLM_LOG_REQ_WARNING(id, "Failed to release transfer session after send failure: %s", e.what());
             }
             catch (...)
             {
-                TLLM_LOG_WARNING("Failed to release transfer session after send failure for request %zu", id);
+                TLLM_LOG_REQ_WARNING(id, "Failed to release transfer session after send failure");
             }
         };
 
@@ -726,14 +726,14 @@ private:
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
-            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
+            TLLM_LOG_REQ_ERROR(id, "Exception in sendAndRemoveResponse: %s", e.what());
             releaseOnFailure();
             auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
             resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
+            TLLM_LOG_REQ_ERROR(id, "Exception in sendAndRemoveResponse: %s", e.what());
             releaseOnFailure();
             resp.mPromise.set_exception(std::current_exception());
         }
@@ -1312,10 +1312,10 @@ public:
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(allConnections),
-            DataContext{tagFromRequestId(requestId), *requestCancelFlag}, std::move(allCounterparts), mSelfState,
-            contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(),
-            &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty(), requestCancelFlag);
+        return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), *requestCancelFlag},
+            std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
+            requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
+            !common::getEnvKVCacheTimeOutputPath().empty(), requestCancelFlag);
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -1404,7 +1404,7 @@ public:
 
         if (!isCancelled)
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            TLLM_LOG_REQ_WARNING(llmRequest.mRequestId, "Cannot cancel request");
         }
         return isCancelled;
     }
@@ -1588,8 +1588,8 @@ private:
                     {
                         requestAndPromise.mHasError->store(true);
                     }
-                    TLLM_LOG_ERROR("Exception in DataRequester request(): request id:%zu , request context id:%zu : %s",
-                        requestAndPromise.mRequest->mRequestId,
+                    TLLM_LOG_REQ_ERROR(requestAndPromise.mRequest->mRequestId,
+                        "Exception in DataRequester request(): context_request_id=%zu: %s",
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
                     auto new_exception = TLLM_REQUEST_EXCEPTION(
                         requestAndPromise.mRequest->mRequestId, err.getErrorCode(), "%s", err.what());
@@ -1601,8 +1601,8 @@ private:
                     {
                         requestAndPromise.mHasError->store(true);
                     }
-                    TLLM_LOG_ERROR("Exception in CacheReceiver request(): request id:%ld , request context id:%ld : %s",
-                        requestAndPromise.mRequest->mRequestId,
+                    TLLM_LOG_REQ_ERROR(requestAndPromise.mRequest->mRequestId,
+                        "Exception in CacheReceiver request(): context_request_id=%ld: %s",
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
                     requestAndPromise.mPromise->set_exception(std::current_exception());
                 }
