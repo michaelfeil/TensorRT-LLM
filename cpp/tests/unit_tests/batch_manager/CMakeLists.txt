@@ -15,6 +15,7 @@
 
 add_gtest(radixTreeTest radixTreeTest.cpp)
 add_gtest(blockKeyTest blockKeyTest.cpp)
+add_gtest(cacheTransceiverDiagnosticsTest cacheTransceiverDiagnosticsTest.cpp)
 add_gtest(radixBlockTreeTest radixBlockTreeTest.cpp)
 add_gtest(cacheTransBufferTest cacheTransBufferTest.cpp)
 add_gtest(bufferIndexHolderTest bufferIndexHolderTest.cpp)

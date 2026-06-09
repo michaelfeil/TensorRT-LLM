@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/batch_manager/utils/cacheTransceiverDiagnostics.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
@@ -418,15 +419,31 @@ public:
     {
         std::unique_lock<std::mutex> lock(mMtxForMap);
         auto it = mRequestToSession.find(requestId);
-        TLLM_CHECK(it != mRequestToSession.end());
+        if (it == mRequestToSession.end())
+        {
+            TLLM_THROW("getCounterpartsCount: session not found in mRequestToSession; %s",
+                utils::formatSessionNotFoundDiagnostic(
+                    requestId, mRequestToSession, mRequestCancelFlags, mSenderMutex, mCancelledRequests)
+                    .c_str());
+        }
         return it->second.getConnections().size();
     }
 
-    void release(LlmRequest::RequestIdType requestId)
+    /// `reason` is caller attribution for diagnostics (e.g. "send_complete", "cancel").
+    void release(LlmRequest::RequestIdType requestId, char const* reason = "unspecified")
     {
         std::unique_lock<std::mutex> lk(mMtxForMap);
         auto it = mRequestToSession.find(requestId);
-        TLLM_CHECK(it != mRequestToSession.end());
+        if (it == mRequestToSession.end())
+        {
+            TLLM_THROW(
+                "release: session not found in mRequestToSession (likely already released by another path "
+                "such as cancel/timeout). reason=\"%s\" %s",
+                reason,
+                utils::formatSessionNotFoundDiagnostic(
+                    requestId, mRequestToSession, mRequestCancelFlags, mSenderMutex, mCancelledRequests)
+                    .c_str());
+        }
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             if (!mMeasuresFile.is_open())
@@ -705,7 +722,7 @@ private:
         {
             try
             {
-                release(id);
+                release(id, "send_failure");
             }
             catch (std::exception const& e)
             {
@@ -721,7 +738,7 @@ private:
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
             sendSync(*resp.mRequest);
-            release(id);
+            release(id, "send_complete");
             resp.mPromise.set_value();
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
@@ -789,7 +806,7 @@ private:
                 removeResponse(it);
                 try
                 {
-                    release(cancelledReqId);
+                    release(cancelledReqId, "cancel");
                 }
                 catch (std::exception const& e)
                 {
