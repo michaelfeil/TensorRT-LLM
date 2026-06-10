@@ -228,6 +228,11 @@ public:
         std::vector<SizeType32> const& counterPartRanks) const
         = 0;
 
+    [[nodiscard]] virtual bool shouldReportKvCacheTransferEvent(TransferSession const&) const
+    {
+        return true;
+    }
+
     /// @brief Destructor.
     virtual ~BaseCacheFormatter() = default;
 };
@@ -250,6 +255,8 @@ public:
     void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
+
+    [[nodiscard]] bool shouldReportKvCacheTransferEvent(TransferSession const& session) const override;
 
     [[nodiscard]] std::vector<SizeType32> getCounterparts(
         CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const override

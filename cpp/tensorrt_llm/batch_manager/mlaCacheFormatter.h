@@ -51,6 +51,8 @@ public:
         return mCacheManager;
     }
 
+    [[nodiscard]] bool shouldReportKvCacheTransferEvent(TransferSession const& session) const override;
+
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
     std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
         CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
@@ -60,6 +62,8 @@ public:
         SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const;
 
 private:
+    [[nodiscard]] std::vector<size_t> pickSendConnections(TransferSession const& session) const;
+
     BaseKVCacheManager* mCacheManager;
     std::vector<CacheTransBufferManager*> mCacheTransBufferManagers;
 };

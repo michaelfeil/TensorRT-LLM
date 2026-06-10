@@ -108,11 +108,24 @@ class KvCacheTransceiver(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def check_context_transfer_status(self, at_least_request_num: int):
+    def check_context_transfer_status(
+            self,
+            at_least_request_num: int,
+            mark_complete: bool = False,
+            collect_kv_transfer_events: bool = False,
+            timed_out_context_request_ids: Optional[List[int]] = None):
         raise NotImplementedError
 
     @abstractmethod
-    def check_gen_transfer_status(self, at_least_request_num: int):
+    def take_context_kv_transfer_event_report(self, req: LlmRequest):
+        """Return whether this rank should report a context KV transfer event."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def check_gen_transfer_status(
+            self,
+            at_least_request_num: int,
+            collect_kv_transfer_events: bool = False):
         raise NotImplementedError
 
     @abstractmethod
@@ -125,6 +138,14 @@ class KvCacheTransceiver(ABC):
 
     @abstractmethod
     def cancel_request(self, req: LlmRequest):
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_context_kv_transfer_failure_event(self, req: LlmRequest):
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_generation_kv_transfer_failure_event(self, req: LlmRequest):
         raise NotImplementedError
 
     @abstractmethod
@@ -219,11 +240,28 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def request_and_receive_async(self, req: LlmRequest):
         return self.impl.request_and_receive_async(req)
 
-    def check_context_transfer_status(self, at_least_request_num: int):
-        return self.impl.check_context_transfer_status(at_least_request_num)
+    def check_context_transfer_status(
+            self,
+            at_least_request_num: int,
+            mark_complete: bool = False,
+            collect_kv_transfer_events: bool = False,
+            timed_out_context_request_ids: Optional[List[int]] = None):
+        return self.impl.check_context_transfer_status(
+            at_least_request_num,
+            mark_complete=mark_complete,
+            collect_kv_transfer_events=collect_kv_transfer_events,
+            timed_out_context_request_ids=timed_out_context_request_ids or [])
 
-    def check_gen_transfer_status(self, at_least_request_num: int):
-        return self.impl.check_gen_transfer_status(at_least_request_num)
+    def take_context_kv_transfer_event_report(self, req: LlmRequest):
+        return self.impl.take_context_kv_transfer_event_report(req)
+
+    def check_gen_transfer_status(
+            self,
+            at_least_request_num: int,
+            collect_kv_transfer_events: bool = False):
+        return self.impl.check_gen_transfer_status(
+            at_least_request_num,
+            collect_kv_transfer_events=collect_kv_transfer_events)
 
     def check_gen_transfer_complete(self):
         return self.impl.check_gen_transfer_complete()
@@ -233,6 +271,12 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def record_context_kv_transfer_failure_event(self, req: LlmRequest):
+        return self.impl.record_context_kv_transfer_failure_event(req)
+
+    def record_generation_kv_transfer_failure_event(self, req: LlmRequest):
+        return self.impl.record_generation_kv_transfer_failure_event(req)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally

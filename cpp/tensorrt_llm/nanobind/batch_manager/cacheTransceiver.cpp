@@ -62,14 +62,18 @@ public:
     }
 
     tb::RequestStatuses checkContextTransferStatus(
-        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false,
+        bool collectKvTransferEvents = false,
+        std::vector<tb::LlmRequest::RequestIdType> const& timedOutContextRequestIds = {}) override
     {
-        NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum, markComplete);
+        NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum, markComplete, collectKvTransferEvents,
+            timedOutContextRequestIds);
     }
 
-    void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
+    tb::RequestStatuses checkGenTransferStatus(
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool collectKvTransferEvents = false) override
     {
-        NB_OVERRIDE_PURE(checkGenTransferStatus, atLeastRequestNum);
+        NB_OVERRIDE_PURE(checkGenTransferStatus, atLeastRequestNum, collectKvTransferEvents);
     }
 
     bool checkGenTransferComplete() const override
@@ -87,6 +91,16 @@ public:
         NB_OVERRIDE_PURE(cancelRequest, llmRequest);
     }
 };
+
+nb::list kvTransferEventRecordsToList(std::vector<tb::KvTransferEventRecord> const& eventRecords)
+{
+    nb::list events;
+    for (auto const& event : eventRecords)
+    {
+        events.append(nb::make_tuple(event.rank, static_cast<int64_t>(event.requestId)));
+    }
+    return events;
+}
 } // namespace
 
 void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
@@ -97,25 +111,57 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
         .def(
             "check_context_transfer_status",
-            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false)
+            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false,
+                bool collectKvTransferEvents = false,
+                std::vector<tb::LlmRequest::RequestIdType> const& timedOutContextRequestIds = {})
             {
                 RequestStatuses result;
                 {
                     nb::gil_scoped_release release;
-                    result = self.checkContextTransferStatus(atLeastRequestNum, markComplete);
+                    result = self.checkContextTransferStatus(
+                        atLeastRequestNum, markComplete, collectKvTransferEvents, timedOutContextRequestIds);
                 }
 
                 auto completedRequestIds
                     = std::vector<int64_t>(result.completedRequestIds.begin(), result.completedRequestIds.end());
                 auto errorRequestIds
                     = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
-                return nb::make_tuple(completedRequestIds, errorRequestIds);
+                auto completedKvTransferEvents = kvTransferEventRecordsToList(result.completedKvTransferEvents);
+                auto errorKvTransferEvents = kvTransferEventRecordsToList(result.errorKvTransferEvents);
+                return nb::make_tuple(
+                    completedRequestIds, errorRequestIds, completedKvTransferEvents, errorKvTransferEvents);
             },
-            nb::arg("at_least_request_num") = std::nullopt, nb::arg("mark_complete") = false)
-        .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("at_least_request_num") = std::nullopt, nb::arg("mark_complete") = false,
+            nb::arg("collect_kv_transfer_events") = false,
+            nb::arg("timed_out_context_request_ids") = std::vector<tb::LlmRequest::RequestIdType>{})
+        .def("take_context_kv_transfer_event_report", &BaseCacheTransceiver::takeContextKvTransferEventReport)
+        .def(
+            "check_gen_transfer_status",
+            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum,
+                bool collectKvTransferEvents = false)
+            {
+                RequestStatuses result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.checkGenTransferStatus(atLeastRequestNum, collectKvTransferEvents);
+                }
+
+                auto completedRequestIds
+                    = std::vector<int64_t>(result.completedRequestIds.begin(), result.completedRequestIds.end());
+                auto errorRequestIds
+                    = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
+                auto completedKvTransferEvents = kvTransferEventRecordsToList(result.completedKvTransferEvents);
+                auto errorKvTransferEvents = kvTransferEventRecordsToList(result.errorKvTransferEvents);
+                return nb::make_tuple(
+                    completedRequestIds, errorRequestIds, completedKvTransferEvents, errorKvTransferEvents);
+            },
+            nb::arg("at_least_request_num") = std::nullopt, nb::arg("collect_kv_transfer_events") = false)
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
         .def("has_pending_gen_transfer", &BaseCacheTransceiver::hasPendingGenTransfer)
+        .def("record_context_kv_transfer_failure_event",
+            &BaseCacheTransceiver::recordContextKvTransferFailureEvent)
+        .def("record_generation_kv_transfer_failure_event",
+            &BaseCacheTransceiver::recordGenerationKvTransferFailureEvent)
         .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")

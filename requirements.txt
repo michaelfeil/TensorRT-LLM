@@ -13,6 +13,7 @@ onnx>=1.21.0
 onnx_graphsurgeon>=0.5.2
 graphviz
 openai
+orjson
 polygraphy
 psutil
 nvidia-ml-py>=13

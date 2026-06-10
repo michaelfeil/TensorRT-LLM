@@ -112,6 +112,11 @@ void CacheTransferLayer::format(TransferSession& session) const
     }
 }
 
+bool CacheTransferLayer::shouldReportKvCacheTransferEvent(TransferSession const& session) const
+{
+    return mKvFormatter->shouldReportKvCacheTransferEvent(session);
+}
+
 void CacheTransferLayer::unformat(TransferSession& session) const
 {
     mKvFormatter->unformat(session);

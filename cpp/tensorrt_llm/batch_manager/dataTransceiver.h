@@ -292,6 +292,10 @@ public:
     /// @param llmRequest The request object to which the data belongs.
     virtual void sendSync(LlmRequest const& llmRequest);
 
+    /// @brief Return and clear whether this local rank should report a context KV transfer event for the request.
+    /// Returns true once per recorded request/rank report bit.
+    [[nodiscard]] virtual bool takeContextKvTransferEventReport(LlmRequest::RequestIdType requestId);
+
     /// @brief Receive request information.
     /// @param llmRequest The request object to which the data belongs.
     virtual std::optional<RequestInfo> recvRequestInfo();

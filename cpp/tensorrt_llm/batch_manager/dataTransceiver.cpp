@@ -38,6 +38,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -429,6 +430,20 @@ public:
         return it->second.getConnections().size();
     }
 
+    [[nodiscard]] bool takeContextKvTransferEventReport(RequestIdType requestId)
+    {
+        std::scoped_lock lock(mMtxForMap);
+        return mReportableContextKvTransferRequestIds.erase(requestId) > 0;
+    }
+
+    void recordContextKvTransferEventReportUnlocked(RequestIdType requestId, TransferSession const& session)
+    {
+        if (mCacheTransferLayer.shouldReportKvCacheTransferEvent(session))
+        {
+            mReportableContextKvTransferRequestIds.insert(requestId);
+        }
+    }
+
     /// `reason` is caller attribution for diagnostics (e.g. "send_complete", "cancel").
     void release(LlmRequest::RequestIdType requestId, char const* reason = "unspecified")
     {
@@ -558,6 +573,7 @@ public:
                 return std::nullopt;
             }
             it->second.setConnection(peerOffset, connection);
+            recordContextKvTransferEventReportUnlocked(requestId, it->second);
         }
         return info;
     }
@@ -570,7 +586,9 @@ public:
             auto it = mRequestToSession.find(llmRequest.mRequestId);
             TLLM_CHECK(it != mRequestToSession.end());
             session = std::addressof(it->second);
+            recordContextKvTransferEventReportUnlocked(llmRequest.mRequestId, *session);
         }
+
         session->setLlmRequest(llmRequest);
         mCacheTransferLayer.format(*session);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
@@ -598,6 +616,15 @@ public:
             isCancelled = true;
         }
 
+        if (isCancelled)
+        {
+            std::scoped_lock lk(mMtxForMap);
+            auto it = mRequestToSession.find(llmRequest.mRequestId);
+            if (it != mRequestToSession.end())
+            {
+                recordContextKvTransferEventReportUnlocked(llmRequest.mRequestId, it->second);
+            }
+        }
         if (isCancelled && dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) == nullptr)
         {
             mReceiveInterrupt.store(true);
@@ -1069,6 +1096,9 @@ private:
     // Sessions poll these flags without holding mMtxForMap, so the flag object must outlive map updates.
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<std::atomic<bool>>> mRequestCancelFlags;
     AsyncSendResource mAsyncSendResource;
+    // Inserted when this rank owns a reportable context KV transfer event. The bit is consumed when
+    // checkContextTransferStatus observes completion/error, or by CacheTransceiver after cancellation succeeds.
+    std::unordered_set<RequestIdType> mReportableContextKvTransferRequestIds;
     std::vector<std::future<void>> mAsyncSendFutures;
     int mDeviceId{-1};
 
@@ -1707,6 +1737,11 @@ CacheSender::~CacheSender() = default;
 void CacheSender::sendSync(LlmRequest const& llmRequest)
 {
     mImpl->sendSync(llmRequest);
+}
+
+bool CacheSender::takeContextKvTransferEventReport(LlmRequest::RequestIdType requestId)
+{
+    return mImpl->takeContextKvTransferEventReport(requestId);
 }
 
 std::optional<RequestInfo> CacheSender::recvRequestInfo()

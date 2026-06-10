@@ -352,6 +352,16 @@ std::pair<std::vector<size_t>, std::vector<size_t>> CacheFormatter::pickRecvConn
         numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
 }
 
+bool CacheFormatter::shouldReportKvCacheTransferEvent(TransferSession const& session) const
+{
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto const targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
+    return !targetInfo.mIRanks.empty()
+        && cache_formatter_utils::needSendCache(selfConfig, destConfig, selfIdx, targetInfo);
+}
+
 void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_format);

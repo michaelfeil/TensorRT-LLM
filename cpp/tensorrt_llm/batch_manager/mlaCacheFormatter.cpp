@@ -120,6 +120,26 @@ bool MLACacheFormatter::needSendCache(
     return selfTpRank % dupHeadFactor == destDPRank % dupHeadFactor;
 }
 
+std::vector<size_t> MLACacheFormatter::pickSendConnections(TransferSession const& session) const
+{
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    if (!needSendCache(selfConfig, destConfig, selfIdx))
+    {
+        return {};
+    }
+
+    auto const& connections = session.getConnections();
+    TLLM_CHECK(!connections.empty());
+    return pickSendConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+}
+
+bool MLACacheFormatter::shouldReportKvCacheTransferEvent(TransferSession const& session) const
+{
+    return !pickSendConnections(session).empty();
+}
+
 void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_format);
@@ -136,12 +156,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto& bufferManager = session.getBufferManager();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     TLLM_CHECK(!connections.empty());
-    if (!needSendCache(selfConfig, destConfig, selfIdx))
-    {
-        return;
-    }
-    auto pickUpConnections
-        = pickSendConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
+    auto pickUpConnections = pickSendConnections(session);
     auto targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {

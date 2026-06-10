@@ -295,6 +295,26 @@ std::optional<std::pair<std::string, int>> parse_zmq_endpoint(std::string const&
     return std::nullopt;
 }
 
+static constexpr int kDefaultZmqConnectionTimeoutMs = 10000;
+static constexpr char const* kUcxConnectionTimeoutMsEnv = "TRTLLM_UCX_CONNECTION_TIMEOUT_MS";
+
+static int getZmqConnectionTimeoutMs(int rank)
+{
+    return getUcxRequestTimeoutMs(
+        rank, kUcxConnectionTimeoutMsEnv, kDefaultZmqConnectionTimeoutMs, "connection bootstrap");
+}
+
+static void configureZmqRequestSocket(zmq::socket_t& socket, int timeoutMs)
+{
+    socket.set(zmq::sockopt::ipv6, 1);
+    socket.set(zmq::sockopt::linger, 0);
+    if (timeoutMs > 0)
+    {
+        socket.set(zmq::sockopt::sndtimeo, timeoutMs);
+        socket.set(zmq::sockopt::rcvtimeo, timeoutMs);
+    }
+}
+
 UcxConnectionManager::UcxConnectionManager()
 {
     try
@@ -579,17 +599,26 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
                     return existingConnectionIt->second;
                 }
             }
+            int const connectionTimeoutMs = getZmqConnectionTimeoutMs(mRank);
             auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
-            reqSocket.set(zmq::sockopt::ipv6, 1);
+            configureZmqRequestSocket(reqSocket, connectionTimeoutMs);
             reqSocket.connect(build_zmq_endpoint(ip, port));
             UcxCmMessage getWorkerAddressMessage(UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress);
             std::ostringstream oStream;
             UcxCmMessage::serialize(getWorkerAddressMessage, oStream);
             std::string getWorkerAddressMessageStr = oStream.str();
-            reqSocket.send(zmq::buffer(getWorkerAddressMessageStr), zmq::send_flags::none);
+            auto sendRet = reqSocket.send(zmq::buffer(getWorkerAddressMessageStr), zmq::send_flags::none);
+            TLLM_CHECK_WITH_INFO(sendRet, "zmq socket.send failed while requesting worker address from %s after %d ms",
+                address.c_str(), connectionTimeoutMs);
             zmq::message_t reply;
             auto ret = reqSocket.recv(reply);
-            TLLM_CHECK_WITH_INFO(ret, "zmq socket.recv failed");
+            if (!ret && connectionTimeoutMs > 0)
+            {
+                TLLM_THROW("Timed out waiting for ZMQ worker address response from %s after %d ms", address.c_str(),
+                    connectionTimeoutMs);
+            }
+            TLLM_CHECK_WITH_INFO(ret, "zmq socket.recv failed while waiting for worker address from %s",
+                address.c_str());
             std::string replyStr(static_cast<char*>(reply.data()), reply.size());
             std::istringstream is(replyStr);
             UcxCmMessage serverMessage = UcxCmMessage::deserialize(is);

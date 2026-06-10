@@ -70,6 +70,8 @@ public:
     /// @param session The transfer session.
     void format(TransferSession& session) const;
 
+    [[nodiscard]] bool shouldReportKvCacheTransferEvent(TransferSession const& session) const;
+
     /// @brief Calls all unformatters sequentially.
     /// @param session The transfer session.
     void unformat(TransferSession& session) const;

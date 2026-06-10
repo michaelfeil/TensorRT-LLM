@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/kvTransferEventObserver.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
@@ -259,6 +260,8 @@ struct RequestStatuses
     std::unordered_set<LlmRequest::RequestIdType> completedRequestIds;
     /// Requests that have encountered an error during their transfer.
     std::unordered_set<LlmRequest::RequestIdType> errorRequestIds;
+    std::vector<KvTransferEventRecord> completedKvTransferEvents;
+    std::vector<KvTransferEventRecord> errorKvTransferEvents;
 };
 
 class BaseCacheTransceiver
@@ -277,16 +280,29 @@ public:
 
     /// Check all requests transferring context, and return the requests that have completed or encountered an error.
     virtual RequestStatuses checkContextTransferStatus(
-        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false)
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false,
+        bool collectKvTransferEvents = false,
+        std::vector<LlmRequest::RequestIdType> const& timedOutContextRequestIds = {})
         = 0;
 
-    virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
+    virtual RequestStatuses checkGenTransferStatus(
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool collectKvTransferEvents = false)
+        = 0;
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
     [[nodiscard]] virtual bool hasPendingGenTransfer(std::shared_ptr<LlmRequest> llmRequest) const = 0;
+
+    virtual void recordContextKvTransferFailureEvent(LlmRequest*) {}
+
+    virtual void recordGenerationKvTransferFailureEvent(LlmRequest*) {}
+
+    [[nodiscard]] virtual bool takeContextKvTransferEventReport(LlmRequest*)
+    {
+        return true;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -326,15 +342,24 @@ public:
     void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     RequestStatuses checkContextTransferStatus(
-        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override;
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false,
+        bool collectKvTransferEvents = false,
+        std::vector<LlmRequest::RequestIdType> const& timedOutContextRequestIds = {}) override;
 
-    void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
+    RequestStatuses checkGenTransferStatus(
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool collectKvTransferEvents = false) override;
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
     [[nodiscard]] bool hasPendingGenTransfer(std::shared_ptr<LlmRequest> llmRequest) const override;
+
+    void recordContextKvTransferFailureEvent(LlmRequest* llmRequest) override;
+
+    void recordGenerationKvTransferFailureEvent(LlmRequest* llmRequest) override;
+
+    [[nodiscard]] bool takeContextKvTransferEventReport(LlmRequest* llmRequest) override;
 
 private:
     void initializeCommState();
@@ -357,6 +382,7 @@ private:
     std::unordered_set<LlmRequest::RequestIdType> mCompletedRequesterRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedRequesterRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mRequesterRequestsAwaitingConsensus;
+    KvTransferEventObserver mKvTransferEventObserver;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;

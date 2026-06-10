@@ -22,6 +22,7 @@ from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
+import orjson
 import psutil
 import torch
 
@@ -836,7 +837,7 @@ class BaseWorker(GenerationExecutor):
             stats_dict["requestStats"] = []
             for req_stat in req_stats:
                 stats_dict["requestStats"].append(
-                    json.loads(req_stat.to_json_str()))
+                    orjson.loads(req_stat.to_json_str()))
 
         # Inject per-iteration KV cache stats (keyed by window size)
         if kv_iter_stats is not None:
@@ -895,13 +896,14 @@ class BaseWorker(GenerationExecutor):
             stats_dict["schedulerMode"] = scheduler_mode
 
         # Convert back to JSON string
-        return json.dumps(stats_dict)
+        return orjson.dumps(stats_dict).decode("utf-8")
 
     # Define a Callable to serialize KV cache events
     @staticmethod
     def _kv_cache_events_serializer(events) -> str:
         from .._utils import KVCacheEventSerializer
-        return json.dumps(KVCacheEventSerializer.serialize(events))
+        return orjson.dumps(KVCacheEventSerializer.serialize(events)).decode(
+            "utf-8")
 
     def _pop_result(self, client_id: int):
         self._results.pop(client_id, None)
