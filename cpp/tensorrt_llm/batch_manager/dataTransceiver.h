@@ -105,6 +105,8 @@ public:
         , mTransferTerminateFlag(std::move(transferTerminateFlag))
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
+        , mTotalBytesSent(std::make_shared<std::atomic<std::size_t>>(0))
+        , mTotalBytesReceived(std::make_shared<std::atomic<std::size_t>>(0))
     {
         TLLM_CHECK(!mConnections.empty());
         if (recordTiming)
@@ -136,6 +138,18 @@ public:
     void send(size_t idx, void const* data, size_t size);
 
     void recv(size_t idx, void* data, size_t size);
+
+    // Total bytes this rank sent/received for this session (successful transfers
+    // only). Diagnostics; relaxed load.
+    [[nodiscard]] std::size_t getTotalBytesSent() const noexcept
+    {
+        return mTotalBytesSent->load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::size_t getTotalBytesReceived() const noexcept
+    {
+        return mTotalBytesReceived->load(std::memory_order_relaxed);
+    }
 
     [[nodiscard]] LlmRequest const& getLlmRequest() const;
 
@@ -181,6 +195,12 @@ private:
     std::shared_ptr<std::atomic<bool>> mTransferTerminateFlag;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    // Bytes this rank actually sent/received for this session, accumulated in
+    // send()/recv(). Held via shared_ptr<atomic> (not a bare atomic) so the
+    // session stays movable — it is moved into the session map / returned by
+    // value. relaxed ordering: diagnostics only, no synchronization intent.
+    std::shared_ptr<std::atomic<std::size_t>> mTotalBytesSent;
+    std::shared_ptr<std::atomic<std::size_t>> mTotalBytesReceived;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;

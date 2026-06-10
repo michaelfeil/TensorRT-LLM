@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/batch_manager/perRequestActivityLog.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/cacheTransceiverDiagnostics.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -32,6 +33,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <future>
 #include <map>
 #include <memory>
@@ -88,6 +90,8 @@ void TransferSession::send(size_t idx, void const* data, size_t size)
     try
     {
         mConnections.at(idx)->send(mDataContext, data, size);
+        // Count only successful transfers; a failed send throws and skips this.
+        mTotalBytesSent->fetch_add(size, std::memory_order_relaxed);
     }
     catch (std::exception const& e)
     {
@@ -102,6 +106,8 @@ void TransferSession::recv(size_t idx, void* data, size_t size)
     try
     {
         mConnections.at(idx)->recv(mDataContext, data, size);
+        // Count only successful transfers; a failed recv throws and skips this.
+        mTotalBytesReceived->fetch_add(size, std::memory_order_relaxed);
     }
     catch (std::exception const& e)
     {
@@ -320,6 +326,7 @@ public:
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
+        PerRequestActivityLog::instance().setRank(static_cast<int>(selfIndex));
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
         mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
@@ -422,10 +429,11 @@ public:
         auto it = mRequestToSession.find(requestId);
         if (it == mRequestToSession.end())
         {
-            TLLM_THROW("getCounterpartsCount: session not found in mRequestToSession; %s",
+            TLLM_THROW("getCounterpartsCount: session not found in mRequestToSession; %s\n%s",
                 utils::formatSessionNotFoundDiagnostic(
                     requestId, mRequestToSession, mRequestCancelFlags, mSenderMutex, mCancelledRequests)
-                    .c_str());
+                    .c_str(),
+                PerRequestActivityLog::instance().dump(requestId).c_str());
         }
         return it->second.getConnections().size();
     }
@@ -453,11 +461,12 @@ public:
         {
             TLLM_THROW(
                 "release: session not found in mRequestToSession (likely already released by another path "
-                "such as cancel/timeout). reason=\"%s\" %s",
+                "such as cancel/timeout). reason=\"%s\" %s\n%s",
                 reason,
                 utils::formatSessionNotFoundDiagnostic(
                     requestId, mRequestToSession, mRequestCancelFlags, mSenderMutex, mCancelledRequests)
-                    .c_str());
+                    .c_str(),
+                PerRequestActivityLog::instance().dump(requestId).c_str());
         }
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
@@ -478,6 +487,14 @@ public:
             std::scoped_lock lkResp(mSenderMutex);
             mCancelledRequests.erase(requestId);
         }
+
+        // Record a tombstone but intentionally do NOT drop the activity log
+        // here: the failure this log targets is a *later* double-release /
+        // session-not-found for the same id, whose dump must still show that
+        // this request was already released (and when). The per-request slot is
+        // reclaimed by the global cap (kMaxTrackedRequests) or an explicit
+        // PerRequestActivityLog::release() (e.g. from the Python binding).
+        PerRequestActivityLog::instance().record(requestId, "session_released", "CacheSender::release");
     }
 
     [[nodiscard]] std::optional<RequestInfo> recvRequestInfo()
@@ -566,6 +583,7 @@ public:
                     !common::getEnvKVCacheTimeOutputPath().empty(), requestCancelFlag);
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
+                PerRequestActivityLog::instance().record(requestId, "session_added", "CacheSender::recvRequestInfo");
             }
             else if (!isAgent && it->second.getConnections().at(peerOffset) != nullptr)
             {
@@ -580,11 +598,17 @@ public:
 
     void sendSync(LlmRequest const& llmRequest)
     {
+        PerRequestActivityLog::instance().record(llmRequest.mRequestId, "send_started", "CacheSender::sendSync");
         TransferSession* session = nullptr;
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             auto it = mRequestToSession.find(llmRequest.mRequestId);
-            TLLM_CHECK(it != mRequestToSession.end());
+            if (it == mRequestToSession.end())
+            {
+                TLLM_THROW("CacheSender::sendSync: session for request %zu missing from mRequestToSession.\n%s",
+                    static_cast<size_t>(llmRequest.mRequestId),
+                    PerRequestActivityLog::instance().dump(llmRequest.mRequestId).c_str());
+            }
             session = std::addressof(it->second);
             recordContextKvTransferEventReportUnlocked(llmRequest.mRequestId, *session);
         }
@@ -592,10 +616,19 @@ public:
         session->setLlmRequest(llmRequest);
         mCacheTransferLayer.format(*session);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+        {
+            char detail[PerRequestActivityLog::kDetailLen];
+            std::snprintf(detail, sizeof(detail), "bytes=%zu connections=%zu", session->getTotalBytesSent(),
+                session->getConnections().size());
+            PerRequestActivityLog::instance().recordDetail(
+                llmRequest.mRequestId, "send_completed", "CacheSender::sendSync", detail);
+        }
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
     {
+        PerRequestActivityLog::instance().record(
+            llmRequest.mRequestId, "cancel_requested", "CacheSender::cancelRequest");
         bool isCancelled = false;
         {
             std::scoped_lock lkResp(mSenderMutex);
@@ -770,6 +803,7 @@ private:
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
+            PerRequestActivityLog::instance().record(id, "send_failed", "CacheSender::sendAndRemoveResponse");
             TLLM_LOG_REQ_ERROR(id, "Exception in sendAndRemoveResponse: %s", e.what());
             releaseOnFailure();
             auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
@@ -777,6 +811,7 @@ private:
         }
         catch (std::exception const& e)
         {
+            PerRequestActivityLog::instance().record(id, "send_failed", "CacheSender::sendAndRemoveResponse");
             TLLM_LOG_REQ_ERROR(id, "Exception in sendAndRemoveResponse: %s", e.what());
             releaseOnFailure();
             resp.mPromise.set_exception(std::current_exception());
@@ -1122,6 +1157,7 @@ public:
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
+        PerRequestActivityLog::instance().setRank(static_cast<int>(selfIndex));
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     }
 
@@ -1400,6 +1436,13 @@ public:
 
     bool cancelRequest(LlmRequest const& llmRequest)
     {
+        // Key by the context (transfer) request id to match requestSync and the
+        // sender side; fall back to the local id if context params are absent.
+        auto const transferReqId = llmRequest.getContextPhaseParams().has_value()
+            ? llmRequest.getContextPhaseParams().value().getReqId()
+            : llmRequest.mRequestId;
+        PerRequestActivityLog::instance().record(transferReqId, "cancel_requested", "CacheReceiver::cancelRequest",
+            "gen_request_id", static_cast<std::int64_t>(llmRequest.mRequestId));
 
         std::string processInfo = kDefaultProcessInfo;
         if (common::getEnvRequestKVCacheConcurrent())
@@ -1503,14 +1546,24 @@ public:
 private:
     void requestSync(LlmRequest& llmRequest)
     {
+        // Key activity-log events by the context (transfer) request id so they
+        // correlate with the sender side, which keys its sessions by
+        // RequestInfo::getRequestId() == this same context request id. The
+        // local generation request id is recorded as the event payload.
+        auto const transferReqId = llmRequest.getContextPhaseParams().value().getReqId();
+        auto const genReqId = static_cast<std::int64_t>(llmRequest.mRequestId);
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
-            llmRequest.getContextPhaseParams().value().getReqId());
+            transferReqId);
+        PerRequestActivityLog::instance().record(
+            transferReqId, "recv_request_started", "CacheReceiver::requestSync", "gen_request_id", genReqId);
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto requestCancelFlag = getOrCreateRequestCancelFlag(llmRequest.mRequestId);
         if (requestCancelFlag->load())
         {
+            PerRequestActivityLog::instance().record(transferReqId, "recv_request_cancelled_early",
+                "CacheReceiver::requestSync", "gen_request_id", genReqId);
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
             return;
@@ -1520,6 +1573,8 @@ private:
         bool isReady = receiveReadySignal(session);
         if (!isReady)
         {
+            PerRequestActivityLog::instance().record(
+                transferReqId, "recv_ready_signal_failed", "CacheReceiver::requestSync", "gen_request_id", genReqId);
             // Reuse the error state for the cancelled request.
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
@@ -1527,6 +1582,14 @@ private:
         }
         receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+        {
+            char detail[PerRequestActivityLog::kDetailLen];
+            std::snprintf(detail, sizeof(detail), "gen_request_id=%llu bytes=%zu connections=%zu",
+                static_cast<unsigned long long>(genReqId), session.getTotalBytesReceived(),
+                session.getConnections().size());
+            PerRequestActivityLog::instance().recordDetail(
+                transferReqId, "recv_request_completed", "CacheReceiver::requestSync", detail);
+        }
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,

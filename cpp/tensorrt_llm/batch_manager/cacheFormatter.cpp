@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/batch_manager/perRequestActivityLog.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
@@ -36,6 +37,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <future>
 #include <numeric>
 
@@ -398,6 +400,22 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
     auto blockRange
         = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
+    // Activity-log: capture what this rank is about to send (block/token volume,
+    // local layer count, PP fanout) for post-mortem diagnostics. Counts only;
+    // exact global token/layer index ranges would require parallelism-layout math.
+    {
+        std::size_t numBlocks = 0;
+        for (auto const& blockIdsForWindow : blockRange.getBlockIdsPerWindow())
+        {
+            numBlocks += blockIdsForWindow.second.size();
+        }
+        auto const tokensPerBlock = static_cast<std::size_t>(blockManager.getTokensPerBlock());
+        char detail[PerRequestActivityLog::kDetailLen];
+        std::snprintf(detail, sizeof(detail), "blocks=%zu tokens=%zu local_layers=%d pp=%d", numBlocks,
+            numBlocks * tokensPerBlock, static_cast<int>(blockManager.getNumLayers()), static_cast<int>(ppSize));
+        PerRequestActivityLog::instance().recordDetail(
+            llmRequest.mRequestId, "send_kvcache", "CacheFormatter::format", detail);
+    }
     auto const numPools
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...

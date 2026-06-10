@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/batch_manager/perRequestActivityLog.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
@@ -607,6 +608,23 @@ void initBindings(nb::module_& m)
         nb::arg("decoder_input_buffers"), nb::arg("decoder_state"), nb::arg("context_requests"),
         nb::arg("generation_requests"), nb::arg("logits"), nb::arg("beam_width"),
         nb::arg("num_context_logits_prefix_sum"), nb::arg("buffer_manager"), "Make decoding batch input.");
+
+    m.def(
+        "dump_kv_transfer_activity_log",
+        [](tb::LlmRequest::RequestIdType request_id) { return tb::PerRequestActivityLog::instance().dump(request_id); },
+        nb::arg("request_id"),
+        "Return the in-memory KV transfer activity log for the given request id, or an empty string if no events "
+        "have been recorded. Intended for debugging stuck or failed disagg transfers from Python.");
+
+    m.def(
+        "release_kv_transfer_activity_log",
+        [](tb::LlmRequest::RequestIdType request_id) { tb::PerRequestActivityLog::instance().release(request_id); },
+        nb::arg("request_id"), "Drop the activity log entry for the given request id.");
+
+    m.def(
+        "kv_transfer_activity_log_tracked_count",
+        []() { return tb::PerRequestActivityLog::instance().trackedRequestCount(); },
+        "Return the number of request ids currently tracked in the activity log.");
 }
 
 } // namespace tensorrt_llm::nanobind::batch_manager

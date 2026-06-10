@@ -50,6 +50,7 @@ set(SRCS
     microBatchScheduler.cpp
     pauseRequests.cpp
     peftCacheManager.cpp
+    perRequestActivityLog.cpp
     promptTuningBuffers.cpp
     rnnStateBuffers.cpp
     rnnStateManager.cpp
