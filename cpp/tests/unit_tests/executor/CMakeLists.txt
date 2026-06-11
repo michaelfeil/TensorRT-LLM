@@ -29,6 +29,7 @@ target_link_libraries(executorTestSmallArbitraryOutputTensors
 
 add_gtest(executorConfigTest executorConfigTest.cpp)
 add_gtest(executorTensorTest tensorTest.cpp)
+add_gtest(kvTransferMetricsTest kvTransferMetricsTest.cpp)
 add_gtest(serializeUtilsTest serializeUtilsTest.cpp)
 add_gtest(requestWithIdTest requestWithIdTest.cpp)
 add_gtest(loraConfigTest loraConfigTest.cpp)

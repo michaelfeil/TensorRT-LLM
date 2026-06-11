@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/ucxCacheCommunicator.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cache_transmission/kvTransferMetrics.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/payloadStaging.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
@@ -582,6 +583,7 @@ std::string build_zmq_endpoint(std::string const& ip, uint16_t port)
 UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string const& ip, uint16_t port)
 {
     static std::mutex sAddConnectionIPMutex;
+    auto setupStage = executor::kv_cache::UcxConnectionSetupErrorStage::kZmqSend;
     try
     {
         UcxConnection::ConnectionIdType connectionId = 0;
@@ -610,15 +612,18 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
             auto sendRet = reqSocket.send(zmq::buffer(getWorkerAddressMessageStr), zmq::send_flags::none);
             TLLM_CHECK_WITH_INFO(sendRet, "zmq socket.send failed while requesting worker address from %s after %d ms",
                 address.c_str(), connectionTimeoutMs);
+            setupStage = executor::kv_cache::UcxConnectionSetupErrorStage::kZmqRecv;
             zmq::message_t reply;
             auto ret = reqSocket.recv(reply);
             if (!ret && connectionTimeoutMs > 0)
             {
+                setupStage = executor::kv_cache::UcxConnectionSetupErrorStage::kZmqRecvTimeout;
                 TLLM_THROW("Timed out waiting for ZMQ worker address response from %s after %d ms", address.c_str(),
                     connectionTimeoutMs);
             }
-            TLLM_CHECK_WITH_INFO(ret, "zmq socket.recv failed while waiting for worker address from %s",
-                address.c_str());
+            TLLM_CHECK_WITH_INFO(
+                ret, "zmq socket.recv failed while waiting for worker address from %s", address.c_str());
+            setupStage = executor::kv_cache::UcxConnectionSetupErrorStage::kEndpointInit;
             std::string replyStr(static_cast<char*>(reply.data()), reply.size());
             std::istringstream is(replyStr);
             UcxCmMessage serverMessage = UcxCmMessage::deserialize(is);
@@ -638,6 +643,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
     }
     catch (std::exception const& e)
     {
+        executor::kv_cache::metrics::recordUcxConnectionSetupError(setupStage);
         std::string error = "Error in addConnection(ip) for rank " + std::to_string(mRank) + " ip: " + ip
             + " port: " + std::to_string(port) + ": " + e.what();
         TLLM_THROW(error);

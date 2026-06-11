@@ -19,6 +19,7 @@
 #include "executor.h"
 #include "executorConfig.h"
 #include "request.h"
+#include "tensorrt_llm/executor/cache_transmission/kvTransferMetrics.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
@@ -28,7 +29,9 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
+#include <nanobind/stl/vector.h>
 #include <optional>
+#include <vector>
 
 namespace nb = nanobind;
 namespace tle = tensorrt_llm::executor;
@@ -284,6 +287,78 @@ void initBindings(nb::module_& m)
                 return self.getLatestEvents(std::nullopt);
             },
             nb::arg("timeout_ms") = std::nullopt);
+
+    namespace kvc = tensorrt_llm::executor::kv_cache;
+    nb::enum_<kvc::UcxCancelReason>(m, "UcxCancelReason")
+        .value("OPERATION_TIMEOUT", kvc::UcxCancelReason::kOperationTimeout)
+        .value("TRANSFER_TERMINATED", kvc::UcxCancelReason::kTransferTerminated)
+        .value("PIPELINED_CHUNK_ABORTED", kvc::UcxCancelReason::kPipelinedChunkAborted)
+        .value("OTHER", kvc::UcxCancelReason::kOther);
+
+    nb::enum_<kvc::UcxConnectionSetupErrorStage>(m, "UcxConnectionSetupErrorStage")
+        .value("ZMQ_SEND", kvc::UcxConnectionSetupErrorStage::kZmqSend)
+        .value("ZMQ_RECV_TIMEOUT", kvc::UcxConnectionSetupErrorStage::kZmqRecvTimeout)
+        .value("ZMQ_RECV", kvc::UcxConnectionSetupErrorStage::kZmqRecv)
+        .value("ENDPOINT_INIT", kvc::UcxConnectionSetupErrorStage::kEndpointInit);
+
+    nb::enum_<kvc::UcxTagOp>(m, "UcxTagOp").value("SEND", kvc::UcxTagOp::kSend).value("RECV", kvc::UcxTagOp::kRecv);
+
+    nb::class_<kvc::KvTransferMetricsSnapshot>(m, "KvTransferMetricsSnapshot")
+        .def_ro("staging_buffer_in_use", &kvc::KvTransferMetricsSnapshot::stagingBufferInUse)
+        .def_ro("staging_buffer_pool_size", &kvc::KvTransferMetricsSnapshot::stagingBufferPoolSize)
+        .def_ro("staging_buffer_acquire_total", &kvc::KvTransferMetricsSnapshot::stagingBufferAcquireTotal)
+        .def_ro("staging_buffer_exhausted_total", &kvc::KvTransferMetricsSnapshot::stagingBufferExhaustedTotal)
+        .def_ro("staging_buffer_wait_micros_total", &kvc::KvTransferMetricsSnapshot::stagingBufferWaitMicrosTotal)
+        .def_ro("staging_quarantine_size", &kvc::KvTransferMetricsSnapshot::stagingQuarantineSize)
+        .def_ro("staging_quarantine_bytes", &kvc::KvTransferMetricsSnapshot::stagingQuarantineBytes)
+        .def_ro("staging_quarantine_total", &kvc::KvTransferMetricsSnapshot::stagingQuarantineTotal)
+        .def_ro("staging_quarantine_unsafe_reclaim_total",
+            &kvc::KvTransferMetricsSnapshot::stagingQuarantineUnsafeReclaimTotal)
+        .def_ro("ucx_cancel_grace_timeout_total", &kvc::KvTransferMetricsSnapshot::ucxCancelGraceTimeoutTotal)
+        .def_ro("ucx_operation_timeout_total", &kvc::KvTransferMetricsSnapshot::ucxOperationTimeoutTotal)
+        .def_ro("ucx_active_connections", &kvc::KvTransferMetricsSnapshot::ucxActiveConnections)
+        .def_ro("ucx_connection_established_total", &kvc::KvTransferMetricsSnapshot::ucxConnectionEstablishedTotal)
+        .def_prop_ro("ucx_cancel_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            {
+                std::vector<int64_t> v(
+                    s.ucxCancelTotal, s.ucxCancelTotal + static_cast<int>(kvc::UcxCancelReason::kReasonCount));
+                return v;
+            })
+        .def_prop_ro("ucx_connection_setup_errors_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            {
+                std::vector<int64_t> v(s.ucxConnectionSetupErrorsTotal,
+                    s.ucxConnectionSetupErrorsTotal + static_cast<int>(kvc::UcxConnectionSetupErrorStage::kStageCount));
+                return v;
+            })
+        .def_prop_ro("ucx_tag_send_ok_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            { return s.ucxTagOkTotal[static_cast<int>(kvc::UcxTagOp::kSend)]; })
+        .def_prop_ro("ucx_tag_recv_ok_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            { return s.ucxTagOkTotal[static_cast<int>(kvc::UcxTagOp::kRecv)]; })
+        .def_prop_ro("ucx_tag_send_error_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            { return s.ucxTagErrorTotal[static_cast<int>(kvc::UcxTagOp::kSend)]; })
+        .def_prop_ro("ucx_tag_recv_error_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            { return s.ucxTagErrorTotal[static_cast<int>(kvc::UcxTagOp::kRecv)]; })
+        .def_prop_ro("ucx_tag_send_wait_micros_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            { return s.ucxTagWaitMicrosTotal[static_cast<int>(kvc::UcxTagOp::kSend)]; })
+        .def_prop_ro("ucx_tag_recv_wait_micros_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            { return s.ucxTagWaitMicrosTotal[static_cast<int>(kvc::UcxTagOp::kRecv)]; })
+        .def_prop_ro("ucx_tag_send_timeout_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            { return s.ucxTagTimeoutTotal[static_cast<int>(kvc::UcxTagOp::kSend)]; })
+        .def_prop_ro("ucx_tag_recv_timeout_total",
+            [](kvc::KvTransferMetricsSnapshot const& s)
+            { return s.ucxTagTimeoutTotal[static_cast<int>(kvc::UcxTagOp::kRecv)]; });
+
+    m.def("get_kv_transfer_metrics_snapshot", &kvc::getKvTransferMetricsSnapshot,
+        "Atomic snapshot of all KV transfer counters; safe to call from any thread.");
 
     tensorrt_llm::nanobind::executor::initRequestBindings(m);
     tensorrt_llm::nanobind::executor::initConfigBindings(m);

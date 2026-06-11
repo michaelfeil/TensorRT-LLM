@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
+#include "tensorrt_llm/executor/cache_transmission/kvTransferMetrics.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <future>
@@ -178,6 +180,7 @@ public:
             return nullptr;
         }
 
+        auto const acquireStart = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(mMutex);
         while (mAvailable.empty())
         {
@@ -195,6 +198,7 @@ public:
             auto const now = std::chrono::steady_clock::now();
             if (deadline != std::chrono::steady_clock::time_point::max() && now >= deadline)
             {
+                metrics::recordStagingBufferExhausted();
                 TLLM_THROW("Timed out waiting for UCX payload staging pool buffer");
             }
             auto const waitTime = deadline == std::chrono::steady_clock::time_point::max()
@@ -209,6 +213,10 @@ public:
         }
         auto buffer = std::move(mAvailable.back());
         mAvailable.pop_back();
+        auto const waitMicros
+            = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - acquireStart)
+                  .count();
+        metrics::recordStagingBufferAcquire(static_cast<int64_t>(waitMicros));
         return {buffer.get(),
             [this, buffer = std::move(buffer)](PinnedHostBuffer*) mutable { release(std::move(buffer)); }};
     }
@@ -280,6 +288,7 @@ private:
         }
         mBuffers = std::move(buffers);
         mAvailable = std::move(available);
+        metrics::setStagingBufferPoolSize(static_cast<int64_t>(mPoolSize));
         TLLM_LOG_INFO(mRank, "Initialized UCX payload staging buffer pool with %zu buffers of %zu bytes", mPoolSize,
             mBufferBytes);
     }
@@ -290,6 +299,7 @@ private:
             std::lock_guard<std::mutex> lock(mMutex);
             mAvailable.push_back(std::move(buffer));
         }
+        metrics::recordStagingBufferRelease();
         mAvailableCv.notify_one();
     }
 
@@ -494,6 +504,7 @@ void pruneReclaimableQuarantinedRequests(std::vector<QuarantinedRequest>& reques
             {
                 if (entry.request->isCompleted())
                 {
+                    metrics::recordQuarantineReclaim(static_cast<int64_t>(entry.stagedBytes));
                     return true;
                 }
                 if (unsafeReclaimMs > 0 && now - entry.quarantinedAt >= std::chrono::milliseconds(unsafeReclaimMs))
@@ -504,6 +515,7 @@ void pruneReclaimableQuarantinedRequests(std::vector<QuarantinedRequest>& reques
                         "UNSAFE reclaiming canceled UCX %s for tag %d after %ld ms in staged request "
                         "quarantine; staged bytes: %zu",
                         entry.operation, entry.tag, ageMs, entry.stagedBytes);
+                    metrics::recordQuarantineUnsafeReclaim(static_cast<int64_t>(entry.stagedBytes));
                     return true;
                 }
                 return false;
@@ -563,6 +575,7 @@ void quarantineStagedRequest(std::shared_ptr<ucxx::Request> const& req,
     pruneReclaimableQuarantinedRequests(requests, rank);
     requests.push_back(
         QuarantinedRequest{req, callbackData, stagedBytes, std::chrono::steady_clock::now(), operation, tag, rank});
+    metrics::recordQuarantineEnqueue(static_cast<int64_t>(stagedBytes));
     size_t const retainedBytes = getQuarantinedBytes(requests);
     TLLM_LOG_WARNING(rank,
         "Retaining canceled UCX %s for tag %d in staged request quarantine; retained requests: %zu, retained bytes: "
@@ -578,10 +591,32 @@ void quarantineStagedRequest(std::shared_ptr<ucxx::Request> const& req,
     }
 }
 
+UcxCancelReason classifyCancelReason(char const* reason) noexcept
+{
+    if (reason == nullptr)
+    {
+        return UcxCancelReason::kOther;
+    }
+    if (std::strcmp(reason, "operation timeout") == 0)
+    {
+        return UcxCancelReason::kOperationTimeout;
+    }
+    if (std::strcmp(reason, "transfer terminated") == 0)
+    {
+        return UcxCancelReason::kTransferTerminated;
+    }
+    if (std::strcmp(reason, "pipelined payload transfer aborted") == 0)
+    {
+        return UcxCancelReason::kPipelinedChunkAborted;
+    }
+    return UcxCancelReason::kOther;
+}
+
 void cancelRequestWithLog(std::shared_ptr<ucxx::Request> const& req, DataContext const& ctx, int rank,
     char const* operation, char const* reason)
 {
     TLLM_LOG_WARNING(rank, "Canceling UCX %s for tag %d: %s", operation, ctx.getTag(), reason);
+    metrics::recordUcxCancel(classifyCancelReason(reason));
     req->cancel();
 }
 
@@ -1046,6 +1081,8 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
     bool cancelRequested = false;
     bool operationTimedOut = false;
     char const* cancelReason = "none";
+    auto const op
+        = (operation != nullptr && std::strncmp(operation, "recv", 4) == 0) ? UcxTagOp::kRecv : UcxTagOp::kSend;
     auto const operationStart = std::chrono::steady_clock::now();
     auto const operationDeadline = timeoutMs > 0 ? operationStart + std::chrono::milliseconds(timeoutMs)
                                                  : std::chrono::steady_clock::time_point::max();
@@ -1089,6 +1126,7 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
                 stagedBytes, cancelReason, static_cast<long long>(elapsedSinceStartMs),
                 static_cast<long long>(elapsedSinceCancelMs));
             dumpUcxConnectionDiagnostics(rank, endpoint, operation, ctx.getTag(), cancelReason, ucsStatus);
+            metrics::recordUcxCancelGraceTimeout();
             quarantineStagedRequest(req, callbackData, stagedBytes, rank, operation, ctx.getTag());
             TLLM_THROW(
                 "Timed out waiting for canceled UCX %s for tag %d to complete after %d ms "
@@ -1110,10 +1148,29 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
             operation, ctx.getTag(), timeoutMs, ucsStatus, static_cast<int>(req->isCompleted()), cancelReason,
             static_cast<long long>(elapsedMs));
         dumpUcxConnectionDiagnostics(rank, endpoint, operation, ctx.getTag(), cancelReason, ucsStatus);
+        metrics::recordUcxOperationTimeout();
+        metrics::recordUcxTagTimeout(op);
         TLLM_THROW(
             "Timed out waiting for UCX %s for tag %d after %d ms "
             "(ucsStatus=%s cancelReason=\"%s\" elapsedMs=%lld)",
             operation, ctx.getTag(), timeoutMs, ucsStatus, cancelReason, static_cast<long long>(elapsedMs));
+    }
+
+    // Reached only when the request completed without hitting the timeout /
+    // cancel-grace throws above. Record per-direction outcome + wait latency.
+    // Cancellations (UCS_ERR_CANCELED) are already attributed via
+    // recordUcxCancel, so they are excluded from the tag-error counter.
+    auto const finalStatus = req->getStatus();
+    if (finalStatus == UCS_OK)
+    {
+        auto const waitMicros
+            = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - operationStart)
+                  .count();
+        metrics::recordUcxTagOk(op, static_cast<int64_t>(waitMicros));
+    }
+    else if (finalStatus != UCS_ERR_CANCELED)
+    {
+        metrics::recordUcxTagError(op);
     }
 }
 

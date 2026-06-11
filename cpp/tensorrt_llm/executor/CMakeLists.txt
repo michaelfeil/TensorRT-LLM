@@ -21,6 +21,7 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(SRCS
     cache_transmission/mpi_utils/connection.cpp
     cache_transmission/agent_utils/connection.cpp
+    cache_transmission/kvTransferMetrics.cpp
     cache_transmission/transferAgent.cpp
     cache_transmission/cacheSplitConcat.cu
     cache_transmission/rnnCacheSplitConcat.cu

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
+#include "tensorrt_llm/executor/cache_transmission/kvTransferMetrics.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/payloadStaging.h"
 #include <cstdint>
@@ -160,6 +161,7 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
     mSendTagPrefix = mConnectionIdInPeer;
     mRecvTagPrefix = mConnectionId;
 
+    executor::kv_cache::metrics::recordUcxConnectionEstablished();
     TLLM_LOG_DEBUG(mManager->getRank(),
         "UcxConnection::UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
@@ -168,6 +170,7 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
 UcxConnection::~UcxConnection()
 {
 
+    executor::kv_cache::metrics::recordUcxConnectionClosed();
     TLLM_LOG_DEBUG(mManager->getRank(),
         "UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
