@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/ucxCacheCommunicator.h"
+#include "b10/ucx_vfs_dump.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/kvTransferMetrics.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
@@ -347,6 +348,8 @@ UcxConnectionManager::UcxConnectionManager()
         ucxx::ConfigMap ucxConfig{{"RNDV_PIPELINE_ERROR_HANDLING", "y"}};
 
         mUcxCtx = ucxx::createContext(ucxConfig, UCP_FEATURE_TAG);
+        b10::StartUcxStat(mRank);
+
         int const device = mDevice;
         try
         {
@@ -504,6 +507,9 @@ UcxConnectionManager::UcxConnectionManager()
 UcxConnectionManager::~UcxConnectionManager()
 {
     TLLM_LOG_DEBUG(mRank, "UcxConnectionManager::~UcxConnectionManager");
+
+    // Stop the VFS dumper before libucs teardown.
+    b10::StopUcxStat();
 
     for (auto& worker : mWorkersPool)
     {

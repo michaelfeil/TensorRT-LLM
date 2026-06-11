@@ -12,9 +12,10 @@ if(ENABLE_UCX)
   pkg_check_modules(ZMQ REQUIRED libzmq)
   # Add the NIXL wrapper target
 
-  add_library(${UCX_WRAPPER_TARGET} SHARED connection.cpp
-                                           payloadStaging.cpp
-                                           ucxCacheCommunicator.cpp)
+  add_library(
+    ${UCX_WRAPPER_TARGET} SHARED
+    connection.cpp payloadStaging.cpp ucxCacheCommunicator.cpp
+    ${PROJECT_SOURCE_DIR}/b10/ucx_vfs_dump.cc)
   set_target_properties(
     ${UCX_WRAPPER_TARGET}
     PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
