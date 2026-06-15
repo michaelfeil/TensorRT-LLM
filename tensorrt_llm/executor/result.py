@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import json
 import math
+import os
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -14,6 +15,9 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm.llmapi import tracing
+from tensorrt_llm.llmapi.request_tracer import (create_request_tracer,
+                                                get_request_tracer,
+                                                release_request_tracer)
 
 try:
     pass
@@ -31,6 +35,15 @@ from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
+
+# Gate the per-request phase-span waterfall (queue/prefill/kv_transfer/decode
+# child spans under llm_request). Off by default: the child spans multiply span
+# volume ~5-8x, which can overwhelm a capacity-limited trace pipeline (Refinery
+# cache / Honeycomb ingest). The unified trace_id and the single llm_request
+# span are unaffected; flip this on only when the backend can absorb the volume.
+_EMIT_PHASE_SPANS = os.environ.get("TRTLLM_REQUEST_TRACE_SPANS",
+                                   "0").strip().lower() in ("1", "true", "yes",
+                                                            "on")
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -191,6 +204,9 @@ class GenerationResultBase:
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
         self._aborted = False
+        # Guards the one-shot "first_response" request-tracer transition so the
+        # per-request trace spans the lifecycle (not just the completion dump).
+        self._first_response_traced = False
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
         self.trace_headers: Optional[dict[str, str]] = None
@@ -436,6 +452,14 @@ class GenerationResultBase:
         else:
             logprobs_result = None
 
+        # Open the per-request trace on the first response so the trace spans the
+        # request lifecycle: a mid-flight failure/hang then dumps "request_created
+        # -> first_response -> ..." instead of just the terminal event. One-shot;
+        # subsequent responses and the completion/error paths reuse this tracer.
+        if not self._first_response_traced:
+            self._first_response_traced = True
+            self._ensure_request_tracer().transition("first_response")
+
         if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
             if isinstance(response.res, CompletionOutput):
@@ -475,8 +499,14 @@ class GenerationResultBase:
             if response.should_abort and not self._aborted:
                 self.abort()
 
+            if response.error:
+                self._trace_request_error(response.error)
+                if self._background_error_handler is not None and (
+                        handler := self._background_error_handler()):
+                    handler(response.error)
         elif is_llm_response(response):
             if response.has_error():
+                self._trace_request_error(response.error_msg)
                 self._error_msg = response.error_msg
                 self._done = True
                 if self._background_error_handler is not None and (
@@ -591,6 +621,7 @@ class GenerationResultBase:
                     handler := self._background_error_handler()):
                 handler()
         elif isinstance(response, ErrorResponse):
+            self._trace_request_error(response.error_msg)
             self._error_msg = response.error_msg
             self._done = True
             if self._background_error_handler is not None and (
@@ -713,6 +744,98 @@ class GenerationResultBase:
         self.candidate_metrics.append(metrics_stats)
         self.metrics_dict.update(metrics_stats)
 
+    def _disagg_role(self) -> str:
+        """Disaggregation role of this leg: 'prefill' | 'decode' | 'aggregated'.
+
+        Derived from disaggregated_params.request_type (context_only=prefill,
+        generation_only=decode). Stamped on the tracer and the exported span so
+        a trace's two legs are distinguishable without inferring from which
+        events are present.
+        """
+        dp = getattr(self, "disaggregated_params", None)
+        request_type = getattr(dp, "request_type", None) if dp else None
+        return {
+            "context_only": "prefill",
+            "generation_only": "decode",
+        }.get(request_type, "aggregated")
+
+    def _ensure_request_tracer(self):
+        """Get or create this request's tracer.
+
+        On first creation, seed the tracer's trace_id from a propagated trace
+        context (inbound ``traceparent``) when present, so the per-request
+        tracer, the exported ``llm_request`` span, and the pod-log lines all
+        share one trace_id. When no context is propagated the tracer keeps its
+        own generated id and :meth:`do_tracing` seeds the span from it instead.
+        """
+        tracer = get_request_tracer(self.id)
+        if tracer is not None:
+            return tracer
+        propagated_trace_id = tracing.trace_id_from_context(
+            tracing.extract_trace_context(self.trace_headers))
+        return create_request_tracer(
+            self.id,
+            trace_id=propagated_trace_id,
+            attributes={"disagg_role": self._disagg_role()})
+
+    def _trace_request_error(self, error: Any) -> None:
+        """Dump the per-request trace when a request fails.
+
+        Gets (or lazily creates) the request's tracer, records the error, and
+        dumps the accumulated transitions so a failed request leaves a
+        trace_id-keyed post-mortem that can be cross-referenced with exported
+        OTel spans and [request_id=N] log lines.
+        """
+        self._ensure_request_tracer().record_error(error)
+        release_request_tracer(self.id)
+
+    def _record_lifecycle_transitions(
+        self,
+        output: CompletionOutput,
+        req_perf_metrics_dict: Optional[dict[str, float]] = None,
+    ):
+        """Record this request's lifecycle transitions on its tracer, release it.
+
+        Runs even when OTel is disabled so each phase still gets a
+        trace_id-prefixed log line. Returns the tracer so the caller can reuse
+        its trace_id (e.g. to seed the exported span).
+        """
+        request_tracer = self._ensure_request_tracer()
+
+        if req_perf_metrics_dict:
+            kv_start = req_perf_metrics_dict.get(
+                RequestEventTiming.KV_CACHE_TRANSFER_START, 0)
+            kv_end = req_perf_metrics_dict.get(
+                RequestEventTiming.KV_CACHE_TRANSFER_END, 0)
+            if kv_start and kv_end and kv_end >= kv_start:
+                request_tracer.transition(
+                    "kv_cache_transfer",
+                    duration_ms=(kv_end - kv_start) * 1000.0,
+                    kv_cache_num_bytes=req_perf_metrics_dict.get(
+                        RequestEventTiming.KV_CACHE_SIZE, 0))
+
+        if self.metrics_dict:
+            # Absent -> None; these are durations, so a missing or non-positive
+            # value means "not measured" and we skip the transition.
+            ttft = self.metrics_dict.get(MetricNames.TTFT)
+            tpot = self.metrics_dict.get(MetricNames.TPOT)
+            e2et = self.metrics_dict.get(MetricNames.E2E)
+            if ttft is not None and ttft > 0:
+                request_tracer.transition("prefill_completed",
+                                          ttft_ms=ttft * 1000.0)
+            if tpot is not None and tpot > 0:
+                request_tracer.transition(
+                    "decode_completed",
+                    tpot_ms=tpot * 1000.0,
+                    output_tokens=output.length,
+                )
+            if e2et is not None and e2et > 0:
+                request_tracer.transition("request_completed",
+                                          e2e_ms=e2et * 1000.0,
+                                          finish_reason=output.finish_reason)
+        release_request_tracer(self.id)
+        return request_tracer
+
     def do_tracing(
         self,
         output: CompletionOutput,
@@ -724,6 +847,12 @@ class GenerationResultBase:
             output (CompletionOutput): The output of the generation result.
             req_perf_metrics_dict (Optional[dict[str, float]]): Request performance metrics. Defaults to None.
         """
+        # Record the per-request tracer transitions (runs even when OTel is
+        # disabled, for the trace_id-prefixed per-phase log lines); reuse the
+        # returned tracer's trace_id to seed the exported span below.
+        request_tracer = self._record_lifecycle_transitions(
+            output, req_perf_metrics_dict)
+
         if not tracing.global_otlp_tracer():
             return
 
@@ -734,6 +863,12 @@ class GenerationResultBase:
             return
 
         trace_context = tracing.extract_trace_context(self.trace_headers)
+        if tracing.trace_id_from_context(trace_context) is None:
+            # No inbound traceparent: seed the exported span with the
+            # per-request tracer's trace_id so the trace_id in pod logs equals
+            # the trace_id the OTLP backend (e.g. Honeycomb) indexes by.
+            trace_context = tracing.parent_context_for_trace_id(
+                request_tracer.trace_id)
         sampling_params = self.sampling_params
 
         # Since arrival_time and other timing metrics are based on different time origins,
@@ -752,6 +887,16 @@ class GenerationResultBase:
             def safe_set_attr(span, attr, value):
                 if value is not None:
                     span.set_attribute(attr, value)
+
+            # Redundant now that the span shares the tracer's trace_id (see the
+            # trace_context seeding above), but kept as an explicit, queryable
+            # attribute: operators can grep pod logs for this exact id and it
+            # equals the span's trace_id in the trace UI.
+            safe_set_attr(span, "trtllm.request_trace_id",
+                          request_tracer.trace_id)
+            # Disaggregation leg (prefill / decode / aggregated) so a trace's
+            # two legs are distinguishable in the trace UI.
+            safe_set_attr(span, "trtllm.disagg_role", self._disagg_role())
 
             safe_set_attr(span,
                           tracing.SpanAttributes.GEN_AI_REQUEST_TEMPERATURE,
@@ -815,6 +960,45 @@ class GenerationResultBase:
                     timestamp=int((req_perf_metrics_dict.get(
                         RequestEventTiming.KV_CACHE_TRANSFER_END, 0.0) +
                                    time_correction) * 1e9))
+
+            # Phase waterfall: real timed child spans under llm_request so the
+            # request timeline (queue -> prefill -> kv transfer -> decode) is a
+            # navigable span tree, not just flat events. Gated off by default
+            # (TRTLLM_REQUEST_TRACE_SPANS) because the extra spans multiply trace
+            # volume and can overwhelm a capacity-limited export pipeline. Each
+            # is emitted only if its interval is present on this leg (prefill leg
+            # has no decode, decode leg has the kv transfer, etc.).
+            if _EMIT_PHASE_SPANS:
+
+                def _phase_ns(field):
+                    t = req_perf_metrics_dict.get(field, 0)
+                    return int((t + time_correction) * 1e9) if t else 0
+
+                arrival_ns = _phase_ns(RequestEventTiming.ARRIVAL_TIME)
+                scheduled_ns = _phase_ns(
+                    RequestEventTiming.FIRST_SCHEDULED_TIME)
+                first_token_ns = _phase_ns(RequestEventTiming.FIRST_TOKEN_TIME)
+                last_token_ns = _phase_ns(RequestEventTiming.LAST_TOKEN_TIME)
+                kv_start_ns = _phase_ns(
+                    RequestEventTiming.KV_CACHE_TRANSFER_START)
+                kv_end_ns = _phase_ns(RequestEventTiming.KV_CACHE_TRANSFER_END)
+
+                tracing.record_phase_span(span, "queue", arrival_ns,
+                                          scheduled_ns)
+                tracing.record_phase_span(span, "prefill", scheduled_ns,
+                                          first_token_ns)
+                tracing.record_phase_span(
+                    span,
+                    "kv_cache_transfer",
+                    kv_start_ns,
+                    kv_end_ns,
+                    attributes={
+                        "kv_cache_size":
+                        req_perf_metrics_dict.get(
+                            RequestEventTiming.KV_CACHE_SIZE, 0)
+                    })
+                tracing.record_phase_span(span, "decode", first_token_ns,
+                                          last_token_ns)
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):

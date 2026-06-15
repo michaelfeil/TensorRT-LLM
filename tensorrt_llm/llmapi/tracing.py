@@ -5,11 +5,13 @@ __all__ = [
     'extract_trace_context', 'get_span_exporter', 'global_otlp_tracer',
     'init_tracer', 'insufficient_request_metrics_warning', 'is_otel_available',
     'is_tracing_enabled', 'log_tracing_disabled_warning',
-    'set_global_otlp_tracer', 'extract_trace_headers'
+    'set_global_otlp_tracer', 'extract_trace_headers', 'trace_id_from_context',
+    'parent_context_for_trace_id', 'record_phase_span'
 ]
 
 import functools
 import os
+import secrets
 import typing
 from collections.abc import Mapping
 from typing import Optional
@@ -32,8 +34,10 @@ try:
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.trace import (SpanKind, Status, StatusCode, Tracer,
-                                     get_current_span, set_tracer_provider)
+    from opentelemetry.trace import (NonRecordingSpan, SpanContext, SpanKind,
+                                     Status, StatusCode, TraceFlags, Tracer,
+                                     get_current_span, set_span_in_context,
+                                     set_tracer_provider)
     from opentelemetry.trace.propagation.tracecontext import \
         TraceContextTextMapPropagator
 
@@ -97,6 +101,70 @@ def extract_trace_context(
         return TraceContextTextMapPropagator().extract(headers)
     else:
         return None
+
+
+def trace_id_from_context(ctx: Optional["Context"]) -> Optional[str]:
+    """Return the 32-hex trace_id of the span carried in ``ctx``.
+
+    Used to align the per-request tracer's trace_id with a propagated parent.
+    Returns None when OTel is unavailable or ``ctx`` carries no valid span
+    (e.g. no inbound ``traceparent``).
+    """
+    if not is_otel_available() or ctx is None:
+        return None
+    span_context = get_current_span(ctx).get_span_context()
+    if not span_context.is_valid:
+        return None
+    return format(span_context.trace_id, "032x")
+
+
+def parent_context_for_trace_id(trace_id_hex: str) -> Optional["Context"]:
+    """Build a context whose (non-recording) span carries ``trace_id_hex``.
+
+    A span started under the returned context inherits ``trace_id_hex`` as its
+    trace_id, so the exported ``llm_request`` span shares the per-request
+    tracer's trace_id -- i.e. the trace_id printed in pod logs equals the
+    trace_id the OTLP backend indexes by. Returns None when OTel is
+    unavailable. The synthetic parent span is never exported.
+    """
+    if not is_otel_available():
+        return None
+    span_context = SpanContext(
+        trace_id=int(trace_id_hex, 16),
+        span_id=secrets.randbits(64)
+        or 1,  # span_id must be non-zero to be valid
+        is_remote=True,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+    )
+    return set_span_in_context(NonRecordingSpan(span_context))
+
+
+def record_phase_span(
+        parent_span,
+        name: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        attributes: Optional[Mapping[str, object]] = None) -> None:
+    """Emit a child span ``[start_time_ns, end_time_ns]`` under ``parent_span``.
+
+    Used to turn a request's lifecycle phases (queue / prefill / kv transfer /
+    decode) into a real span waterfall nested under ``llm_request`` instead of
+    flat span events. No-op when OTel is unavailable or the interval is missing
+    or non-positive (e.g. a phase that didn't run on this leg).
+    """
+    if not is_otel_available() or parent_span is None:
+        return
+    if not start_time_ns or not end_time_ns or end_time_ns < start_time_ns:
+        return
+    ctx = set_span_in_context(parent_span)
+    child = global_otlp_tracer().start_span(name,
+                                            context=ctx,
+                                            start_time=start_time_ns)
+    if attributes:
+        for key, value in attributes.items():
+            if value is not None:
+                child.set_attribute(key, value)
+    child.end(end_time=end_time_ns)
 
 
 def extract_trace_headers(
