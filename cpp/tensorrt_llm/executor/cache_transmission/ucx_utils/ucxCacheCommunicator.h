@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,9 @@
 #include "ucxx/api.h"
 #include "ucxx/utils/sockaddr.h"
 #include "ucxx/utils/ucx.h"
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <future>
 #if __linux__
 #include <arpa/inet.h>
@@ -31,10 +33,13 @@
 #endif
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 
-#include <future>
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 #include <zmq.hpp>
 
@@ -44,15 +49,25 @@ namespace tensorrt_llm::executor::kv_cache
 class UcxConnectionManager : public ConnectionManager, public std::enable_shared_from_this<UcxConnectionManager>
 {
 private:
+    struct PassiveConnectionRequest
+    {
+        UcxConnection::ConnectionIdType connectionId;
+        std::string workerAddress;
+        std::shared_ptr<std::promise<void>> connectionPromise;
+    };
+
     std::shared_ptr<ucxx::Context> mUcxCtx;
     std::vector<std::shared_ptr<ucxx::Worker>> mWorkersPool;
+    std::mutex mEndpointCreationMutex;
     std::string mWorkerAddress;
     std::map<UcxConnection::ConnectionIdType, std::shared_ptr<UcxConnection>> mConnections;
-    std::map<UcxConnection::ConnectionIdType, std::future<void>> mConnectionFutures;
+    std::map<UcxConnection::ConnectionIdType, std::shared_future<void>> mConnectionFutures;
     std::mutex mConnectionsMutex;
     std::mutex mConnectionFuturesMutex;
     std::unordered_map<std::string, uint64_t> mAddressToConnectionId;
     std::mutex mAddressToConnectionIdMutex;
+    std::unordered_map<std::string, std::shared_future<UcxConnection::ConnectionIdType>> mAddressConnectionFutures;
+    std::mutex mAddressConnectionFuturesMutex;
     CommState mCommState;
     int mDevice;
     int mRank;
@@ -62,10 +77,17 @@ private:
     zmq::socket_t mZmqRepSocket;
     std::string mZmqRepEndpoint;
     std::thread mZmqRepThread;
+    std::deque<PassiveConnectionRequest> mPassiveConnectionRequests;
+    std::mutex mPassiveConnectionRequestsMutex;
+    std::condition_variable mPassiveConnectionRequestsCv;
+    std::thread mPassiveConnectionWorkerThread;
+    bool mStopPassiveConnectionWorker{false};
     std::atomic<bool> mIsRunning{true};
 
-    UcxConnection::ConnectionIdType getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
+    UcxConnection::ConnectionIdType getNewConnectionId();
     UcxConnection::ConnectionIdType addConnection(std::string const& ip, uint16_t port);
+    void processPassiveConnectionRequests();
+    void stopPassiveConnectionWorker();
 
 public:
     explicit UcxConnectionManager();

@@ -33,6 +33,7 @@
 #include <mutex>
 #include <numeric>
 #include <regex>
+#include <stdexcept>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -456,6 +457,7 @@ UcxConnectionManager::UcxConnectionManager()
         mCommState = CommState(socketStates, mRank);
         TLLM_LOG_DEBUG(mRank, " ***** UCX    mCommState: %s", mCommState.toString().c_str());
 
+        mPassiveConnectionWorkerThread = std::thread([this]() { processPassiveConnectionRequests(); });
         mZmqRepThread = std::thread(
             [this]()
             {
@@ -499,6 +501,7 @@ UcxConnectionManager::UcxConnectionManager()
     }
     catch (std::exception const& e)
     {
+        stopPassiveConnectionWorker();
         std::string error = std::string("Error in UcxConnectionManager initialization for rank ") + e.what();
         TLLM_THROW(error);
     }
@@ -511,10 +514,6 @@ UcxConnectionManager::~UcxConnectionManager()
     // Stop the VFS dumper before libucs teardown.
     b10::StopUcxStat();
 
-    for (auto& worker : mWorkersPool)
-    {
-        worker->stopProgressThread();
-    }
     if (mZmqRepThread.joinable())
     {
         zmq::socket_t socket(mZmqContext, zmq::socket_type::req);
@@ -535,6 +534,12 @@ UcxConnectionManager::~UcxConnectionManager()
         socket.close();
         mZmqRepThread.join();
     }
+    stopPassiveConnectionWorker();
+
+    for (auto& worker : mWorkersPool)
+    {
+        worker->stopProgressThread();
+    }
     mIsRunning = false;
     mZmqRepSocket.close();
 
@@ -542,25 +547,101 @@ UcxConnectionManager::~UcxConnectionManager()
     TLLM_LOG_DEBUG(mRank, "END UcxConnectionManager::~UcxConnectionManager");
 }
 
+void UcxConnectionManager::processPassiveConnectionRequests()
+{
+    while (true)
+    {
+        PassiveConnectionRequest request;
+        {
+            std::unique_lock lock(mPassiveConnectionRequestsMutex);
+            mPassiveConnectionRequestsCv.wait(lock,
+                [this]() { return mStopPassiveConnectionWorker || !mPassiveConnectionRequests.empty(); });
+            if (mStopPassiveConnectionWorker)
+            {
+                auto pendingRequests = std::move(mPassiveConnectionRequests);
+                mPassiveConnectionRequests.clear();
+                lock.unlock();
+
+                auto exception = std::make_exception_ptr(std::runtime_error("passive connection worker stopped"));
+                for (auto& pendingRequest : pendingRequests)
+                {
+                    pendingRequest.connectionPromise->set_exception(exception);
+                }
+                return;
+            }
+            if (mPassiveConnectionRequests.empty())
+            {
+                return;
+            }
+            request = std::move(mPassiveConnectionRequests.front());
+            mPassiveConnectionRequests.pop_front();
+        }
+
+        try
+        {
+            auto workerAddressPtr = ucxx::createAddressFromString(request.workerAddress);
+            std::shared_ptr<ucxx::Endpoint> newEp;
+            {
+                std::scoped_lock lock(mEndpointCreationMutex);
+                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, true);
+            }
+            std::shared_ptr<UcxConnection> connection
+                = std::make_shared<UcxConnection>(request.connectionId, newEp, this, false);
+            {
+                std::scoped_lock lock(mConnectionsMutex);
+                mConnections.emplace(request.connectionId, connection);
+            }
+            request.connectionPromise->set_value();
+        }
+        catch (...)
+        {
+            request.connectionPromise->set_exception(std::current_exception());
+        }
+    }
+}
+
+void UcxConnectionManager::stopPassiveConnectionWorker()
+{
+    {
+        std::scoped_lock lock(mPassiveConnectionRequestsMutex);
+        mStopPassiveConnectionWorker = true;
+    }
+    mPassiveConnectionRequestsCv.notify_one();
+    if (mPassiveConnectionWorkerThread.joinable())
+    {
+        mPassiveConnectionWorkerThread.join();
+    }
+}
+
 void UcxConnectionManager::addConnection(std::string const& workerAddress)
 {
     try
     {
-        auto workerAddressPtr = ucxx::createAddressFromString(workerAddress);
-        auto newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, true);
-
-        UcxConnection::ConnectionIdType connectionId = getNewConnectionId(newEp);
-        std::scoped_lock lock(mConnectionFuturesMutex);
-
-        std::future<void> future = std::async(std::launch::async,
-            [this, connectionId, newEp]()
+        UcxConnection::ConnectionIdType connectionId = getNewConnectionId();
+        auto connectionPromise = std::make_shared<std::promise<void>>();
+        auto connectionFuture = connectionPromise->get_future().share();
+        {
+            std::scoped_lock lock(mConnectionFuturesMutex);
+            auto const inserted = mConnectionFutures.emplace(connectionId, std::move(connectionFuture)).second;
+            TLLM_CHECK_WITH_INFO(inserted, "connectionFuture already exists for connectionId: %lu", connectionId);
+        }
+        try
+        {
             {
-                std::scoped_lock lock(mConnectionsMutex);
-                std::shared_ptr<UcxConnection> connection
-                    = std::make_shared<UcxConnection>(connectionId, newEp, this, false);
-                mConnections.emplace(connectionId, connection);
-            });
-        mConnectionFutures.emplace(connectionId, std::move(future));
+                std::scoped_lock lock(mPassiveConnectionRequestsMutex);
+                TLLM_CHECK_WITH_INFO(
+                    !mStopPassiveConnectionWorker, "passive connection worker has already stopped");
+                mPassiveConnectionRequests.emplace_back(
+                    PassiveConnectionRequest{connectionId, workerAddress, connectionPromise});
+            }
+            mPassiveConnectionRequestsCv.notify_one();
+        }
+        catch (...)
+        {
+            std::scoped_lock lock(mConnectionFuturesMutex);
+            mConnectionFutures.erase(connectionId);
+            throw;
+        }
     }
     catch (std::exception const& e)
     {
@@ -588,25 +669,47 @@ std::string build_zmq_endpoint(std::string const& ip, uint16_t port)
 
 UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string const& ip, uint16_t port)
 {
-    static std::mutex sAddConnectionIPMutex;
+    // Each peer rank is identified by its ip:port ZMQ endpoint.
+    std::string const address = ip + ":" + std::to_string(port);
     auto setupStage = executor::kv_cache::UcxConnectionSetupErrorStage::kZmqSend;
     try
     {
-        UcxConnection::ConnectionIdType connectionId = 0;
-        std::string const address = ip + ":" + std::to_string(port);
         {
-            std::scoped_lock addConnectionIPLock(sAddConnectionIPMutex);
-            // This lock ensures that only one thread can create an endpoint from hostname and establish a UCX
-            // connection at a time, and the re-check below keeps duplicate callers for the same peer from opening
-            // redundant UCX endpoints after another caller finished the bootstrap.
+            std::scoped_lock addressLock(mAddressToConnectionIdMutex);
+            auto const existingConnectionIt = mAddressToConnectionId.find(address);
+            if (existingConnectionIt != mAddressToConnectionId.end())
             {
-                std::scoped_lock addressLock(mAddressToConnectionIdMutex);
-                auto const existingConnectionIt = mAddressToConnectionId.find(address);
-                if (existingConnectionIt != mAddressToConnectionId.end())
-                {
-                    return existingConnectionIt->second;
-                }
+                return existingConnectionIt->second;
             }
+        }
+
+        bool createConnection = false;
+        auto connectionPromise = std::make_shared<std::promise<UcxConnection::ConnectionIdType>>();
+        std::shared_future<UcxConnection::ConnectionIdType> connectionFuture;
+        {
+            std::scoped_lock lock(mAddressConnectionFuturesMutex);
+            auto const connectionFutureIt = mAddressConnectionFutures.find(address);
+            if (connectionFutureIt != mAddressConnectionFutures.end())
+            {
+                connectionFuture = connectionFutureIt->second;
+            }
+            else
+            {
+                connectionFuture = connectionPromise->get_future().share();
+                auto const inserted = mAddressConnectionFutures.emplace(address, connectionFuture).second;
+                TLLM_CHECK_WITH_INFO(
+                    inserted, "addressConnectionFuture already exists for address: %s", address.c_str());
+                createConnection = true;
+            }
+        }
+
+        if (!createConnection)
+        {
+            return connectionFuture.get();
+        }
+
+        try
+        {
             int const connectionTimeoutMs = getZmqConnectionTimeoutMs(mRank);
             auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
             configureZmqRequestSocket(reqSocket, connectionTimeoutMs);
@@ -637,15 +740,37 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
                 "serverMessage.mType is not SERVER_WORKER_ADDRESS");
             std::string serverWorkerAddress = serverMessage.mWorkerAddress.value();
             auto serverWorkerAddressPtr = ucxx::createAddressFromString(serverWorkerAddress);
-            auto newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, true);
-            connectionId = getNewConnectionId(newEp);
+            std::shared_ptr<ucxx::Endpoint> newEp;
+            {
+                // TODO: createEndpointFromWorkerAddress does not require this mutex but is blocking; explore
+                // multi-threaded or non-blocking endpoint creation.
+                std::scoped_lock lock(mEndpointCreationMutex);
+                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, true);
+            }
+            UcxConnection::ConnectionIdType connectionId = getNewConnectionId();
             auto connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
             TLLM_CHECK(connectionId != 0);
-            std::scoped_lock lock(mConnectionsMutex, mAddressToConnectionIdMutex);
-            mConnections.emplace(connectionId, connection);
-            mAddressToConnectionId[address] = connectionId;
+            {
+                std::scoped_lock lock(mConnectionsMutex, mAddressToConnectionIdMutex);
+                mConnections.emplace(connectionId, connection);
+                mAddressToConnectionId[address] = connectionId;
+            }
+            connectionPromise->set_value(connectionId);
+            {
+                std::scoped_lock lock(mAddressConnectionFuturesMutex);
+                mAddressConnectionFutures.erase(address);
+            }
+            return connectionId;
         }
-        return connectionId;
+        catch (...)
+        {
+            connectionPromise->set_exception(std::current_exception());
+            {
+                std::scoped_lock lock(mAddressConnectionFuturesMutex);
+                mAddressConnectionFutures.erase(address);
+            }
+            throw;
+        }
     }
     catch (std::exception const& e)
     {
@@ -656,7 +781,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
     }
 }
 
-UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp)
+UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId()
 {
     return mConnectionIdCounter++;
 }
@@ -695,23 +820,33 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
     memcpy(data, buffer.data(), size);
     UcxConnection::ConnectionIdType connectionId
         = *reinterpret_cast<UcxConnection::ConnectionIdType*>(buffer.data() + size);
-    std::scoped_lock lock(mConnectionsMutex, mConnectionFuturesMutex);
-    TLLM_CHECK_WITH_INFO(mConnectionFutures.find(connectionId) != mConnectionFutures.end(),
-        "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId, mRank);
-    if (mConnectionFutures.at(connectionId).valid())
+    std::shared_future<void> connectionFuture;
     {
-        // wait for the connection to be created
-        mConnectionFutures.at(connectionId).get();
+        std::scoped_lock lock(mConnectionFuturesMutex);
+        auto const connectionFutureIt = mConnectionFutures.find(connectionId);
+        TLLM_CHECK_WITH_INFO(connectionFutureIt != mConnectionFutures.end(),
+            "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId, mRank);
+        connectionFuture = connectionFutureIt->second;
     }
-    TLLM_CHECK_WITH_INFO(mConnections.find(connectionId) != mConnections.end(),
-        "Connection not found In recvConnect connectionId: %lu , worldRank: %d", connectionId, mRank);
+    TLLM_CHECK_WITH_INFO(connectionFuture.valid(),
+        "connectionFuture is invalid In recvConnect connectionId : %lu , worldRank: %d", connectionId, mRank);
+    // Wait outside mConnectionsMutex: the passive connection future inserts into mConnections when it completes.
+    connectionFuture.get();
 
-    TLLM_CHECK(!mConnections[connectionId]->isFromRequester());
+    Connection const* connection = nullptr;
+    {
+        std::scoped_lock lock(mConnectionsMutex);
+        TLLM_CHECK_WITH_INFO(mConnections.find(connectionId) != mConnections.end(),
+            "Connection not found In recvConnect connectionId: %lu , worldRank: %d", connectionId, mRank);
+
+        TLLM_CHECK(!mConnections[connectionId]->isFromRequester());
+        connection = mConnections[connectionId].get();
+    }
 
     TLLM_LOG_DEBUG(mRank, "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
         *reinterpret_cast<uint64_t*>(buffer.data()));
 
-    return mConnections[connectionId].get();
+    return connection;
 }
 
 std::vector<Connection const*> UcxConnectionManager::getConnections(CommState const& state)
