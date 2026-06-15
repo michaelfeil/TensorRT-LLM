@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, RequestStats
 from tensorrt_llm.logger import logger
@@ -51,6 +51,7 @@ class ADPIterStatsRecord:
     host_step_time_ms: Optional[float] = None
     prev_device_step_time_ms: Optional[float] = None
     gpu_forward_time_ms: Optional[float] = None
+    extra_stats: Optional[Dict[str, Any]] = None
 
 
 class ADPIterStatsBuffer:
@@ -80,6 +81,7 @@ class ADPIterStatsBuffer:
         self._rank0_host_step_time_ms: Dict[int, Optional[float]] = {}
         self._rank0_prev_device_step_time_ms: Dict[int, Optional[float]] = {}
         self._rank0_gpu_forward_time_ms: Dict[int, Optional[float]] = {}
+        self._rank0_extra_stats: Dict[int, Optional[Dict[str, Any]]] = {}
         self._oldest_iter: Optional[int] = None
 
     @staticmethod
@@ -108,6 +110,7 @@ class ADPIterStatsBuffer:
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
+        extra_stats: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
         payload = self.make_payload(stats)
@@ -129,6 +132,7 @@ class ADPIterStatsBuffer:
             self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
             self._rank0_prev_device_step_time_ms[iter_id] = prev_device_step_time_ms
             self._rank0_gpu_forward_time_ms[iter_id] = gpu_forward_time_ms
+            self._rank0_extra_stats[iter_id] = extra_stats
 
     def next_payload(self) -> Optional[RankIterStatsPayload]:
         """Return the oldest pending stats payload to piggyback."""
@@ -163,6 +167,7 @@ class ADPIterStatsBuffer:
         self._rank0_host_step_time_ms.pop(iter_id, None)
         self._rank0_prev_device_step_time_ms.pop(iter_id, None)
         self._rank0_gpu_forward_time_ms.pop(iter_id, None)
+        self._rank0_extra_stats.pop(iter_id, None)
         if recompute_oldest and iter_id == self._oldest_iter:
             self._recompute_oldest_iter()
 
@@ -294,6 +299,7 @@ class ADPIterStatsBuffer:
             host_step_time_ms = self._rank0_host_step_time_ms.get(iter_stats_iter)
             prev_device_step_time_ms = self._rank0_prev_device_step_time_ms.get(iter_stats_iter)
             gpu_forward_time_ms = self._rank0_gpu_forward_time_ms.get(iter_stats_iter)
+            extra_stats = self._rank0_extra_stats.get(iter_stats_iter)
 
             for rank_state in sorted(matching_states, key=lambda s: s.rank):
                 rank = rank_state.rank
@@ -306,6 +312,7 @@ class ADPIterStatsBuffer:
                         host_step_time_ms=host_step_time_ms,
                         prev_device_step_time_ms=prev_device_step_time_ms,
                         gpu_forward_time_ms=gpu_forward_time_ms,
+                        extra_stats=extra_stats,
                     )
                 )
 
