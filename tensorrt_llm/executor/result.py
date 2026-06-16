@@ -1277,12 +1277,14 @@ class IterationResult:
         if self._done:
             raise StopAsyncIteration
 
-        assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-
         try:
-            data = await self.aqueue.get(timeout=self._timeout)
+            if self.aqueue is None:
+                data = await asyncio.to_thread(self.queue.get, True,
+                                               self._timeout)
+            else:
+                data = await self.aqueue.get(timeout=self._timeout)
             return json.loads(data)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, Empty):
             self._done = True
             raise StopAsyncIteration
 

@@ -826,6 +826,9 @@ class BaseWorker(GenerationExecutor):
         scheduler_mode = stats[6] if len(stats) > 6 else None
         gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
         extra_stats = stats[8] if len(stats) > 8 else None
+        if extra_stats is None and hasattr(kv_iter_stats, "to_dict"):
+            extra_stats = kv_iter_stats
+            kv_iter_stats = None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -897,14 +900,18 @@ class BaseWorker(GenerationExecutor):
             stats_dict["schedulerMode"] = scheduler_mode
 
         if extra_stats is not None:
-            spec_decode_extra_stats = extra_stats.get("specDecodingStats")
-            if spec_decode_extra_stats is not None:
-                stats_dict["specDecodingStats"] = (
-                    stats_dict.get("specDecodingStats") or {})
-                stats_dict["specDecodingStats"].update(spec_decode_extra_stats)
-            for key, value in extra_stats.items():
-                if key != "specDecodingStats":
-                    stats_dict[key] = value
+            if hasattr(extra_stats, "to_dict"):
+                stats_dict["hbmStats"] = extra_stats.to_dict()
+            elif isinstance(extra_stats, dict):
+                spec_decode_extra_stats = extra_stats.get("specDecodingStats")
+                if spec_decode_extra_stats is not None:
+                    stats_dict["specDecodingStats"] = (
+                        stats_dict.get("specDecodingStats") or {})
+                    stats_dict["specDecodingStats"].update(
+                        spec_decode_extra_stats)
+                for key, value in extra_stats.items():
+                    if key != "specDecodingStats":
+                        stats_dict[key] = value
 
         # Convert back to JSON string
         return orjson.dumps(stats_dict).decode("utf-8")

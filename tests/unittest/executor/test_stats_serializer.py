@@ -76,6 +76,15 @@ def _make_mock_kv_iter_stats(
     return {window_size: s}
 
 
+class _FakeHbmStats:
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def to_dict(self):
+        return self.payload
+
+
 class TestStatsSerializer:
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
@@ -237,3 +246,24 @@ class TestStatsSerializer:
         assert "prevDeviceStepTimeMS" not in d
         assert d["schedulerMode"] == "overlap"
         assert d["gpuForwardTimeMS"] == 4.25
+
+    def test_serializer_accepts_hbm_extra_stats_legacy_slot(self):
+        """Object-style slot-2 payloads should remain backward compatible."""
+        hbm_stats = {"allocatedBytes": 1024, "reservedBytes": 2048}
+        iter_stats = _make_mock_iteration_stats()
+
+        stats_json = BaseWorker._stats_serializer(
+            (iter_stats, None, _FakeHbmStats(hbm_stats)))
+
+        assert json.loads(stats_json)["hbmStats"] == hbm_stats
+
+    def test_serializer_accepts_hbm_extra_stats_canonical_slot(self):
+        """Object-style extras should serialize from the current slot-8 shape."""
+        hbm_stats = {"allocatedBytes": 1024, "reservedBytes": 2048}
+        iter_stats = _make_mock_iteration_stats()
+
+        stats_json = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, None, None, None, None,
+             _FakeHbmStats(hbm_stats)))
+
+        assert json.loads(stats_json)["hbmStats"] == hbm_stats
