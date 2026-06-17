@@ -25,6 +25,7 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <exception>
@@ -32,6 +33,7 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -64,10 +66,13 @@ public:
 
     MessageType mType;
     std::optional<std::string> mWorkerAddress;
+    std::optional<UcxConnection::ConnectionIdType> mRequesterConnectionId;
 
-    UcxCmMessage(MessageType type, std::optional<std::string> workerAddress)
+    UcxCmMessage(MessageType type, std::optional<std::string> workerAddress,
+        std::optional<UcxConnection::ConnectionIdType> requesterConnectionId = std::nullopt)
         : mType(type)
         , mWorkerAddress(std::move(workerAddress))
+        , mRequesterConnectionId(requesterConnectionId)
     {
     }
 
@@ -75,7 +80,8 @@ public:
     {
         namespace su = tensorrt_llm::executor::serialize_utils;
 
-        return su::serializedSize(message.mType) + su::serializedSize(message.mWorkerAddress);
+        return su::serializedSize(message.mType) + su::serializedSize(message.mWorkerAddress)
+            + su::serializedSize(message.mRequesterConnectionId);
     }
 
     static void serialize(UcxCmMessage const& message, std::ostream& os)
@@ -83,6 +89,7 @@ public:
         namespace su = tensorrt_llm::executor::serialize_utils;
         su::serialize(message.mType, os);
         su::serialize(message.mWorkerAddress, os);
+        su::serialize(message.mRequesterConnectionId, os);
     }
 
     static UcxCmMessage deserialize(std::istream& is)
@@ -90,7 +97,8 @@ public:
         namespace su = tensorrt_llm::executor::serialize_utils;
         auto type = su::deserialize<MessageType>(is);
         auto workerAddress = su::deserialize<std::optional<std::string>>(is);
-        return UcxCmMessage(type, workerAddress);
+        auto requesterConnectionId = su::deserialize<std::optional<UcxConnection::ConnectionIdType>>(is);
+        return UcxCmMessage(type, workerAddress, requesterConnectionId);
     }
 };
 
@@ -474,6 +482,8 @@ UcxConnectionManager::UcxConnectionManager()
                     {
                         // add Connection
                         TLLM_CHECK_WITH_INFO(ucxCmessage.mWorkerAddress.has_value(), "workerAddress is null");
+                        TLLM_CHECK_WITH_INFO(
+                            ucxCmessage.mRequesterConnectionId.has_value(), "requesterConnectionId is null");
                         std::string workerAddress = ucxCmessage.mWorkerAddress.value();
                         std::string selfWorkerAddress = mWorkerAddress;
                         UcxCmMessage serverMessage(UcxCmMessage::MessageType::SERVER_WORKER_ADDRESS, selfWorkerAddress);
@@ -481,7 +491,7 @@ UcxConnectionManager::UcxConnectionManager()
                         UcxCmMessage::serialize(serverMessage, oStream);
                         std::string serverMessageStr = oStream.str();
                         mZmqRepSocket.send(zmq::buffer(serverMessageStr), zmq::send_flags::none);
-                        addConnection(workerAddress);
+                        addConnection(workerAddress, ucxCmessage.mRequesterConnectionId.value());
                     }
                     else if (ucxCmessage.mType == UcxCmMessage::MessageType::STOP)
                     {
@@ -586,7 +596,8 @@ void UcxConnectionManager::processPassiveConnectionRequests()
                 newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, true);
             }
             std::shared_ptr<UcxConnection> connection
-                = std::make_shared<UcxConnection>(request.connectionId, newEp, this, false);
+                = std::make_shared<UcxConnection>(
+                    request.connectionId, newEp, this, false, request.requesterConnectionId);
             {
                 std::scoped_lock lock(mConnectionsMutex);
                 mConnections.emplace(request.connectionId, connection);
@@ -613,7 +624,8 @@ void UcxConnectionManager::stopPassiveConnectionWorker()
     }
 }
 
-void UcxConnectionManager::addConnection(std::string const& workerAddress)
+void UcxConnectionManager::addConnection(
+    std::string const& workerAddress, UcxConnection::ConnectionIdType requesterConnectionId)
 {
     try
     {
@@ -632,7 +644,7 @@ void UcxConnectionManager::addConnection(std::string const& workerAddress)
                 TLLM_CHECK_WITH_INFO(
                     !mStopPassiveConnectionWorker, "passive connection worker has already stopped");
                 mPassiveConnectionRequests.emplace_back(
-                    PassiveConnectionRequest{connectionId, workerAddress, connectionPromise});
+                    PassiveConnectionRequest{connectionId, requesterConnectionId, workerAddress, connectionPromise});
             }
             mPassiveConnectionRequestsCv.notify_one();
         }
@@ -710,11 +722,13 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
 
         try
         {
+            UcxConnection::ConnectionIdType connectionId = getNewConnectionId();
             int const connectionTimeoutMs = getZmqConnectionTimeoutMs(mRank);
             auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
             configureZmqRequestSocket(reqSocket, connectionTimeoutMs);
             reqSocket.connect(build_zmq_endpoint(ip, port));
-            UcxCmMessage getWorkerAddressMessage(UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress);
+            UcxCmMessage getWorkerAddressMessage(
+                UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress, connectionId);
             std::ostringstream oStream;
             UcxCmMessage::serialize(getWorkerAddressMessage, oStream);
             std::string getWorkerAddressMessageStr = oStream.str();
@@ -747,8 +761,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
                 std::scoped_lock lock(mEndpointCreationMutex);
                 newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, true);
             }
-            UcxConnection::ConnectionIdType connectionId = getNewConnectionId();
-            auto connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
+            auto connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true, connectionId);
             TLLM_CHECK(connectionId != 0);
             {
                 std::scoped_lock lock(mConnectionsMutex, mAddressToConnectionIdMutex);
@@ -788,38 +801,29 @@ UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId()
 
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
 {
-    std::vector<char> buffer(size + sizeof(UcxConnection::ConnectionIdType));
+    auto buffer = std::make_shared<std::vector<char>>(size + sizeof(UcxConnection::ConnectionIdType));
     auto promise = std::make_shared<std::promise<void>>();
     std::future<void> future = promise->get_future();
     auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
+    ucxx::RequestCallbackUserData callbackData = buffer;
 
-    std::shared_ptr<ucxx::Request> req = mWorkersPool.front()->tagRecv(
-        buffer.data(), buffer.size(), ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback);
-    while (!req->isCompleted())
+    std::shared_ptr<ucxx::Request> req = mWorkersPool.front()->tagRecv(buffer->data(), buffer->size(),
+        ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback, callbackData);
+    if (!req->isCompleted())
     {
-        if (ctx.getTransferTerminate().load())
-        {
-            // Explicitly cancel the posted receive before returning so UCX
-            // does not keep a stale match alive for a later handshake.
-            req->cancel();
-            while (!req->isCompleted())
-            {
-                future.wait_for(std::chrono::milliseconds(1));
-            }
-            if (req->getStatus() != UCS_OK)
-            {
-                return nullptr;
-            }
-            break;
-        }
-        future.wait_for(std::chrono::milliseconds(1));
+        waitForUcxRequestCompletion(req, future, ctx, mRank, "recvConnect", true, callbackData, buffer->size(),
+            getUcxHostControlRequestTimeoutMs(mRank));
+    }
+    if (ctx.getTransferTerminate().load() && req->getStatus() == UCS_ERR_CANCELED)
+    {
+        return nullptr;
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv SendConnectionId should be completed");
     req->checkError();
 
-    memcpy(data, buffer.data(), size);
+    memcpy(data, buffer->data(), size);
     UcxConnection::ConnectionIdType connectionId
-        = *reinterpret_cast<UcxConnection::ConnectionIdType*>(buffer.data() + size);
+        = *reinterpret_cast<UcxConnection::ConnectionIdType*>(buffer->data() + size);
     std::shared_future<void> connectionFuture;
     {
         std::scoped_lock lock(mConnectionFuturesMutex);
@@ -844,7 +848,7 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
     }
 
     TLLM_LOG_DEBUG(mRank, "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
-        *reinterpret_cast<uint64_t*>(buffer.data()));
+        *reinterpret_cast<uint64_t*>(buffer->data()));
 
     return connection;
 }
@@ -878,6 +882,36 @@ std::vector<Connection const*> UcxConnectionManager::getConnections(CommState co
 bool UcxConnectionManager::isRunning() const
 {
     return mIsRunning;
+}
+
+std::vector<std::uint64_t> UcxConnectionManager::drainContextKvTransferFailureEventIds()
+{
+    std::scoped_lock lock(mContextKvTransferFailureEventIdsMutex);
+    std::vector<std::uint64_t> eventIds;
+    eventIds.swap(mContextKvTransferFailureEventIds);
+    return eventIds;
+}
+
+void UcxConnectionManager::recordPassiveHandshakeFailureEvent(std::uint64_t tag) noexcept
+{
+    try
+    {
+        auto const eventId = makeUcxPassiveHandshakeFailureEventId(tag);
+        std::scoped_lock lock(mContextKvTransferFailureEventIdsMutex);
+        if (std::find(mContextKvTransferFailureEventIds.begin(), mContextKvTransferFailureEventIds.end(), eventId)
+            == mContextKvTransferFailureEventIds.end())
+        {
+            mContextKvTransferFailureEventIds.push_back(eventId);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING(mRank, "Failed to record UCX passive handshake failure event for tag %lu: %s", tag, e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_WARNING(mRank, "Failed to record UCX passive handshake failure event for tag %lu", tag);
+    }
 }
 
 CommState const& UcxConnectionManager::getCommState() const

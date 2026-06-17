@@ -38,8 +38,8 @@ namespace tensorrt_llm::executor::kv_cache
 
 namespace
 {
-constexpr int kDefaultHostControlRequestTimeoutMs = 0;
-constexpr char const* kUcxHostControlTimeoutMsEnv = "TRTLLM_UCX_HOST_CONTROL_TIMEOUT_MS";
+constexpr int kDefaultConnectionHandshakeTimeoutMs = 10000;
+constexpr char const* kUcxConnectionHandshakeTimeoutMsEnv = "TRTLLM_UCX_CONNECTION_HANDSHAKE_TIMEOUT_MS";
 constexpr int32_t kTagTypeBits = 8;
 constexpr int32_t kTagTypeMask = (1 << kTagTypeBits) - 1;
 
@@ -52,10 +52,76 @@ bool isHostControlTag(int tag)
         || tag == TransceiverTag::kREADY_SIGNAL_TAG || (tag & kTagTypeMask) == TransceiverTag::kREADY_SIGNAL_TAG;
 }
 
-int getHostControlRequestTimeoutMs(int rank)
+int getConnectionHandshakeTimeoutMs(int rank)
 {
-    return getUcxRequestTimeoutMs(
-        rank, kUcxHostControlTimeoutMsEnv, kDefaultHostControlRequestTimeoutMs, "host control");
+    auto const timeoutMs = getUcxRequestTimeoutMs(
+        rank, kUcxConnectionHandshakeTimeoutMsEnv, kDefaultConnectionHandshakeTimeoutMs, "connection handshake");
+    if (timeoutMs == 0)
+    {
+        TLLM_LOG_WARNING(rank, "%s=0 is unsupported for UCX connection handshakes; using default timeout of %d ms",
+            kUcxConnectionHandshakeTimeoutMsEnv, kDefaultConnectionHandshakeTimeoutMs);
+        return kDefaultConnectionHandshakeTimeoutMs;
+    }
+    return timeoutMs;
+}
+
+uint64_t makeConnectionHandshakeTag(UcxConnection::ConnectionIdType connectionId, uint64_t tag)
+{
+    return ((connectionId & 0xFFFFFFFF) << 32) | (tag & 0xFFFFFFFF);
+}
+
+void waitForConnectionHandshakeRequest(std::shared_ptr<ucxx::Request> const& req, std::future<void>& future,
+    DataContext const& ctx, UcxConnectionManager* manager, char const* operation,
+    ucxx::RequestCallbackUserData const& callbackData, ucxx::Endpoint* endpoint)
+{
+    auto const rank = manager->getRank();
+    waitForUcxRequestCompletion(req, future, ctx, rank, operation, true, callbackData,
+        sizeof(UcxConnection::ConnectionIdType), getConnectionHandshakeTimeoutMs(rank), endpoint);
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "connection handshake request should be completed");
+    req->checkError();
+}
+
+UcxConnection::ConnectionIdType recvConnectionHandshake(
+    UcxConnectionManager* manager, ucxx::Endpoint& endpoint, ucxx::Tag recvTag, int contextTag)
+{
+    auto connectionId = std::make_shared<UcxConnection::ConnectionIdType>();
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+    auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
+    ucxx::RequestCallbackUserData callbackData = connectionId;
+    std::shared_ptr<ucxx::Request> request = endpoint.tagRecv(connectionId.get(), sizeof(*connectionId), recvTag,
+        ucxx::TagMaskFull, false, completionCallback, callbackData);
+    if (!request->isCompleted())
+    {
+        waitForConnectionHandshakeRequest(
+            request, future, DataContext{contextTag}, manager, "recvConnectionHandshake", callbackData, &endpoint);
+    }
+    else
+    {
+        request->checkError();
+    }
+    return *connectionId;
+}
+
+void sendConnectionHandshake(UcxConnectionManager* manager, ucxx::Endpoint& endpoint,
+    UcxConnection::ConnectionIdType connectionId, ucxx::Tag sendTag, int contextTag)
+{
+    auto connectionIdBuffer = std::make_shared<UcxConnection::ConnectionIdType>(connectionId);
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+    auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
+    ucxx::RequestCallbackUserData callbackData = connectionIdBuffer;
+    std::shared_ptr<ucxx::Request> request = endpoint.tagSend(connectionIdBuffer.get(), sizeof(*connectionIdBuffer),
+        sendTag, false, completionCallback, callbackData);
+    if (!request->isCompleted())
+    {
+        waitForConnectionHandshakeRequest(
+            request, future, DataContext{contextTag}, manager, "sendConnectionHandshake", callbackData, &endpoint);
+    }
+    else
+    {
+        request->checkError();
+    }
 }
 
 void sendPayloadWithoutStaging(ucxx::Endpoint& endpoint, uint64_t sendTag, void const* data, size_t size)
@@ -103,7 +169,7 @@ void logRecvEnd(UcxConnection::ConnectionIdType connectionId, UcxConnection::Con
 } // namespace
 
 UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
-    UcxConnectionManager* manager, bool fromRequester)
+    UcxConnectionManager* manager, bool fromRequester, ConnectionIdType requesterConnectionId)
     : mConnectionId(connectionId)
     , mEndpoint(std::move(endpoint))
     , mManager(manager)
@@ -115,40 +181,41 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
         if (mFromRequester)
         {
 
-            // since the tag don't contain the information of the connection id or mConnectionIdInPeer, we need to
-            // lock the mutex ,to ensure only one tagRecv is called in the same time.
-            std::shared_ptr<ucxx::Request> recvRequest
-                = mEndpoint->tagRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer),
-                    ucxx::Tag(ResponserTag), ucxx::TagMaskFull);
-            while (!recvRequest->isCompleted())
-                ;
+            // Receive the responder connection id on a requester-unique tag before switching to peer-specific tags.
+            auto recvTag = ucxx::Tag(makeConnectionHandshakeTag(requesterConnectionId, ResponserTag));
+            mConnectionIdInPeer = recvConnectionHandshake(
+                mManager, *mEndpoint, recvTag, static_cast<int>(ResponserTag));
 
-            recvRequest->checkError();
-
-            auto sendTag = ucxx::Tag(mConnectionIdInPeer << 32 | (RequesterTag & 0xFFFFFFFF));
-            std::shared_ptr<ucxx::Request> sendRequest
-                = mEndpoint->tagSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), sendTag);
-            while (!sendRequest->isCompleted())
-                ;
-            sendRequest->checkError();
+            auto sendTag = ucxx::Tag(makeConnectionHandshakeTag(mConnectionIdInPeer, RequesterTag));
+            sendConnectionHandshake(mManager, *mEndpoint, mConnectionId, sendTag, static_cast<int>(RequesterTag));
         }
         else
         {
 
-            // Since Responder may recv from multiple Requesters, we need to send the mConnectionId to the Reqester
-            // first and use ConnectionId as the tag to recv the mConnectionIdInPeer from the Requester
-            std::shared_ptr<ucxx::Request> sendRequest = mEndpoint->tagSend(
-                reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), ucxx::Tag(ResponserTag));
-            while (!sendRequest->isCompleted())
-                ;
-            sendRequest->checkError();
+            // Send the responder connection id first so the requester can reply on a connection-specific tag.
+            auto sendTag = ucxx::Tag(makeConnectionHandshakeTag(requesterConnectionId, ResponserTag));
+            try
+            {
+                sendConnectionHandshake(
+                    mManager, *mEndpoint, mConnectionId, sendTag, static_cast<int>(ResponserTag));
+            }
+            catch (...)
+            {
+                mManager->recordPassiveHandshakeFailureEvent(ResponserTag);
+                throw;
+            }
 
-            auto recvTag = ucxx::Tag(mConnectionId << 32 | (RequesterTag & 0xFFFFFFFF));
-            std::shared_ptr<ucxx::Request> recvRequest = mEndpoint->tagRecv(
-                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), recvTag, ucxx::TagMaskFull);
-            while (!recvRequest->isCompleted())
-                ;
-            recvRequest->checkError();
+            auto recvTag = ucxx::Tag(makeConnectionHandshakeTag(mConnectionId, RequesterTag));
+            try
+            {
+                mConnectionIdInPeer
+                    = recvConnectionHandshake(mManager, *mEndpoint, recvTag, static_cast<int>(RequesterTag));
+            }
+            catch (...)
+            {
+                mManager->recordPassiveHandshakeFailureEvent(RequesterTag);
+                throw;
+            }
         }
     }
     catch (std::exception const& e)
@@ -196,7 +263,7 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
     if (!req->isCompleted())
     {
         waitForUcxRequestCompletion(req, future, ctx, mManager->getRank(), "sendConnectionId", true, buffer,
-            buffer->size(), getHostControlRequestTimeoutMs(mManager->getRank()), mEndpoint.get());
+            buffer->size(), getUcxHostControlRequestTimeoutMs(mManager->getRank()), mEndpoint.get());
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "sendConnectionId should be completed");
     req->checkError();
@@ -245,7 +312,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
     if (!req->isCompleted())
     {
         waitForUcxRequestCompletion(req, future, ctx, rank, "send", true, callbackData, hostControlBuffer->size(),
-            getHostControlRequestTimeoutMs(rank), mEndpoint.get());
+            getUcxHostControlRequestTimeoutMs(rank), mEndpoint.get());
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
     req->checkError();
@@ -287,7 +354,7 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     if (!req->isCompleted())
     {
         waitForUcxRequestCompletion(req, future, ctx, rank, "recv", true, callbackData, hostControlBuffer->size(),
-            getHostControlRequestTimeoutMs(rank), mEndpoint.get());
+            getUcxHostControlRequestTimeoutMs(rank), mEndpoint.get());
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
     req->checkError();

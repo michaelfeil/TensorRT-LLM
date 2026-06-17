@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,16 +42,26 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "gtest/gtest.h"
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <future>
 #include <gmock/gmock.h>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <set>
+#include <sstream>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#include <thread>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
@@ -83,12 +93,223 @@ std::unique_ptr<texec::kv_cache::ConnectionManager> makeOneUcxConnectionManager(
     return makeUcxConnectionManager();
 }
 
+bool isUcxWrapperUnavailable(std::string const& error)
+{
+    return error.find("UCX wrapper library is not open correctly") != std::string::npos
+        || error.find("Unable to load UCX wrapper library symbol") != std::string::npos;
+}
+
 class UcxCommTest : public ::testing::Test
 {
 };
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using TransceiverTag = tensorrt_llm::batch_manager::TransceiverTag;
+
+class ScopedEnvVar
+{
+public:
+    ScopedEnvVar(char const* name, char const* value)
+        : mName(name)
+    {
+        char const* oldValue = std::getenv(name);
+        if (oldValue != nullptr)
+        {
+            mHadOldValue = true;
+            mOldValue = oldValue;
+        }
+        TLLM_CHECK_WITH_INFO(setenv(name, value, 1) == 0, "Failed to set %s: %s", name, std::strerror(errno));
+    }
+
+    ~ScopedEnvVar() noexcept
+    {
+        int result = 0;
+        if (!mHadOldValue)
+        {
+            result = unsetenv(mName);
+        }
+        else
+        {
+            result = setenv(mName, mOldValue.c_str(), 1);
+        }
+        if (result != 0)
+        {
+            ADD_FAILURE() << "Failed to restore " << mName << ": " << std::strerror(errno);
+        }
+    }
+
+private:
+    char const* mName;
+    bool mHadOldValue{false};
+    std::string mOldValue;
+};
+
+bool waitForFuturesUntil(std::vector<std::future<void>>& futures, std::chrono::steady_clock::time_point deadline)
+{
+    for (auto& future : futures)
+    {
+        auto const now = std::chrono::steady_clock::now();
+        if (now >= deadline || future.wait_until(deadline) != std::future_status::ready)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+void collectReadyFutures(std::vector<std::future<void>>& futures)
+{
+    for (auto& future : futures)
+    {
+        if (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+        {
+            continue;
+        }
+        try
+        {
+            future.get();
+        }
+        catch (std::exception const&)
+        {
+        }
+    }
+}
+
+void runConcurrentConnectionTest(char const* testName,
+    std::vector<texec::kv_cache::ConnectionManager*> const& requesters,
+    std::vector<texec::kv_cache::ConnectionManager*> const& receivers)
+{
+    constexpr auto kTestTimeout = std::chrono::seconds(20);
+    ScopedEnvVar handshakeTimeout("TRTLLM_UCX_CONNECTION_HANDSHAKE_TIMEOUT_MS", "5000");
+    ScopedEnvVar hostControlTimeout("TRTLLM_UCX_HOST_CONTROL_TIMEOUT_MS", "5000");
+
+    ASSERT_EQ(requesters.size(), receivers.size());
+    ASSERT_FALSE(requesters.empty());
+
+    std::vector<texec::kv_cache::CommState> receiverStates;
+    receiverStates.reserve(receivers.size());
+    for (auto* receiver : receivers)
+    {
+        ASSERT_NE(receiver, nullptr);
+        receiverStates.emplace_back(receiver->getCommState());
+        ASSERT_TRUE(receiverStates.back().isSocketState());
+    }
+    for (auto* requester : requesters)
+    {
+        ASSERT_NE(requester, nullptr);
+    }
+
+    std::atomic<bool> terminate{false};
+    std::atomic<bool> timedOut{false};
+    auto const deadline = std::chrono::steady_clock::now() + kTestTimeout;
+    std::mutex errorMutex;
+    std::vector<std::string> workerErrors;
+    std::mutex watchdogMutex;
+    std::condition_variable watchdogCv;
+    bool receiverDone{false};
+
+    std::promise<void> startPromise;
+    std::shared_future<void> startFuture = startPromise.get_future().share();
+    std::vector<std::future<void>> senderFutures;
+    senderFutures.reserve(requesters.size());
+    for (size_t idx = 0; idx < requesters.size(); idx++)
+    {
+        auto* requester = requesters.at(idx);
+        senderFutures.emplace_back(std::async(std::launch::async,
+            [requester, &receiverStates, &startFuture, &terminate, &errorMutex, &workerErrors, idx, testName]()
+            {
+                try
+                {
+                    startFuture.wait();
+                    auto connections = requester->getConnections(receiverStates.at(idx));
+                    TLLM_CHECK_WITH_INFO(
+                        connections.size() == 1, "Expected exactly one UCX connection in %s test", testName);
+                    uint64_t const id = idx + 1;
+                    connections.at(0)->send(DataContext{TransceiverTag::kID_TAG, terminate}, &id, sizeof(id));
+                    uint64_t ack{};
+                    connections.at(0)->recv(DataContext{TransceiverTag::kINFO_SIZE_TAG, terminate}, &ack, sizeof(ack));
+                    TLLM_CHECK_WITH_INFO(
+                        ack == id, "Unexpected UCX %s ack: expected %lu, got %lu", testName, id, ack);
+                }
+                catch (std::exception const& e)
+                {
+                    {
+                        std::scoped_lock lock(errorMutex);
+                        workerErrors.emplace_back(e.what());
+                    }
+                    terminate.store(true);
+                    throw;
+                }
+            }));
+    }
+
+    std::thread watchdog(
+        [&]()
+        {
+            std::unique_lock lock(watchdogMutex);
+            if (!watchdogCv.wait_for(lock, kTestTimeout, [&receiverDone]() { return receiverDone; }))
+            {
+                timedOut.store(true);
+                terminate.store(true);
+            }
+        });
+
+    std::set<uint64_t> receivedIds;
+    std::string receiverError;
+    startPromise.set_value();
+    try
+    {
+        for (auto* receiver : receivers)
+        {
+            uint64_t receivedId{};
+            auto const* connection = receiver->recvConnect(
+                DataContext{TransceiverTag::kID_TAG, terminate}, &receivedId, sizeof(receivedId));
+            if (connection == nullptr)
+            {
+                break;
+            }
+            receivedIds.insert(receivedId);
+            connection->send(DataContext{TransceiverTag::kINFO_SIZE_TAG, terminate}, &receivedId, sizeof(receivedId));
+        }
+    }
+    catch (std::exception const& e)
+    {
+        receiverError = e.what();
+        terminate.store(true);
+    }
+
+    if (!waitForFuturesUntil(senderFutures, deadline))
+    {
+        timedOut.store(true);
+        terminate.store(true);
+        waitForFuturesUntil(senderFutures, std::chrono::steady_clock::now() + std::chrono::seconds(10));
+    }
+
+    {
+        std::scoped_lock lock(watchdogMutex);
+        receiverDone = true;
+    }
+    watchdogCv.notify_one();
+    watchdog.join();
+
+    collectReadyFutures(senderFutures);
+    ASSERT_FALSE(timedOut.load()) << "Timed out waiting for concurrent UCX " << testName << " test";
+    ASSERT_TRUE(receiverError.empty()) << receiverError;
+    if (!workerErrors.empty())
+    {
+        std::ostringstream errorStream;
+        for (auto const& error : workerErrors)
+        {
+            errorStream << error << '\n';
+        }
+        FAIL() << errorStream.str();
+    }
+    ASSERT_EQ(receivedIds.size(), requesters.size());
+    for (size_t idx = 0; idx < requesters.size(); idx++)
+    {
+        EXPECT_NE(receivedIds.find(idx + 1), receivedIds.end());
+    }
+}
 
 TEST_F(UcxCommTest, Basic)
 {
@@ -153,13 +374,12 @@ TEST_F(UcxCommTest, Basic)
     catch (std::exception const& e)
     {
         std::string error = e.what();
-        if (error.find("UCX wrapper library is not open correctly") != std::string::npos
-            || error.find("Unable to load UCX wrapper library symbol") != std::string::npos)
+        if (isUcxWrapperUnavailable(error))
         {
             GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
         }
 
-        throw e;
+        throw;
     }
 }
 
@@ -230,13 +450,79 @@ TEST_F(UcxCommTest, multiSend)
     catch (std::exception const& e)
     {
         std::string error = e.what();
-        if (error.find("UCX wrapper library is not open correctly") != std::string::npos
-            || error.find("Unable to load UCX wrapper library symbol") != std::string::npos)
+        if (isUcxWrapperUnavailable(error))
         {
             GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
         }
 
-        throw e;
+        throw;
+    }
+}
+
+TEST_F(UcxCommTest, concurrentRequestersToOneReceiver)
+{
+    try
+    {
+        constexpr size_t kRequesterCount = 8;
+
+        auto receiverManager = makeOneUcxConnectionManager();
+
+        std::vector<std::unique_ptr<texec::kv_cache::ConnectionManager>> requesterManagers;
+        std::vector<texec::kv_cache::ConnectionManager*> requesters;
+        std::vector<texec::kv_cache::ConnectionManager*> receivers;
+        requesterManagers.reserve(kRequesterCount);
+        requesters.reserve(kRequesterCount);
+        receivers.reserve(kRequesterCount);
+        for (size_t idx = 0; idx < kRequesterCount; idx++)
+        {
+            requesterManagers.emplace_back(makeOneUcxConnectionManager());
+            requesters.push_back(requesterManagers.back().get());
+            receivers.push_back(receiverManager.get());
+        }
+        runConcurrentConnectionTest("fan-in", requesters, receivers);
+    }
+    catch (std::exception const& e)
+    {
+        std::string error = e.what();
+        if (isUcxWrapperUnavailable(error))
+        {
+            GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
+        }
+
+        throw;
+    }
+}
+
+TEST_F(UcxCommTest, concurrentRequesterToMultipleReceivers)
+{
+    try
+    {
+        constexpr size_t kReceiverCount = 8;
+
+        auto requesterManager = makeOneUcxConnectionManager();
+        std::vector<std::unique_ptr<texec::kv_cache::ConnectionManager>> receiverManagers;
+        std::vector<texec::kv_cache::ConnectionManager*> requesters;
+        std::vector<texec::kv_cache::ConnectionManager*> receivers;
+        receiverManagers.reserve(kReceiverCount);
+        requesters.reserve(kReceiverCount);
+        receivers.reserve(kReceiverCount);
+        for (size_t idx = 0; idx < kReceiverCount; idx++)
+        {
+            receiverManagers.emplace_back(makeOneUcxConnectionManager());
+            requesters.push_back(requesterManager.get());
+            receivers.push_back(receiverManagers.back().get());
+        }
+        runConcurrentConnectionTest("fan-out", requesters, receivers);
+    }
+    catch (std::exception const& e)
+    {
+        std::string error = e.what();
+        if (isUcxWrapperUnavailable(error))
+        {
+            GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
+        }
+
+        throw;
     }
 }
 
@@ -279,13 +565,12 @@ TEST_F(UcxCommTest, CommCache)
     catch (std::exception const& e)
     {
         std::string error = e.what();
-        if (error.find("UCX wrapper library is not open correctly") != std::string::npos
-            || error.find("Unable to load UCX wrapper library symbol") != std::string::npos)
+        if (isUcxWrapperUnavailable(error))
         {
             GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
         }
 
-        throw e;
+        throw;
     }
 }
 

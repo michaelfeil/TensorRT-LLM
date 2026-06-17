@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,13 @@
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+constexpr std::uint64_t kKvTransferSyntheticEventIdBit{1ULL << 63};
+
+inline std::uint64_t makeUcxPassiveHandshakeFailureEventId(std::uint64_t tag)
+{
+    return kKvTransferSyntheticEventIdBit | (tag & 0xFFFFULL);
+}
 
 class CommState;
 
@@ -85,6 +92,11 @@ public:
 
     [[nodiscard]] virtual CommState const& getCommState() const = 0;
     [[nodiscard]] virtual bool isRunning() const = 0;
+
+    [[nodiscard]] virtual std::vector<std::uint64_t> drainContextKvTransferFailureEventIds()
+    {
+        return {};
+    }
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

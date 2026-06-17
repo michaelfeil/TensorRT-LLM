@@ -56,6 +56,10 @@ public:
         RequestStatuses& requestsStatus, LlmRequest::RequestIdType requestId, KvTransferResult transferResult,
         bool collectKvTransferEvents) const;
 
+    void recordContextEvent(
+        RequestStatuses& requestsStatus, LlmRequest::RequestIdType requestId, KvTransferResult transferResult,
+        bool collectKvTransferEvents) const;
+
     void recordContextCancellation(CacheSender& cacheSender, LlmRequest::RequestIdType requestId);
 
     void flushContextEvents(

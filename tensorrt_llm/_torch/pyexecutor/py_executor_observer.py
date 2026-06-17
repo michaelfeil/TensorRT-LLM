@@ -12,18 +12,35 @@ KV_TRANSFER_DIRECTION_GENERATION = "generation"
 KV_TRANSFER_STATUS_FAILURE = "failure"
 KV_TRANSFER_STATUS_SUCCESS = "success"
 
+_KV_TRANSFER_SYNTHETIC_EVENT_ID_BIT = 1 << 63
+_KV_TRANSFER_SYNTHETIC_EVENT_TAG_MASK = 0xFFFF
+_KV_TRANSFER_UCX_PASSIVE_HANDSHAKE_FAILURE = "ucxPassiveHandshakeFailure"
+_KV_TRANSFER_UCX_PASSIVE_HANDSHAKE_TAGS = (0xF1, 0xF2)
+_KV_TRANSFER_UCX_PASSIVE_HANDSHAKE_EVENT_IDS = frozenset(
+    _KV_TRANSFER_SYNTHETIC_EVENT_ID_BIT | tag
+    for tag in _KV_TRANSFER_UCX_PASSIVE_HANDSHAKE_TAGS)
 _KV_CACHE_TRANSFER_EVENTS_FIELD = "kvCacheTransferEvents"
 ObserverStatsPayload = dict[str, Any]
 
 
 def _kv_transfer_event(rank: int, direction: str, status: str,
                        request_id: int) -> dict[str, int | str]:
-    return {
+    request_id = int(request_id)
+    synthetic_request_id = request_id
+    if request_id in _KV_TRANSFER_UCX_PASSIVE_HANDSHAKE_EVENT_IDS:
+        request_id = -(request_id & _KV_TRANSFER_SYNTHETIC_EVENT_TAG_MASK)
+    event = {
         "rank": int(rank),
         "direction": direction,
         "status": status,
-        "requestId": int(request_id),
+        "requestId": request_id,
     }
+    if synthetic_request_id in _KV_TRANSFER_UCX_PASSIVE_HANDSHAKE_EVENT_IDS:
+        event["syntheticEvent"] = _KV_TRANSFER_UCX_PASSIVE_HANDSHAKE_FAILURE
+        event["syntheticRequestId"] = str(synthetic_request_id)
+        event["ucxHandshakeTag"] = (
+            synthetic_request_id & _KV_TRANSFER_SYNTHETIC_EVENT_TAG_MASK)
+    return event
 
 
 @dataclasses.dataclass(frozen=True)

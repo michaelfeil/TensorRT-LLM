@@ -97,7 +97,7 @@ nb::list kvTransferEventRecordsToList(std::vector<tb::KvTransferEventRecord> con
     nb::list events;
     for (auto const& event : eventRecords)
     {
-        events.append(nb::make_tuple(event.rank, static_cast<int64_t>(event.requestId)));
+        events.append(nb::make_tuple(event.rank, static_cast<std::uint64_t>(event.requestId)));
     }
     return events;
 }

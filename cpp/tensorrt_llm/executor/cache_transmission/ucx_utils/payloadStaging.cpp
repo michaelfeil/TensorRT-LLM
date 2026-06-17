@@ -52,6 +52,7 @@ namespace
 constexpr int kRequestPollMs = 1;
 constexpr int kRequestCancelGraceMs = 1000;
 constexpr int kDefaultPayloadRequestTimeoutMs = 30000;
+constexpr int kDefaultHostControlRequestTimeoutMs = 30000;
 constexpr int kDefaultUnsafeReclaimQuarantinedStagingMs = 0;
 constexpr size_t kPayloadChunkBytes = 512ULL * 1024 * 1024;
 constexpr size_t kDefaultPayloadStagingChunkBytes = kPayloadChunkBytes;
@@ -60,6 +61,7 @@ constexpr size_t kDefaultPayloadStagingPipelineDepth = 4;
 constexpr size_t kMaxQuarantinedStagedRequests = 64;
 constexpr char const* kUcxPayloadStagingEnv = "TRTLLM_UCX_ENABLE_PAYLOAD_STAGING";
 constexpr char const* kUcxPayloadTimeoutMsEnv = "TRTLLM_UCX_PAYLOAD_TIMEOUT_MS";
+constexpr char const* kUcxHostControlTimeoutMsEnv = "TRTLLM_UCX_HOST_CONTROL_TIMEOUT_MS";
 constexpr char const* kUcxPayloadStagingPoolSizeEnv = "TRTLLM_UCX_PAYLOAD_STAGING_POOL_SIZE";
 constexpr char const* kUcxPayloadStagingChunkBytesEnv = "TRTLLM_UCX_PAYLOAD_STAGING_CHUNK_BYTES";
 constexpr char const* kUcxPayloadStagingPipelineDepthEnv = "TRTLLM_UCX_PAYLOAD_STAGING_PIPELINE_DEPTH";
@@ -1057,6 +1059,12 @@ int getUcxRequestTimeoutMs(int rank, char const* envName, int defaultTimeoutMs, 
         return defaultTimeoutMs;
     }
     return static_cast<int>(timeoutMs);
+}
+
+int getUcxHostControlRequestTimeoutMs(int rank)
+{
+    return getUcxRequestTimeoutMs(
+        rank, kUcxHostControlTimeoutMsEnv, kDefaultHostControlRequestTimeoutMs, "host control");
 }
 
 bool isPayloadStagingEnabled(int rank)

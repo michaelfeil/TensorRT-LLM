@@ -888,6 +888,16 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         toCompleteIdSet.insert(it->requestId);
     }
 
+    if (collectKvTransferEvents)
+    {
+        auto contextKvTransferFailureEventIds = mManager->drainContextKvTransferFailureEventIds();
+        for (auto const eventId : contextKvTransferFailureEventIds)
+        {
+            mKvTransferEventObserver.recordContextEvent(
+                requestsStatus, eventId, KvTransferResult::kFailure, collectKvTransferEvents);
+        }
+    }
+
     // Record local terminal outcomes for requests selected this round. The
     // request is reported only after all ranks in the sync group agree that the
     // request reached a terminal state.

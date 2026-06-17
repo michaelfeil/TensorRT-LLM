@@ -452,6 +452,20 @@ public:
         }
     }
 
+    void recordReadyResponseContextFailureReportsUnlocked()
+    {
+        // A response-thread failure can happen before RequestInfo creates a TransferSession, so there is no
+        // needSendCache-based rank report bit yet. Report the ready requests that will receive this exception.
+        for (auto const& readyResponse : mReadyResponses)
+        {
+            if (mCancelledRequests.find(readyResponse.first) != mCancelledRequests.end())
+            {
+                continue;
+            }
+            mReportableContextKvTransferRequestIds.insert(readyResponse.first);
+        }
+    }
+
     /// `reason` is caller attribution for diagnostics (e.g. "send_complete", "cancel").
     void release(LlmRequest::RequestIdType requestId, char const* reason = "unspecified")
     {
@@ -967,10 +981,36 @@ private:
         }
         catch (std::exception const& err)
         {
+            auto const responseException = std::current_exception();
             TLLM_LOG_ERROR("Exception in CacheSender response: %s", err.what());
+            std::scoped_lock lk(mSenderMutex, mMtxForMap);
+            try
+            {
+                recordReadyResponseContextFailureReportsUnlocked();
+            }
+            catch (std::exception const& reportErr)
+            {
+                TLLM_LOG_WARNING("Failed to record CacheSender response failure events: %s", reportErr.what());
+            }
+            catch (...)
+            {
+                TLLM_LOG_WARNING("Failed to record CacheSender response failure events");
+            }
             for (auto& it : mReadyResponses)
             {
-                it.second.mPromise.set_exception(std::current_exception());
+                try
+                {
+                    it.second.mPromise.set_exception(responseException);
+                }
+                catch (std::exception const& promiseErr)
+                {
+                    TLLM_LOG_WARNING("Failed to set CacheSender response exception for request %zu: %s", it.first,
+                        promiseErr.what());
+                }
+                catch (...)
+                {
+                    TLLM_LOG_WARNING("Failed to set CacheSender response exception for request %zu", it.first);
+                }
             }
         }
     }

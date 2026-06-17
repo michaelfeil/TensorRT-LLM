@@ -33,6 +33,8 @@ void preallocatePayloadStagingBufferPool(int rank);
 
 int getUcxRequestTimeoutMs(int rank, char const* envName, int defaultTimeoutMs, char const* timeoutDescription);
 
+int getUcxHostControlRequestTimeoutMs(int rank);
+
 void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std::future<void>& future,
     DataContext const& ctx, int rank, char const* operation, bool stagedBuffer,
     ucxx::RequestCallbackUserData const& callbackData, size_t stagedBytes, int timeoutMs = 0,

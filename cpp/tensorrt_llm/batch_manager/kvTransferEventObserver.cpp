@@ -144,6 +144,24 @@ void KvTransferEventObserver::recordGenerationEvent(
     }
 }
 
+void KvTransferEventObserver::recordContextEvent(
+    RequestStatuses& requestsStatus, LlmRequest::RequestIdType requestId, KvTransferResult transferResult,
+    bool collectKvTransferEvents) const
+{
+    if (!collectKvTransferEvents)
+    {
+        return;
+    }
+    if (transferResult == KvTransferResult::kFailure)
+    {
+        requestsStatus.errorKvTransferEvents.push_back({mRank, requestId});
+    }
+    else
+    {
+        requestsStatus.completedKvTransferEvents.push_back({mRank, requestId});
+    }
+}
+
 void KvTransferEventObserver::recordContextCancellation(CacheSender& cacheSender, LlmRequest::RequestIdType requestId)
 {
     bool const pendingKvTransferError = mPendingContextErrorEventIds.find(requestId) != mPendingContextErrorEventIds.end();

@@ -43,7 +43,7 @@ public:
 
     UcxConnection() = default;
     explicit UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
-        UcxConnectionManager* manager, bool fromRequester);
+        UcxConnectionManager* manager, bool fromRequester, ConnectionIdType requesterConnectionId);
     ~UcxConnection();
     void sendConnectionId(DataContext const& ctx, void const* data, size_t size) const;
     void send(DataContext const& ctx, void const* data, size_t size) const override;

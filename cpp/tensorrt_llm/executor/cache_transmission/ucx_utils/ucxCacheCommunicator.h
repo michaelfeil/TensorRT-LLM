@@ -52,6 +52,7 @@ private:
     struct PassiveConnectionRequest
     {
         UcxConnection::ConnectionIdType connectionId;
+        UcxConnection::ConnectionIdType requesterConnectionId;
         std::string workerAddress;
         std::shared_ptr<std::promise<void>> connectionPromise;
     };
@@ -82,10 +83,13 @@ private:
     std::condition_variable mPassiveConnectionRequestsCv;
     std::thread mPassiveConnectionWorkerThread;
     bool mStopPassiveConnectionWorker{false};
+    std::mutex mContextKvTransferFailureEventIdsMutex;
+    std::vector<std::uint64_t> mContextKvTransferFailureEventIds;
     std::atomic<bool> mIsRunning{true};
 
     UcxConnection::ConnectionIdType getNewConnectionId();
     UcxConnection::ConnectionIdType addConnection(std::string const& ip, uint16_t port);
+    void addConnection(std::string const& workerAddress, UcxConnection::ConnectionIdType requesterConnectionId);
     void processPassiveConnectionRequests();
     void stopPassiveConnectionWorker();
 
@@ -99,7 +103,6 @@ public:
         return std::make_unique<UcxConnectionManager>();
     }
 
-    void addConnection(std::string const& workerAddress);
     Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
@@ -110,6 +113,9 @@ public:
     }
 
     [[nodiscard]] bool isRunning() const override;
+    [[nodiscard]] std::vector<std::uint64_t> drainContextKvTransferFailureEventIds() override;
+
+    void recordPassiveHandshakeFailureEvent(std::uint64_t tag) noexcept;
 };
 
 #if defined(__clang__)
