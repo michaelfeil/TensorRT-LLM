@@ -1030,6 +1030,8 @@ class RocketKVCacheManager(KVCacheManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager=None,
     ):
+        active_sequence_ids = set(
+            self._active_sequence_owners) if prepare_resource else set()
         requests = super().add_dummy_requests(
             request_ids=request_ids,
             token_nums=token_nums,
@@ -1042,9 +1044,13 @@ class RocketKVCacheManager(KVCacheManager):
             num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
-        if prepare_resource:
+        if prepare_resource and requests is not None:
+            added_sequence_ids = set(
+                self._active_sequence_owners) - active_sequence_ids
             for req in requests:
                 request_id = req.py_request_id
+                if request_id not in added_sequence_ids:
+                    continue
                 kt_token_num = math.ceil(req.max_beam_num_tokens /
                                          self.page_size)
                 self.kt_cache_manager.add_tokens(request_id, kt_token_num)

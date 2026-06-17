@@ -609,6 +609,7 @@ class KVCacheManager(BaseResourceManager):
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0
         self._warmup_missed_blocks = 0
+        self._active_sequence_owners: Dict[int, Tuple[int, bool]] = {}
 
         self.impl.allocate_pools(False)
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
@@ -716,6 +717,44 @@ class KVCacheManager(BaseResourceManager):
             return None
         return req.prompt_len
 
+    def _should_add_sequence(
+        self,
+        request: LlmRequest,
+        pending_sequence_owners: Optional[Dict[int, Tuple[int, bool]]] = None,
+    ) -> bool:
+        request_id = request.py_request_id
+        request_owner = id(request)
+        is_dummy_request = getattr(request, "is_dummy_request", False)
+
+        def should_skip(existing_owner: Tuple[int, bool]) -> bool:
+            active_request_owner, active_is_dummy_request = existing_owner
+            return (active_request_owner == request_owner
+                    or (active_is_dummy_request and is_dummy_request))
+
+        active_owner = self._active_sequence_owners.get(request_id)
+        if active_owner is not None:
+            if should_skip(active_owner):
+                return False
+            raise RuntimeError(
+                f"Request id {request_id} already has an active KV sequence")
+
+        if pending_sequence_owners is not None:
+            pending_owner = pending_sequence_owners.get(request_id)
+            if pending_owner is not None:
+                if should_skip(pending_owner):
+                    return False
+                raise RuntimeError(
+                    f"Request id {request_id} already has an active KV sequence"
+                )
+            pending_sequence_owners[request_id] = (request_owner,
+                                                   is_dummy_request)
+
+        return True
+
+    def _record_sequence_owner(self, request: LlmRequest):
+        self._active_sequence_owners[request.py_request_id] = (
+            id(request), getattr(request, "is_dummy_request", False))
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
         # dedicated path so the self-attention flow below stays unconditional.
@@ -738,6 +777,8 @@ class KVCacheManager(BaseResourceManager):
             if batch_request_infos:
                 self.impl.add_sequence_batch(batch_request_infos,
                                              batch_llm_requests)
+                for req in batch_llm_requests:
+                    self._record_sequence_owner(req)
                 for req in batch_llm_requests:
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
@@ -788,9 +829,12 @@ class KVCacheManager(BaseResourceManager):
         """
         batch_request_infos = []
         batch_llm_requests = []
+        pending_sequence_owners: Dict[int, Tuple[int, bool]] = {}
         for req in scheduled_batch.context_requests:
             seq_len = self._context_seq_len(req, is_cross, is_star_cp)
             if seq_len is None:
+                continue
+            if not self._should_add_sequence(req, pending_sequence_owners):
                 continue
             beam_width = 1 if is_cross else req.py_beam_width
             batch_request_infos.append((req.py_request_id, seq_len, beam_width))
@@ -813,6 +857,8 @@ class KVCacheManager(BaseResourceManager):
             if batch_request_infos:
                 self.impl.add_sequence_batch(batch_request_infos,
                                              batch_llm_requests)
+                for req in batch_llm_requests:
+                    self._record_sequence_owner(req)
             # kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()
 
@@ -846,8 +892,14 @@ class KVCacheManager(BaseResourceManager):
         # we need to make the KV cache manager aware that multiple autoregressive steps will
         # occur.
         num_extra_decoding_steps: int = 0,
-        draft_kv_cache_manager: Optional[BaseResourceManager] = None,
+        draft_kv_cache_manager: Optional['KVCacheManager'] = None,
     ):
+        if (draft_kv_cache_manager is not None
+                and not isinstance(draft_kv_cache_manager, KVCacheManager)):
+            raise TypeError(
+                "KVCacheManager.add_dummy_requests only supports "
+                "KVCacheManager or subclass draft_kv_cache_manager instances")
+
         _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space
@@ -860,6 +912,10 @@ class KVCacheManager(BaseResourceManager):
         batch_llm_requests = []
         draft_batch_request_infos = []
         draft_batch_llm_requests = []
+        sequence_added_request_ids: Set[int] = set()
+        draft_sequence_added_request_ids: Set[int] = set()
+        pending_sequence_owners: Dict[int, Tuple[int, bool]] = {}
+        draft_pending_sequence_owners: Dict[int, Tuple[int, bool]] = {}
         for i, req_id in enumerate(request_ids):
             # exact choice of n can be ignored for dummy requests
             sampling_params = SamplingParams(n=beam_width,
@@ -888,12 +944,15 @@ class KVCacheManager(BaseResourceManager):
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
-                batch_request_infos.append((req_id, token_num, beam_width))
-                batch_llm_requests.append(req)
+                if self._should_add_sequence(req, pending_sequence_owners):
+                    batch_request_infos.append((req_id, token_num, beam_width))
+                    batch_llm_requests.append(req)
                 if draft_kv_cache_manager is not None:
-                    draft_batch_request_infos.append(
-                        (req_id, token_num, beam_width))
-                    draft_batch_llm_requests.append(req)
+                    if draft_kv_cache_manager._should_add_sequence(
+                            req, draft_pending_sequence_owners):
+                        draft_batch_request_infos.append(
+                            (req_id, token_num, beam_width))
+                        draft_batch_llm_requests.append(req)
 
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)
@@ -905,6 +964,9 @@ class KVCacheManager(BaseResourceManager):
         if batch_request_infos:
             self.impl.add_sequence_batch(batch_request_infos,
                                          batch_llm_requests)
+            for req in batch_llm_requests:
+                self._record_sequence_owner(req)
+                sequence_added_request_ids.add(req.py_request_id)
             for req_id, token_num, _ in batch_request_infos:
                 for _ in range(self.num_extra_kv_tokens):
                     self.impl.add_token(req_id)
@@ -914,6 +976,9 @@ class KVCacheManager(BaseResourceManager):
         if draft_batch_request_infos and draft_kv_cache_manager is not None:
             draft_kv_cache_manager.impl.add_sequence_batch(
                 draft_batch_request_infos, draft_batch_llm_requests)
+            for req in draft_batch_llm_requests:
+                draft_kv_cache_manager._record_sequence_owner(req)
+                draft_sequence_added_request_ids.add(req.py_request_id)
             for req_id, _, _ in draft_batch_request_infos:
                 for _ in range(self.num_extra_kv_tokens):
                     draft_kv_cache_manager.impl.add_token(req_id)
@@ -946,12 +1011,15 @@ class KVCacheManager(BaseResourceManager):
                         req.py_decoding_iter = 1
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    for _ in range(_kv_draft):
-                        self.impl.add_token(req.request_id)
-                    if draft_kv_cache_manager is not None:
+                    request_id = req.py_request_id
+                    if request_id in sequence_added_request_ids:
                         for _ in range(_kv_draft):
-                            draft_kv_cache_manager.impl.add_token(
-                                req.request_id)
+                            self.impl.add_token(request_id)
+
+                    if (draft_kv_cache_manager is not None
+                            and request_id in draft_sequence_added_request_ids):
+                        for _ in range(_kv_draft):
+                            draft_kv_cache_manager.impl.add_token(request_id)
 
         return requests
 
@@ -1003,8 +1071,10 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        return self.impl.remove_sequence(request.py_request_id, request,
-                                         pin_on_release)
+        result = self.impl.remove_sequence(request.py_request_id, request,
+                                           pin_on_release)
+        self._active_sequence_owners.pop(request.py_request_id, None)
+        return result
 
     def store_blocks_for_reuse(self,
                                request: LlmRequest,
