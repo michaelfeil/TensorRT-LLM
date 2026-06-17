@@ -55,6 +55,28 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
+nvinfer1::DataType getPoolDataType(KVCacheBlockPool const& pool, nvinfer1::DataType dataType)
+{
+    constexpr nvinfer1::DataType kScaleDtypeNVFP4 = nvinfer1::DataType::kFP8;
+
+    auto poolDtype = pool.containsBlockScales ? kScaleDtypeNVFP4 : dataType;
+#ifdef ENABLE_FP4
+    auto const poolIsFP4 = poolDtype == nvinfer1::DataType::kFP4;
+#else
+    auto const poolIsFP4 = false;
+#endif
+
+    if (poolIsFP4)
+    {
+        poolDtype = nvinfer1::DataType::kINT8;
+    }
+    if (pool.containsIndexerKCache)
+    {
+        poolDtype = nvinfer1::DataType::kUINT8;
+    }
+    return poolDtype;
+}
+
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
 //! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
 //! \return Vector of BlockPtr-s in sequence order
@@ -1115,39 +1137,41 @@ void WindowBlockManager::createIndexerKCachePools()
     }
 }
 
-void BlockManager::allocatePools(bool useUvm)
+void BlockManager::allocatePrimaryPools(bool useUvm)
 {
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-        manager.allocatePools(useUvm);
+        manager.allocatePrimaryPools(useUvm);
     }
 }
 
-void WindowBlockManager::allocatePools(bool useUvm)
+void BlockManager::allocateSecondaryPools()
 {
-    constexpr nvinfer1::DataType kScaleDtypeNVFP4 = nvinfer1::DataType::kFP8;
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.allocateSecondaryPools();
+    }
+}
 
+void BlockManager::allocatePools(bool useUvm)
+{
+    allocatePrimaryPools(useUvm);
+    allocateSecondaryPools();
+}
+
+void WindowBlockManager::allocatePrimaryPools(bool useUvm)
+{
     // Allocate a memory pool backing the blocks for each numKvHeads
     // TODO(oargov): allocate pools in a single buffer and split it, to avoid fragmentation
     for (auto& pool : mPools)
     {
-        auto blockSize = pool.blockSize;
-        auto poolDtype = pool.containsBlockScales ? kScaleDtypeNVFP4 : mDataType;
-#ifdef ENABLE_FP4
-        auto const poolIsFP4 = poolDtype == nvinfer1::DataType::kFP4;
-#else
-        auto const poolIsFP4 = false;
-#endif
-
-        if (poolIsFP4)
+        if (pool.primaryPtr)
         {
-            poolDtype = nvinfer1::DataType::kINT8;
-        }
-        if (pool.containsIndexerKCache)
-        {
-            poolDtype = nvinfer1::DataType::kUINT8;
+            continue;
         }
 
+        auto const blockSize = pool.blockSize;
+        auto const poolDtype = getPoolDataType(pool, mDataType);
         nvinfer1::Dims cacheShape = isRecurrentState()
             ? ITensor::makeShape({pool.numLayers, mNumPrimaryBlocks, mKVFactor, blockSize})
             : ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
@@ -1159,9 +1183,27 @@ void WindowBlockManager::allocatePools(bool useUvm)
             cacheShape.d[2], cacheShape.d[3], pool.layerFirstLayout ? " (layer-first)" : "");
 
         if (useUvm)
+        {
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
+        }
         else
+        {
             pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
+        }
+    }
+}
+
+void WindowBlockManager::allocateSecondaryPools()
+{
+    // Secondary pools back host offload. Keeping this allocation separate lets the
+    // Python v1 startup path initialize UCX after the primary/indexer pools that
+    // CacheTransceiver inspects, but before the larger pinned host offload pools.
+    for (auto& pool : mPools)
+    {
+        if (pool.secondaryPtr)
+        {
+            continue;
+        }
 
         auto secondaryBlockCount = mNumSecondaryBlocks;
         if (mEnableTpMlaReplicatedHostOffload && mTpHostOffloadTopology.has_value())
@@ -1170,7 +1212,9 @@ void WindowBlockManager::allocatePools(bool useUvm)
         }
         if (secondaryBlockCount > 0)
         {
-            nvinfer1::Dims cacheShapeOffload = isRecurrentState()
+            auto const blockSize = pool.blockSize;
+            auto const poolDtype = getPoolDataType(pool, mDataType);
+            nvinfer1::Dims const cacheShapeOffload = isRecurrentState()
                 ? ITensor::makeShape({pool.numLayers, secondaryBlockCount, mKVFactor, blockSize})
                 : ITensor::makeShape({secondaryBlockCount, pool.numLayers, mKVFactor, blockSize});
             TLLM_LOG_DEBUG("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
@@ -1182,6 +1226,12 @@ void WindowBlockManager::allocatePools(bool useUvm)
             TLLM_LOG_DEBUG("[%s] Skipping secondary pool allocation on non-owner TP rank", mLogPrefix.c_str());
         }
     }
+}
+
+void WindowBlockManager::allocatePools(bool useUvm)
+{
+    allocatePrimaryPools(useUvm);
+    allocateSecondaryPools();
 }
 
 void BlockManager::releasePools()
@@ -1199,10 +1249,12 @@ void WindowBlockManager::releasePools()
         if (pool.primaryPtr)
         {
             pool.primaryPtr->release();
+            pool.primaryPtr.reset();
         }
         if (pool.secondaryPtr)
         {
             pool.secondaryPtr->release();
+            pool.secondaryPtr.reset();
         }
     }
     mBufferManager.getStream().synchronize();
@@ -3337,9 +3389,9 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
 {
 }
 
-void KVCacheManager::allocatePools(bool useUvm)
+void KVCacheManager::allocatePrimaryPools(bool useUvm)
 {
-    mBlockManager.allocatePools(useUvm);
+    mBlockManager.allocatePrimaryPools(useUvm);
     auto const numPools = mBlockManager.getNumPools();
 
     uint64_t cacheSizeBytes = 0;
@@ -3377,15 +3429,41 @@ void KVCacheManager::allocatePools(bool useUvm)
             cacheSizeBytes / static_cast<double>(1 << 30), maxNumTokens);
     }
 
+    updatePoolPointers();
+}
+
+void KVCacheManager::allocateSecondaryPools()
+{
+    mBlockManager.allocateSecondaryPools();
+    updatePoolPointers();
+}
+
+void KVCacheManager::allocatePools(bool useUvm)
+{
+    allocatePrimaryPools(useUvm);
+    allocateSecondaryPools();
+}
+
+void KVCacheManager::updatePoolPointers()
+{
+    auto const numPools = mBlockManager.getNumPools();
     auto const numKVPools
         = mBlockManager.getNumPools(/*include_block_scalar_pools=*/false, /*include_indexer_k_cache_pools=*/false);
     auto const numBlockScalePools
         = mBlockManager.getNumPools(/*includeBlockScalePools=*/true, /*includeIndexerKCachePools=*/false) - numKVPools;
 
     // Code in the attention kernels is cleaner if we can access the KV values and block scales separately.
-    mBlockPoolPointers = BufferManager::cpu(ITensor::makeShape({numKVPools, 2}), TRTDataType<void*>::value);
-    mBlockScalePoolPointers
-        = BufferManager::cpu(ITensor::makeShape({numBlockScalePools, 2}), TRTDataType<void*>::value);
+    // Reuse the pointer tensors across primary and secondary allocation so Python-held tensor views see the
+    // secondary pointer column once offload pools are allocated.
+    if (mBlockPoolPointers == nullptr)
+    {
+        mBlockPoolPointers = BufferManager::cpu(ITensor::makeShape({numKVPools, 2}), TRTDataType<void*>::value);
+    }
+    if (mBlockScalePoolPointers == nullptr)
+    {
+        mBlockScalePoolPointers
+            = BufferManager::cpu(ITensor::makeShape({numBlockScalePools, 2}), TRTDataType<void*>::value);
+    }
 
     auto poolPtrsRange = BufferRange<void*>(*mBlockPoolPointers);
     auto blockScalePtrsRange = BufferRange<void*>(*mBlockScalePoolPointers);
@@ -3399,10 +3477,12 @@ void KVCacheManager::allocatePools(bool useUvm)
         auto& outRange = pool.containsBlockScales ? blockScalePtrsRange : poolPtrsRange;
         if (pool.containsIndexerKCache)
         {
+            TLLM_CHECK_WITH_INFO(pool.primaryPtr != nullptr, "Primary indexer K cache pool is not allocated.");
             mIndexerKCachePoolPointers = pool.primaryPtr;
         }
         else
         {
+            TLLM_CHECK_WITH_INFO(pool.primaryPtr != nullptr, "Primary KV cache pool is not allocated.");
             outRange[outIdx * 2] = pool.primaryPtr->data();
             outRange[outIdx * 2 + 1] = pool.secondaryPtr ? pool.secondaryPtr->data() : nullptr;
             outIdx++;
@@ -3410,7 +3490,10 @@ void KVCacheManager::allocatePools(bool useUvm)
     }
 
     auto const numLayers = mBlockManager.getNumLayers();
-    mLayerToPoolMapping = BufferManager::cpu(ITensor::makeShape({numLayers, 2}), TRTDataType<SizeType32>::value);
+    if (mLayerToPoolMapping == nullptr)
+    {
+        mLayerToPoolMapping = BufferManager::cpu(ITensor::makeShape({numLayers, 2}), TRTDataType<SizeType32>::value);
+    }
     auto poolMappingRange = BufferRange<SizeType32>(*mLayerToPoolMapping);
     for (SizeType32 layerIdx = 0; layerIdx < numLayers; layerIdx++)
     {

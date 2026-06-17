@@ -11,6 +11,8 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor import \
+    resource_manager as resource_manager_module
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              PeftCacheManager)
@@ -27,12 +29,232 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
 DataType = tensorrt_llm.bindings.DataType
+CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
 sys.path.append(str(root_dir / "tests" / "integration"))
+
+
+class _FakeStream:
+    cuda_stream = 0
+
+
+class _FakeKvCacheManagerImpl:
+    num_pools = 1
+    max_blocks_per_seq = 4
+
+    def __init__(self,
+                 events,
+                 *,
+                 max_num_blocks=8,
+                 indexer_pool_width=None):
+        self._events = events
+        self.max_num_blocks = max_num_blocks
+        self._indexer_pool_width = indexer_pool_width
+
+    def allocate_primary_pools(self, use_uvm):
+        self._events.append(("allocate_primary_pools", use_uvm))
+
+    def allocate_secondary_pools(self):
+        self._events.append("allocate_secondary_pools")
+
+    def get_block_pool_pointers(self):
+        self._events.append("get_block_pool_pointers")
+        return torch.tensor([1], dtype=torch.int64)
+
+    def get_block_scale_pool_pointers(self):
+        self._events.append("get_block_scale_pool_pointers")
+        return torch.empty((0, ), dtype=torch.int64)
+
+    def get_layer_to_pool_mapping(self):
+        self._events.append("get_layer_to_pool_mapping")
+        return torch.tensor([0], dtype=torch.int32)
+
+    def get_indexer_k_cache_pool_data(self, layer_idx):
+        self._events.append(("get_indexer_k_cache_pool_data", layer_idx))
+        return torch.zeros((self.max_num_blocks, self._indexer_pool_width),
+                           dtype=torch.uint8)
+
+    def release_pools(self):
+        self._events.append("release_pools")
+
+
+def _patch_fake_kv_cache_cpp(monkeypatch,
+                             events,
+                             fake_kv_cache_manager_cpp=None,
+                             **fake_impl_kwargs):
+    if fake_kv_cache_manager_cpp is None:
+
+        def fake_kv_cache_manager_cpp(**kwargs):
+            events.append("construct")
+            return _FakeKvCacheManagerImpl(events, **fake_impl_kwargs)
+
+    monkeypatch.setattr(resource_manager_module.torch.cuda, "mem_get_info",
+                        lambda: (1 << 30, 2 << 30))
+    monkeypatch.setattr(resource_manager_module, "prefer_pinned",
+                        lambda: False)
+    monkeypatch.setattr(resource_manager_module, "KVCacheManagerCpp",
+                        fake_kv_cache_manager_cpp)
+
+
+def test_v1_kv_cache_manager_can_defer_secondary_pool_allocation(monkeypatch):
+    events = []
+
+    _patch_fake_kv_cache_cpp(monkeypatch, events)
+
+    assert KVCacheManager.supports_deferred_secondary_pool_allocation()
+
+    manager = KVCacheManager(
+        KvCacheConfig(max_tokens=64, enable_block_reuse=False),
+        CacheTypeCpp.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=1,
+        tokens_per_block=8,
+        max_seq_len=64,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0),
+        dtype=DataType.HALF,
+        execution_stream=_FakeStream(),
+        defer_secondary_pool_allocation=True)
+
+    expected_primary_events = [
+        "construct",
+        ("allocate_primary_pools", False),
+        "get_block_pool_pointers",
+        "get_block_scale_pool_pointers",
+        "get_layer_to_pool_mapping",
+    ]
+    assert events == expected_primary_events
+    assert manager.num_pools == 1
+    assert manager.max_blocks_per_seq == 4
+    assert manager.host_kv_cache_block_offsets.shape == (1, 1, 2, 4)
+
+    manager.allocate_secondary_pools()
+
+    expected_events = expected_primary_events + [
+        "allocate_secondary_pools",
+        "get_block_pool_pointers",
+        "get_block_scale_pool_pointers",
+        "get_layer_to_pool_mapping",
+    ]
+    assert events == expected_events
+    assert manager.host_kv_cache_block_offsets.shape == (1, 1, 2, 4)
+
+    manager.allocate_pools()
+    assert events == expected_events
+
+    manager.shutdown()
+    assert events[-1] == "release_pools"
+
+
+def test_v1_kv_cache_creator_requires_all_managers_to_defer_secondary(
+        monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import _util as pyexecutor_util
+
+    class UnsupportedKvCacheManager(KVCacheManager):
+
+        @classmethod
+        def supports_deferred_secondary_pool_allocation(cls) -> bool:
+            return False
+
+    creator = object.__new__(pyexecutor_util.KvCacheCreator)
+    creator._kv_cache_manager_cls = KVCacheManager
+
+    monkeypatch.setattr(pyexecutor_util.KvCacheCreator,
+                        "_should_create_separate_draft_kv_cache",
+                        lambda self: True)
+    monkeypatch.setattr(
+        pyexecutor_util.KvCacheCreator,
+        "_get_draft_kv_cache_manager_cls",
+        lambda self, log_warning=True: UnsupportedKvCacheManager)
+    assert not creator.supports_deferred_secondary_pool_allocation()
+
+    monkeypatch.setattr(pyexecutor_util.KvCacheCreator,
+                        "_get_draft_kv_cache_manager_cls",
+                        lambda self, log_warning=True: KVCacheManager)
+    assert creator.supports_deferred_secondary_pool_allocation()
+
+
+def test_v1_dsa_cache_manager_initializes_indexer_after_primary_pool(
+        monkeypatch):
+    from tensorrt_llm._torch.attention_backend.sparse import dsa as dsa_module
+
+    events = []
+    index_head_dim = 128
+    tokens_per_block = 8
+    num_blocks = 8
+    scale_size = index_head_dim // 128 * 4
+    indexer_pool_width = tokens_per_block * (index_head_dim + scale_size)
+
+    class SparseAttentionConfig:
+        index_head_dim = 128
+        index_n_heads = 1
+        index_topk = 1
+        prompt_budget = 1024
+
+    def fake_kv_cache_manager_cpp(**kwargs):
+        assert kwargs["enable_indexer_k_cache"]
+        assert kwargs["indexer_k_cache_index_head_dim"] == index_head_dim
+        events.append("construct")
+        return _FakeKvCacheManagerImpl(
+            events,
+            max_num_blocks=num_blocks,
+            indexer_pool_width=indexer_pool_width)
+
+    _patch_fake_kv_cache_cpp(monkeypatch, events, fake_kv_cache_manager_cpp)
+
+    assert dsa_module.DSACacheManager.supports_deferred_secondary_pool_allocation()
+
+    cache_manager = dsa_module.DSACacheManager(
+        kv_cache_config=KvCacheConfig(max_tokens=64,
+                                      enable_block_reuse=False),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=1,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=64,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0),
+        dtype=DataType.HALF,
+        sparse_attn_config=SparseAttentionConfig(),
+        execution_stream=_FakeStream(),
+        defer_secondary_pool_allocation=True,
+    )
+
+    expected_primary_events = [
+        "construct",
+        ("allocate_primary_pools", False),
+        "get_block_pool_pointers",
+        "get_block_scale_pool_pointers",
+        "get_layer_to_pool_mapping",
+        ("get_indexer_k_cache_pool_data", 0),
+    ]
+    assert events == expected_primary_events
+    assert len(cache_manager.indexer_k_cache_pool_per_layer) == 1
+    assert cache_manager.indexer_k_cache_pool_per_layer[0].shape == (
+        num_blocks, indexer_pool_width)
+    assert cache_manager.get_indexer_k_cache_buffers(0).shape == (
+        num_blocks, tokens_per_block, 1, index_head_dim + scale_size)
+
+    cache_manager.allocate_secondary_pools()
+    expected_events = expected_primary_events + [
+        "allocate_secondary_pools",
+        "get_block_pool_pointers",
+        "get_block_scale_pool_pointers",
+        "get_layer_to_pool_mapping",
+    ]
+    assert events == expected_events
+
+    cache_manager.allocate_pools()
+    assert events == expected_events
+
+    cache_manager.shutdown()
+    assert events[-1] == "release_pools"
 
 
 class TestResourceManager(unittest.TestCase):

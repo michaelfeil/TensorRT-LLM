@@ -2590,6 +2590,10 @@ class DSATrtllmAttention(TrtllmAttention):
 class DSACacheManager(KVCacheManager):
     """KV cache manager for DSA with additional indexer K-cache pools."""
 
+    @classmethod
+    def supports_deferred_secondary_pool_allocation(cls) -> bool:
+        return cls is DSACacheManager
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2628,6 +2632,7 @@ class DSACacheManager(KVCacheManager):
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
+        self.indexer_k_cache_pool_per_layer = []
 
         super().__init__(
             kv_cache_config,
@@ -2653,10 +2658,21 @@ class DSACacheManager(KVCacheManager):
         )
         self.num_blocks = self.blocks_in_primary_pool
 
+    def allocate_primary_pools(self):
+        if self._primary_pools_allocated:
+            return
+
+        super().allocate_primary_pools()
+        self.num_blocks = self.blocks_in_primary_pool
+        self._init_indexer_k_cache_pools()
+
+    def _init_indexer_k_cache_pools(self):
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.tokens_per_block * (index_head_dim + scale_size)]
         # Non-interleaved layout: [fp8_tok0 | fp8_tok1 | ... | scale_tok0 | scale_tok1 | ...]
-        # Store FP8-quantized k values from the indexer
+        # Store FP8-quantized k values from the indexer. These tensors are
+        # views into C++ owned primary pool memory, so they must be initialized
+        # after allocate_primary_pools() creates the underlying buffers.
         self.indexer_k_cache_pool_per_layer = [
             self.get_indexer_k_cache_pool_data(layer_idx)
             for layer_idx in range(self.num_local_layers)

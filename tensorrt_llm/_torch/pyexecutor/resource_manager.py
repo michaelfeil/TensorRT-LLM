@@ -219,6 +219,12 @@ def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
 
 class KVCacheManager(BaseResourceManager):
 
+    @classmethod
+    def supports_deferred_secondary_pool_allocation(cls) -> bool:
+        # Subclasses must opt in after ensuring constructor-time fields only
+        # depend on primary/indexer pools. Secondary pools back host offload.
+        return cls is KVCacheManager
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -256,6 +262,7 @@ class KVCacheManager(BaseResourceManager):
         # attention types (e.g. Gemma4 SWA head_dim=256 + full-attention
         # head_dim=512).
         pool_configurations: Optional[List[PoolConfiguration]] = None,
+        defer_secondary_pool_allocation: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -346,6 +353,17 @@ class KVCacheManager(BaseResourceManager):
         self.max_total_draft_tokens = (spec_config.tokens_per_gen_step -
                                        1) if spec_config is not None else 0
         self.linear_attention_metadata = linear_attention_metadata
+        self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+        self.kv_cache_pool_pointers = None
+        self.kv_cache_pool_mapping = None
+        self.num_pools = 0
+        self.max_blocks_per_seq = 0
+        self.host_kv_cache_block_offsets = None
+        self._pool_allocation_max_batch_size = max_batch_size
+        self._pool_allocation_max_beam_width = max_beam_width
+        self._primary_pools_allocated = False
+        self._secondary_pools_allocated = False
 
         # Dynamic-tree draft manager reserves K*max_draft_len KV slots (the draft
         # loop can write that many even if max_total_draft_tokens is smaller).
@@ -529,6 +547,7 @@ class KVCacheManager(BaseResourceManager):
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
         logger.info(f"[KVCacheManager] blocks_per_window: {blocks_per_window}")
+        self.blocks_per_window = blocks_per_window
 
         enable_tp_mla_replicated_host_offload = (
             kv_cache_config.enable_tp_mla_replicated_host_offload)
@@ -611,31 +630,74 @@ class KVCacheManager(BaseResourceManager):
         self._warmup_missed_blocks = 0
         self._active_sequence_owners: Dict[int, Tuple[int, bool]] = {}
 
-        self.impl.allocate_pools(False)
-        self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
+        # Primary/indexer pools are allocated during construction because the
+        # C++ CacheTransceiver builds transfer buffers from those addresses.
+        # Secondary pools are pinned host offload buffers and may be delayed
+        # until after UCX initialization to avoid startup interaction with
+        # large host-memory registration.
+        self.allocate_primary_pools()
+        if not defer_secondary_pool_allocation:
+            self.allocate_secondary_pools()
+
+    def _publish_pool_metadata(self):
+        block_pool_pointers = self.impl.get_block_pool_pointers()
         kv_cache_block_scale_pool_pointers = self.impl.get_block_scale_pool_pointers(
         )
         if kv_cache_block_scale_pool_pointers.numel() > 0:
-            self.kv_cache_pool_pointers = torch.stack([
-                self.kv_cache_pool_pointers, kv_cache_block_scale_pool_pointers
-            ],
-                                                      dim=-1)
+            shape = (*block_pool_pointers.shape, 2)
+            if (self.kv_cache_pool_pointers is None
+                    or self.kv_cache_pool_pointers.shape != shape):
+                self.kv_cache_pool_pointers = torch.empty(
+                    shape,
+                    dtype=block_pool_pointers.dtype,
+                    device=block_pool_pointers.device)
+            self.kv_cache_pool_pointers[..., 0].copy_(block_pool_pointers)
+            self.kv_cache_pool_pointers[..., 1].copy_(
+                kv_cache_block_scale_pool_pointers)
+        else:
+            self.kv_cache_pool_pointers = block_pool_pointers
 
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
-        self.enable_block_reuse = kv_cache_config.enable_block_reuse
-        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
-        # Keep unused block offsets as safe block index 0.
-        self.host_kv_cache_block_offsets = torch.zeros(
-            self.num_pools,
-            max_batch_size * max_beam_width,
-            2,
-            self.max_blocks_per_seq,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-            device='cpu')
-        self.blocks_per_window = blocks_per_window
+        if self.host_kv_cache_block_offsets is None:
+            # Keep unused block offsets as safe block index 0.
+            self.host_kv_cache_block_offsets = torch.zeros(
+                self.num_pools,
+                self._pool_allocation_max_batch_size *
+                self._pool_allocation_max_beam_width,
+                2,
+                self.max_blocks_per_seq,
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+                device='cpu')
+
+    def allocate_primary_pools(self):
+        """Allocate primary/indexer pools and publish pool-backed metadata."""
+        if self._primary_pools_allocated:
+            return
+
+        self.impl.allocate_primary_pools(False)
+        self._publish_pool_metadata()
+        self._primary_pools_allocated = True
+
+    def allocate_secondary_pools(self):
+        """Allocate secondary host-offload pools after transceiver initialization."""
+        if self._secondary_pools_allocated:
+            return
+
+        if not self._primary_pools_allocated:
+            raise RuntimeError(
+                "Primary KV cache pools must be allocated before secondary pools."
+            )
+        self.impl.allocate_secondary_pools()
+        self._publish_pool_metadata()
+        self._secondary_pools_allocated = True
+
+    def allocate_pools(self):
+        """Allocate all KV pools, preserving the historical one-call API."""
+        self.allocate_primary_pools()
+        self.allocate_secondary_pools()
 
     def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
         """Probe the KV cache radix tree for prefix match length.
@@ -668,7 +730,10 @@ class KVCacheManager(BaseResourceManager):
         return summary.reusable_blocks_all * self.tokens_per_block
 
     def shutdown(self):
-        self.impl.release_pools()
+        if self._primary_pools_allocated:
+            self.impl.release_pools()
+            self._primary_pools_allocated = False
+            self._secondary_pools_allocated = False
 
     def get_max_resource_count(self) -> int:
         return self.impl.max_num_blocks

@@ -201,6 +201,12 @@ def is_vswa_enabled(kv_cache_config):
         set(max_attention_window)) > 1
 
 
+def supports_deferred_secondary_pool_allocation(kv_cache_manager_cls) -> bool:
+    return (issubclass(kv_cache_manager_cls, KVCacheManager)
+            and
+            kv_cache_manager_cls.supports_deferred_secondary_pool_allocation())
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -333,6 +339,19 @@ class KvCacheCreator:
                     "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
                 )
         return cls
+
+    def supports_deferred_secondary_pool_allocation(self) -> bool:
+        # Managers must explicitly opt in because some subclasses allocate
+        # additional state in their constructors. If a separate draft KV cache is
+        # built with a different manager class, it must also support delaying
+        # only the secondary host-offload pools.
+        if not supports_deferred_secondary_pool_allocation(
+                self._kv_cache_manager_cls):
+            return False
+        if self._should_create_separate_draft_kv_cache():
+            return supports_deferred_secondary_pool_allocation(
+                self._get_draft_kv_cache_manager_cls(log_warning=False))
+        return True
 
     def _per_manager_cache_cost(self,
                                 manager_cls,
@@ -804,7 +823,8 @@ class KvCacheCreator:
         self,
         model_engine: PyTorchModelEngine,
         estimating_kv_cache: bool = False,
-        kv_cache_config_override: Optional[KvCacheConfig] = None
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+        defer_secondary_pool_allocation: bool = False,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -840,6 +860,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            defer_secondary_pool_allocation=defer_secondary_pool_allocation,
         )
 
         if not self._skip_est:
@@ -910,10 +931,39 @@ class KvCacheCreator:
             return self._draft_config.pretrained_config.num_hidden_layers
         return get_num_spec_layers(self._speculative_config)
 
+    def _get_draft_kv_cache_manager_cls(
+        self,
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+        log_warning: bool = True,
+    ):
+        effective_draft_config = self._get_effective_draft_config()
+        draft_kv_config = (kv_cache_config_override if kv_cache_config_override
+                           is not None else self._kv_cache_config)
+        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+            effective_draft_config,
+            draft_kv_config,
+            is_disagg=self._is_disagg,
+            cache_transceiver_config=self._cache_transceiver_config)
+
+        if draft_kv_cache_manager_cls == KVCacheManagerV2:
+            if self._kv_connector_manager is not None or (
+                    self._max_beam_width is not None and self._max_beam_width
+                    > 1) or draft_kv_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                if log_warning:
+                    logger.warning(
+                        "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                        "Falling back to KVCacheManager for draft model.")
+                draft_kv_cache_manager_cls = KVCacheManager
+
+        return draft_kv_cache_manager_cls
+
     def _create_one_model_draft_kv_cache_manager(
         self,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
+        defer_secondary_pool_allocation: bool = False,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
@@ -940,21 +990,8 @@ class KvCacheCreator:
 
         draft_kv_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
-        # Get the appropriate KV cache manager class for the draft model
-        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
-
-        # Use V2 if enabled and the base class is KVCacheManager
-        if draft_kv_cache_manager_cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None and self._max_beam_width
-                    > 1) or draft_kv_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
-                    "Falling back to KVCacheManager for draft model.")
-                draft_kv_cache_manager_cls = KVCacheManager
+        draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
+            kv_cache_config_override=kv_cache_config_override)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
@@ -984,6 +1021,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
+            defer_secondary_pool_allocation=defer_secondary_pool_allocation,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -1364,7 +1402,8 @@ class KvCacheCreator:
 
     def build_managers(self,
                        resources: Dict,
-                       estimating_kv_cache: bool = False) -> None:
+                       estimating_kv_cache: bool = False,
+                       defer_secondary_pool_allocation: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         if self._skip_est:
             self.configure_kv_cache_capacity()
@@ -1409,7 +1448,8 @@ class KvCacheCreator:
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,
             estimating_kv_cache,
-            kv_cache_config_override=self_kv_cache_config)
+            kv_cache_config_override=self_kv_cache_config,
+            defer_secondary_pool_allocation=defer_secondary_pool_allocation)
 
         if (not estimating_kv_cache and self._kv_connector_manager is not None
                 and self._draft_model_engine is not None):
@@ -1430,12 +1470,15 @@ class KvCacheCreator:
             draft_kv_cache_manager = self._create_kv_cache_manager(
                 self._draft_model_engine,
                 estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config)
+                kv_cache_config_override=draft_build_kv_cache_config,
+                defer_secondary_pool_allocation=defer_secondary_pool_allocation)
         # One-model speculative decoding with different KV layouts
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config)
+                kv_cache_config_override=draft_build_kv_cache_config,
+                defer_secondary_pool_allocation=
+                defer_secondary_pool_allocation)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
@@ -1449,6 +1492,15 @@ class KvCacheCreator:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
         resources[
             ResourceManagerType.CROSS_KV_CACHE_MANAGER] = cross_kv_cache_manager
+
+    def allocate_secondary_pools(self, resources: Dict) -> None:
+        """Allocate deferred secondary host-offload pools."""
+        for resource_type in (ResourceManagerType.KV_CACHE_MANAGER,
+                              ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
+            kv_cache_manager = resources.get(resource_type)
+            if kv_cache_manager is not None and hasattr(
+                    kv_cache_manager, "allocate_secondary_pools"):
+                kv_cache_manager.allocate_secondary_pools()
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
@@ -1524,7 +1576,8 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        is_disagg: bool = False,
+        defer_secondary_pool_allocation: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1547,6 +1600,10 @@ def _create_kv_cache_manager(
 
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+
+    defer_secondary_pool_allocation = (
+        defer_secondary_pool_allocation
+        and supports_deferred_secondary_pool_allocation(kv_cache_manager_cls))
 
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
@@ -1664,6 +1721,8 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
+            defer_secondary_pool_allocation=
+            defer_secondary_pool_allocation,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1855,6 +1914,8 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
+            defer_secondary_pool_allocation=
+            defer_secondary_pool_allocation,
         )
     # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
     # via cache_layer_idx — shared layers use target layer's index for

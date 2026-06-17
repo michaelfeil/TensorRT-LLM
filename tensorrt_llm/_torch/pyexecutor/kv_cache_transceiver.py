@@ -30,23 +30,13 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
                        device_ids=None,
                        enable_attention_dp=mapping.enable_attention_dp)
 
-
-def create_kv_cache_transceiver(
-        mapping: Mapping,
-        dist: Distributed,
-        kv_cache_manager: KVCacheManager,
-        attention_type: AttentionTypeCpp,
-        cache_transceiver_config: CacheTransceiverConfig,
-        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+def _normalize_cache_transceiver_backend(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
-        logger.info("cache_transceiver is disabled")
         return None
 
     if cache_transceiver_config.backend == "DEFAULT":
-        # When cache_transceiver_config.backend is not set, fallback to env_vars settings
-        # NIXL is the default backend for non hybrid models
         cache_transceiver_config.backend = "NIXL"
-        # Ordered by priority
         env_vars = [
             ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
             ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
@@ -60,6 +50,28 @@ def create_kv_cache_transceiver(
                 )
                 cache_transceiver_config.backend = be_type
                 break
+
+    return cache_transceiver_config.backend
+
+
+def should_defer_kv_cache_secondary_pool_allocation(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> bool:
+    backend = _normalize_cache_transceiver_backend(cache_transceiver_config)
+    return (backend == "UCX" and cache_transceiver_config is not None
+            and cache_transceiver_config.transceiver_runtime != "PYTHON")
+
+
+def create_kv_cache_transceiver(
+        mapping: Mapping,
+        dist: Distributed,
+        kv_cache_manager: KVCacheManager,
+        attention_type: AttentionTypeCpp,
+        cache_transceiver_config: CacheTransceiverConfig,
+        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+    backend = _normalize_cache_transceiver_backend(cache_transceiver_config)
+    if backend is None:
+        logger.info("cache_transceiver is disabled")
+        return None
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(

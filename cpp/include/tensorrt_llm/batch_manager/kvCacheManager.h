@@ -877,6 +877,12 @@ public:
         return mIndexerKCacheUseFp4;
     }
 
+    //! Allocate GPU primary/indexer pools. CacheTransceiver inspects these pools during construction.
+    void allocatePrimaryPools(bool useUvm);
+
+    //! Allocate pinned host secondary pools used for KV offload.
+    void allocateSecondaryPools();
+
     void allocatePools(bool useUvm);
 
     void releasePools();
@@ -1505,6 +1511,12 @@ public:
     static std::map<SizeType32, float> calculateWindowSizeToShare(
         std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers,
         std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindowSize);
+
+    //! Allocate GPU primary/indexer pools. CacheTransceiver inspects these pools during construction.
+    void allocatePrimaryPools(bool useUvm);
+
+    //! Allocate pinned host secondary pools used for KV offload.
+    void allocateSecondaryPools();
 
     void allocatePools(bool useUvm);
 
@@ -2309,6 +2321,14 @@ public:
 
     ~KVCacheManager() override = default;
 
+    //! Deferred startup order: allocate primary/indexer pools, build the CacheTransceiver, then allocate
+    //! secondary/offload pools before workers start.
+    //! Allocate GPU primary/indexer pools and publish pointer metadata with null secondary pointers.
+    void allocatePrimaryPools(bool useUvm = false);
+
+    //! Allocate pinned host secondary pools and refresh the secondary pointer metadata in place.
+    void allocateSecondaryPools();
+
     void allocatePools(bool useUvm = false) override;
 
     void releasePools() override;
@@ -2671,6 +2691,9 @@ private:
     runtime::ITensor::SharedPtr mIndexerKCachePoolPointers;
     // GPU bytes allocated for KV-cache
     std::size_t mAllocatedBytes{0};
+
+    //! Refresh pointer metadata after primary allocation and again after secondary allocation.
+    void updatePoolPointers();
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

@@ -40,6 +40,7 @@ from .config_utils import is_hybrid_linear
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from .kv_cache_transceiver import should_defer_kv_cache_secondary_pool_allocation
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -830,6 +831,7 @@ def create_py_executor(
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
+    defer_kv_cache_secondary_pool_allocation = False
 
     # Create the execution stream for model forward operations
     # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
@@ -890,11 +892,47 @@ def create_py_executor(
             log_memory_usage("after loading weights")
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+        defer_kv_cache_secondary_pool_allocation = (
+            should_defer_kv_cache_secondary_pool_allocation(
+                cache_transceiver_config)
+            and kv_cache_creator.supports_deferred_secondary_pool_allocation())
 
+    def shutdown_kv_cache_transceiver(py_executor: Optional[PyExecutor]):
+        if py_executor is None:
+            return
+        kv_cache_transceiver = getattr(py_executor, "kv_cache_transceiver",
+                                       None)
+        if kv_cache_transceiver is None:
+            return
+        try:
+            kv_cache_transceiver.shutdown()
+        except Exception as e:
+            logger.warning(
+                "Failed to shut down KV cache transceiver after secondary "
+                f"KV pool allocation failure: {e}")
+
+    def allocate_deferred_secondary_kv_pools(
+            stage: ExecutorMemoryType,
+            py_executor: Optional[PyExecutor] = None):
+        assert kv_cache_creator is not None
+        if not defer_kv_cache_secondary_pool_allocation:
+            return
+        try:
+            with allocation_scope(stage):
+                kv_cache_creator.allocate_secondary_pools(resources)
+        except Exception:
+            shutdown_kv_cache_transceiver(py_executor)
+            raise
+
+    if model_engine.model.model_config.is_generation:
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
-            kv_cache_creator.build_managers(resources, estimating_kv_cache)
+            kv_cache_creator.build_managers(
+                resources,
+                estimating_kv_cache,
+                defer_secondary_pool_allocation=
+                defer_kv_cache_secondary_pool_allocation)
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
             # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
             max_seq_len = kv_cache_creator._max_seq_len
@@ -908,7 +946,6 @@ def create_py_executor(
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
     # to provide a resource manager if required.
-
     with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
         spec_resource_manager = get_spec_resource_manager(
             model_engine, draft_model_engine)
@@ -918,16 +955,18 @@ def create_py_executor(
 
     # Drafter for speculative decoding
     with allocation_scope(ExecutorMemoryType.DRAFTER):
-        drafter = get_spec_drafter(model_engine,
-                                   draft_model_engine,
-                                   sampler,
-                                   spec_resource_manager=spec_resource_manager,
-                                   guided_decoder=guided_decoder)
+        drafter = get_spec_drafter(
+            model_engine,
+            draft_model_engine,
+            sampler,
+            spec_resource_manager=spec_resource_manager,
+            guided_decoder=guided_decoder)
 
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
-        # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+        # Free memory from the previous py_executor to avoid cudaFree
+        # overlap with CUDA graph capture.
         gc.collect()
         py_executor = create_py_executor_instance(
             dist=dist,
@@ -941,7 +980,8 @@ def create_py_executor(
             drafter=drafter,
             guided_decoder=guided_decoder,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+            garbage_collection_gen0_threshold=
+            garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             resource_governor_queue=resource_governor_queue,
@@ -955,10 +995,15 @@ def create_py_executor(
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
         )
+    if model_engine.model.model_config.is_generation:
+        allocate_deferred_secondary_kv_pools(
+            ExecutorMemoryType.INIT_KV_CACHE
+            if estimating_kv_cache else ExecutorMemoryType.KV_CACHE,
+            py_executor)
 
-        # Originally, peft_cache_config might be mutated inside
-        # create_py_executor_instance. Restore it here.
-        peft_cache_config = py_executor.peft_cache_config
+    # Originally, peft_cache_config might be mutated inside
+    # create_py_executor_instance. Restore it here.
+    peft_cache_config = py_executor.peft_cache_config
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -993,15 +1038,19 @@ def create_py_executor(
             # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
-            kv_cache_creator.build_managers(resources, False)
+            kv_cache_creator.build_managers(
+                resources,
+                False,
+                defer_secondary_pool_allocation=
+                defer_kv_cache_secondary_pool_allocation)
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
             # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
-
-            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+            # Free memory from the previous py_executor to avoid cudaFree
+            # overlap with CUDA graph capture.
             gc.collect()
             py_executor = create_py_executor_instance(
                 dist=dist,
@@ -1030,6 +1079,8 @@ def create_py_executor(
                 execution_stream=execution_stream,
                 dwdp_manager=dwdp_manager,
             )
+        allocate_deferred_secondary_kv_pools(ExecutorMemoryType.KV_CACHE,
+                                             py_executor)
 
     _adjust_torch_mem_fraction()
 

@@ -670,6 +670,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("linear_attention_metadata").none() = std::nullopt,
             nb::arg("pool_configurations") = std::vector<tbk::PoolConfiguration>{},
             nb::call_guard<nb::gil_scoped_release>())
+        .def("allocate_primary_pools", &tbk::KVCacheManager::allocatePrimaryPools,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("allocate_secondary_pools", &tbk::KVCacheManager::allocateSecondaryPools,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "scheduling_has_free_blocks",
             [](tbk::KVCacheManager& self, SizeType32 numRequired, SizeType32 windowSize)
