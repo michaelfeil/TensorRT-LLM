@@ -146,7 +146,8 @@ class GuidedDecoder:
                  max_num_sequences: int,
                  vocab_size_padded: int,
                  max_num_draft_tokens: int = 0,
-                 rank: int = 0):
+                 rank: int = 0,
+                 tokenizer=None):
         self.guided_decoding_backend = guided_decoding_config.backend
         self.max_num_sequences = max_num_sequences
         self.vocab_size_padded = vocab_size_padded
@@ -157,7 +158,8 @@ class GuidedDecoder:
             self.grammar_matcher_factory = XGrammarMatcherFactory(
                 guided_decoding_config,
                 vocab_size_padded,
-                max_num_draft_tokens=max_num_draft_tokens)
+                max_num_draft_tokens=max_num_draft_tokens,
+                tokenizer=tokenizer)
         elif self.guided_decoding_backend == GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE:
             self.grammar_matcher_factory = LLGuidanceMatcherFactory(
                 guided_decoding_config, vocab_size_padded)
@@ -451,12 +453,14 @@ class CapturableGuidedDecoder(GuidedDecoder):
                  max_num_sequences: int,
                  vocab_size_padded: int,
                  max_num_draft_tokens: int = 0,
-                 rank: int = 0):
+                 rank: int = 0,
+                 tokenizer=None):
         super().__init__(guided_decoding_config=guided_decoding_config,
                          max_num_sequences=max_num_sequences,
                          vocab_size_padded=vocab_size_padded,
                          max_num_draft_tokens=max_num_draft_tokens,
-                         rank=rank)
+                         rank=rank,
+                         tokenizer=tokenizer)
         # self.requests should be accessed by normal host code;
         # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
         self.requests_hostfunc: Optional[GuidedRequests] = None

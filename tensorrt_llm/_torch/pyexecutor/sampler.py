@@ -5144,7 +5144,6 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
     ) -> None:
         # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateTRTLLM)
-
         if state.sampler_event:
             state.sampler_event.synchronize()
 

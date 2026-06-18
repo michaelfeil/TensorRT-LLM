@@ -1228,16 +1228,18 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _updated_to_json(data):
-        return {
-            "type":
-            "updated",
-            "block_hash":
-            data.block_hash,
-            "cache_level":
-            KVCacheEventSerializer._event_diff_to_json(data.cache_level),
-            "priority":
-            KVCacheEventSerializer._event_diff_to_json(data.priority)
+        json_data = {
+            "type": "updated",
+            "block_hash": data.block_hash,
         }
+        if data.cache_level is not None:
+            json_data[
+                "cache_level"] = KVCacheEventSerializer._event_diff_to_json(
+                    data.cache_level)
+        if data.priority is not None:
+            json_data["priority"] = KVCacheEventSerializer._event_diff_to_json(
+                data.priority)
+        return json_data
 
     @staticmethod
     def _event_diff_to_json(data):

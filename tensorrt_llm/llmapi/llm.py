@@ -821,6 +821,18 @@ class BaseLLM:
             prompt_token_ids = inputs['prompt_token_ids']
             query_token_ids = inputs.get("query_token_ids", None)
             multimodal_data = {}
+            multimodal_input_obj = None
+            if inputs.get("inputs_embeds") is not None:
+                multimodal_data["inputs_embeds"] = inputs["inputs_embeds"]
+                mm_pos = inputs.get("multimodal_positions")
+                mm_len = inputs.get("multimodal_lengths")
+                mm_hash = inputs.get("multimodal_hashes")
+                if mm_pos is not None and mm_len is not None and mm_hash is not None:
+                    multimodal_input_obj = MultimodalInput.from_components(
+                        mm_hashes=mm_hash,
+                        mm_positions=mm_pos,
+                        mm_lengths=mm_len,
+                    )
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
                 # PyTorchModelEngine assumes both are present when using mrope.
@@ -836,6 +848,7 @@ class BaseLLM:
                 multimodal_data["mrope_config"] = mrope_config
             if multimodal_data:
                 multimodal_params = MultimodalParams(
+                    multimodal_input=multimodal_input_obj,
                     multimodal_data=multimodal_data)
         # This is the fast path for token IDs & MM data, as well as the slow path for text prompt and/or MM data,
         # for both encode or aggregated workers.

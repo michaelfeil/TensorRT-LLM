@@ -64,22 +64,30 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
     def __init__(self,
                  guided_decoding_config: GuidedDecodingConfig,
                  vocab_size_padded: int,
-                 max_num_draft_tokens: int = 0):
+                 max_num_draft_tokens: int = 0,
+                 tokenizer=None):
         super().__init__()
-        vocab_type = xgrammar.VocabType.RAW
-        add_prefix_space = False
-        if guided_decoding_config.tokenizer_str is not None:
-            metadata = xgrammar.TokenizerInfo._detect_metadata_from_hf(
-                guided_decoding_config.tokenizer_str)
-            vocab_type = metadata["vocab_type"]
-            add_prefix_space = metadata["add_prefix_space"]
+        if tokenizer is not None:
+            hf_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+            tokenizer_info = xgrammar.TokenizerInfo.from_huggingface(
+                hf_tokenizer,
+                vocab_size=vocab_size_padded,
+                stop_token_ids=guided_decoding_config.stop_token_ids)
+        else:
+            vocab_type = xgrammar.VocabType.RAW
+            add_prefix_space = False
+            if guided_decoding_config.tokenizer_str is not None:
+                metadata = xgrammar.TokenizerInfo._detect_metadata_from_hf(
+                    guided_decoding_config.tokenizer_str)
+                vocab_type = metadata["vocab_type"]
+                add_prefix_space = metadata["add_prefix_space"]
 
-        tokenizer_info = xgrammar.TokenizerInfo(
-            guided_decoding_config.encoded_vocab,
-            vocab_type=vocab_type,
-            vocab_size=vocab_size_padded,
-            stop_token_ids=guided_decoding_config.stop_token_ids,
-            add_prefix_space=add_prefix_space)
+            tokenizer_info = xgrammar.TokenizerInfo(
+                guided_decoding_config.encoded_vocab,
+                vocab_type=vocab_type,
+                vocab_size=vocab_size_padded,
+                stop_token_ids=guided_decoding_config.stop_token_ids,
+                add_prefix_space=add_prefix_space)
 
         # Default cache limit is 1GB.
         cache_limit_gb = float(os.getenv("XGRAMMAR_CACHE_LIMIT_GB", "1"))

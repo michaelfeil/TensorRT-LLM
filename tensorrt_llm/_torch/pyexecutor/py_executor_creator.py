@@ -729,6 +729,7 @@ def create_py_executor(
                     "max_num_sequences": max_batch_size,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
+                    "tokenizer": tokenizer,
                 }
                 if spec_config is not None:
                     kwargs[
@@ -955,12 +956,11 @@ def create_py_executor(
 
     # Drafter for speculative decoding
     with allocation_scope(ExecutorMemoryType.DRAFTER):
-        drafter = get_spec_drafter(
-            model_engine,
-            draft_model_engine,
-            sampler,
-            spec_resource_manager=spec_resource_manager,
-            guided_decoder=guided_decoder)
+        drafter = get_spec_drafter(model_engine,
+                                   draft_model_engine,
+                                   sampler,
+                                   spec_resource_manager=spec_resource_manager,
+                                   guided_decoder=guided_decoder)
 
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
@@ -980,8 +980,7 @@ def create_py_executor(
             drafter=drafter,
             guided_decoder=guided_decoder,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=
-            garbage_collection_gen0_threshold,
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             resource_governor_queue=resource_governor_queue,
@@ -997,9 +996,8 @@ def create_py_executor(
         )
     if model_engine.model.model_config.is_generation:
         allocate_deferred_secondary_kv_pools(
-            ExecutorMemoryType.INIT_KV_CACHE
-            if estimating_kv_cache else ExecutorMemoryType.KV_CACHE,
-            py_executor)
+            ExecutorMemoryType.INIT_KV_CACHE if estimating_kv_cache else
+            ExecutorMemoryType.KV_CACHE, py_executor)
 
     # Originally, peft_cache_config might be mutated inside
     # create_py_executor_instance. Restore it here.

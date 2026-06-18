@@ -373,6 +373,20 @@ class DeepseekV3WeightLoader:
                                    ckpt_num_nextn_predict_layers +
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
+                    if names[-2] == "shared_head" and not filter_weights(
+                            name, weights):
+                        # shared head does not exist (cursor).
+                        # we will have to load the main head.
+                        if names[-1] == "norm":
+                            name = "model.norm"
+                        elif names[-1] == "weight":
+                            name = "model.weight"
+                        else:
+                            raise ValueError(
+                                "Insufficient weights to load shared head.")
+                        print(
+                            f"loading {name} as alias for missing {'.'.join(names[:-1])}"
+                        )
                 mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
@@ -1782,10 +1796,9 @@ class DeepseekV3Model(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if (input_ids is None) ^ (inputs_embeds is not None):
+        if input_ids is None and inputs_embeds is None:
             raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
+                "You must specify at least one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)

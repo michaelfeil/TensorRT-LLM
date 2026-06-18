@@ -1314,6 +1314,7 @@ def create_autodeploy_executor(
             guided_decoding_config=guided_decoding_config,
             max_num_sequences=ad_config.max_batch_size,
             vocab_size_padded=vocab_size_padded,
+            tokenizer=tokenizer,
         )
 
     # creating the executor object
