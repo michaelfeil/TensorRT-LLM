@@ -459,6 +459,66 @@ TEST_F(UcxCommTest, multiSend)
     }
 }
 
+TEST_F(UcxCommTest, recvConnectIgnoresHostControlTimeoutWhileWaitingForRequester)
+{
+    try
+    {
+        constexpr char const* kShortHostControlTimeoutMs = "50";
+        constexpr auto kRequesterDelay = std::chrono::milliseconds(200);
+        ScopedEnvVar hostControlTimeout("TRTLLM_UCX_HOST_CONTROL_TIMEOUT_MS", kShortHostControlTimeoutMs);
+
+        TransceiverTag::Id id1 = TransceiverTag::Id::REQUEST_SEND;
+        TransceiverTag::Id id2;
+
+        auto connectionManager1 = makeOneUcxConnectionManager();
+        EXPECT_NE(connectionManager1, nullptr);
+        auto connectionManager2 = makeOneUcxConnectionManager();
+        EXPECT_NE(connectionManager2, nullptr);
+        auto commState1 = connectionManager1->getCommState();
+        ASSERT_TRUE(commState1.isSocketState());
+
+        auto connections1 = connectionManager2->getConnections(commState1);
+        ASSERT_EQ(connections1.size(), 1);
+        auto const* connection1 = connections1[0];
+
+        auto delayedSend = std::async(std::launch::async,
+            [&]()
+            {
+                std::this_thread::sleep_for(kRequesterDelay);
+                connection1->send(DataContext{TransceiverTag::kID_TAG}, &id1, sizeof(id1));
+            });
+
+        texec::kv_cache::Connection const* connection1Peer = nullptr;
+        std::exception_ptr recvException;
+        try
+        {
+            connection1Peer = connectionManager1->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id2, sizeof(id2));
+        }
+        catch (...)
+        {
+            recvException = std::current_exception();
+        }
+
+        delayedSend.get();
+        if (recvException)
+        {
+            std::rethrow_exception(recvException);
+        }
+        ASSERT_NE(connection1Peer, nullptr);
+        ASSERT_EQ(id2, id1);
+    }
+    catch (std::exception const& e)
+    {
+        std::string error = e.what();
+        if (isUcxWrapperUnavailable(error))
+        {
+            GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
+        }
+
+        throw;
+    }
+}
+
 TEST_F(UcxCommTest, concurrentRequestersToOneReceiver)
 {
     try

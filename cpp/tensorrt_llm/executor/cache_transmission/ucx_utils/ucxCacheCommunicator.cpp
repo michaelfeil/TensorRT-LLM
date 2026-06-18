@@ -811,8 +811,13 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
         ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback, callbackData);
     if (!req->isCompleted())
     {
+        // WARNING: Do not use the UCX host-control timeout here. recvConnect is the accept-side wait for an
+        // incoming requester, not an already-paired request message. A context rank can legitimately sit here with a
+        // ready context response while no generation rank has requested it yet. Adding an elapsed-time timeout turns
+        // that idle-but-valid state into a false transfer failure. Higher-level request timeout/cancellation is still
+        // propagated through DataContext::transferTerminate, so this wait remains cancellable without a local timeout.
         waitForUcxRequestCompletion(req, future, ctx, mRank, "recvConnect", true, callbackData, buffer->size(),
-            getUcxHostControlRequestTimeoutMs(mRank));
+            /* timeoutMs = */ 0);
     }
     if (ctx.getTransferTerminate().load() && req->getStatus() == UCS_ERR_CANCELED)
     {
