@@ -1,7 +1,7 @@
 import copy
 import dataclasses
 import os
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import torch
 
@@ -1950,6 +1950,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    allocate_kv_cache_secondary_pools: Optional[Callable[[], None]] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -2222,6 +2223,23 @@ def create_py_executor_instance(
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
         cache_transceiver_config, mamba_cache_manager)
+
+    # PyExecutor.__init__ runs model warmup before this function returns.
+    # Warmup can offload KV blocks, so deferred host pools must exist after
+    # the transceiver captures primary/indexer pool addresses but before
+    # PyExecutor starts warmup.
+    if allocate_kv_cache_secondary_pools is not None:
+        try:
+            allocate_kv_cache_secondary_pools()
+        except Exception:
+            if kv_cache_transceiver is not None:
+                try:
+                    kv_cache_transceiver.shutdown()
+                except Exception as e:
+                    logger.warning(
+                        "Failed to shut down KV cache transceiver after "
+                        f"secondary KV pool allocation failure: {e}")
+            raise
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

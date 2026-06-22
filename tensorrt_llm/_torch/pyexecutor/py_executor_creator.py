@@ -925,6 +925,22 @@ def create_py_executor(
             shutdown_kv_cache_transceiver(py_executor)
             raise
 
+    def allocate_initial_deferred_secondary_kv_pools():
+        allocate_deferred_secondary_kv_pools(
+            ExecutorMemoryType.INIT_KV_CACHE
+            if estimating_kv_cache else ExecutorMemoryType.KV_CACHE)
+
+    def allocate_final_deferred_secondary_kv_pools():
+        allocate_deferred_secondary_kv_pools(ExecutorMemoryType.KV_CACHE)
+
+    # Secondary host pools are deferred only long enough for the transceiver
+    # to initialize against primary/indexer pools. The callback runs inside
+    # create_py_executor_instance after transceiver creation and before
+    # PyExecutor warmup, while keeping the original KV memory accounting stage.
+    allocate_initial_kv_cache_secondary_pools = (
+        allocate_initial_deferred_secondary_kv_pools
+        if model_engine.model.model_config.is_generation else None)
+
     if model_engine.model.model_config.is_generation:
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE
@@ -993,11 +1009,8 @@ def create_py_executor(
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
+            allocate_kv_cache_secondary_pools=allocate_initial_kv_cache_secondary_pools,
         )
-    if model_engine.model.model_config.is_generation:
-        allocate_deferred_secondary_kv_pools(
-            ExecutorMemoryType.INIT_KV_CACHE if estimating_kv_cache else
-            ExecutorMemoryType.KV_CACHE, py_executor)
 
     # Originally, peft_cache_config might be mutated inside
     # create_py_executor_instance. Restore it here.
@@ -1076,9 +1089,8 @@ def create_py_executor(
                 virtual_memory_pools=vm_pools,
                 execution_stream=execution_stream,
                 dwdp_manager=dwdp_manager,
+                allocate_kv_cache_secondary_pools=allocate_final_deferred_secondary_kv_pools,
             )
-        allocate_deferred_secondary_kv_pools(ExecutorMemoryType.KV_CACHE,
-                                             py_executor)
 
     _adjust_torch_mem_fraction()
 

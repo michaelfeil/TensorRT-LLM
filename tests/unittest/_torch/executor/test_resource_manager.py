@@ -1,3 +1,4 @@
+import collections
 import os
 import pathlib
 import subprocess
@@ -177,6 +178,108 @@ def test_v1_kv_cache_creator_requires_all_managers_to_defer_secondary(
                         "_get_draft_kv_cache_manager_cls",
                         lambda self, log_warning=True: KVCacheManager)
     assert creator.supports_deferred_secondary_pool_allocation()
+
+
+def test_create_py_executor_instance_allocates_secondary_before_warmup(
+        monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import _util as pyexecutor_util
+    from tensorrt_llm._torch.pyexecutor.resource_manager import \
+        ResourceManagerType
+    from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
+
+    events = []
+
+    class FakeKvCacheManager:
+
+        def __init__(self):
+            self.impl = object()
+
+        def allocate_secondary_pools(self):
+            events.append("allocate_secondary_pools")
+
+    class FakeResourceManager:
+
+        def __init__(self, resources):
+            self.resource_managers = collections.OrderedDict(resources)
+
+    class FakeSchedulerConfig:
+        use_python_scheduler = False
+        python_capacity_scheduler_policy = None
+        capacity_scheduler_policy = None
+        waiting_queue_policy = WaitingQueuePolicy.FCFS
+
+    class FakeModelConfig:
+        pretrained_config = object()
+
+    class FakeModel:
+        model_config = FakeModelConfig()
+
+    class FakeModelEngine:
+        spec_config = None
+        model = FakeModel()
+
+    class FakeLlmArgs:
+        extra_resource_managers = {}
+        disable_overlap_scheduler = False
+
+    def fake_create_kv_cache_transceiver(*args, **kwargs):
+        events.append("create_kv_cache_transceiver")
+        return object()
+
+    class FakePyExecutor:
+
+        def __init__(self, *args, **kwargs):
+            events.append("py_executor_warmup")
+
+    monkeypatch.setattr(pyexecutor_util, "ResourceManager",
+                        FakeResourceManager)
+    monkeypatch.setattr(pyexecutor_util, "SeqSlotManager",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr(pyexecutor_util, "BindCapacityScheduler",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr(pyexecutor_util, "BindMicroBatchScheduler",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr(pyexecutor_util, "SimpleScheduler",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr(pyexecutor_util, "create_kv_cache_transceiver",
+                        fake_create_kv_cache_transceiver)
+    monkeypatch.setattr(pyexecutor_util, "PyExecutor", FakePyExecutor)
+    monkeypatch.setattr(pyexecutor_util, "is_mla", lambda config: False)
+
+    resources = {
+        ResourceManagerType.KV_CACHE_MANAGER: FakeKvCacheManager(),
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER: None,
+    }
+
+    def allocate_secondary_pools():
+        resources[
+            ResourceManagerType.KV_CACHE_MANAGER].allocate_secondary_pools()
+
+    pyexecutor_util.create_py_executor_instance(
+        dist=object(),
+        resources=resources,
+        mapping=Mapping(world_size=1, rank=0),
+        llm_args=FakeLlmArgs(),
+        ctx_chunk_config=None,
+        model_engine=FakeModelEngine(),
+        start_worker=False,
+        sampler=object(),
+        drafter=None,
+        max_seq_len=16,
+        max_batch_size=1,
+        max_beam_width=1,
+        max_num_tokens=16,
+        scheduler_config=FakeSchedulerConfig(),
+        cache_transceiver_config=object(),
+        execution_stream=None,
+        allocate_kv_cache_secondary_pools=allocate_secondary_pools,
+    )
+
+    assert events == [
+        "create_kv_cache_transceiver",
+        "allocate_secondary_pools",
+        "py_executor_warmup",
+    ]
 
 
 def test_v1_dsa_cache_manager_initializes_indexer_after_primary_pool(
