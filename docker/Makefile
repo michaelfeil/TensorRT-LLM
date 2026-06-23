@@ -36,6 +36,8 @@ IMAGE_WITH_TAG     ?= $(IMAGE_NAME)$(if $(STAGE),/$(STAGE)):$(IMAGE_TAG)
 PUSH_TO_STAGING    ?= 1
 DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
+DOCKER_BUILD_ARGS  += $(if $(KEEP_SOURCE), --build-arg KEEP_SOURCE="$(KEEP_SOURCE)")
+DOCKER_BUILD_ARGS  += $(if $(image_src_key), --build-arg image_src_key="$(image_src_key)")
 DOCKER_PROGRESS    ?= auto
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
 CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
@@ -107,8 +109,6 @@ base_pull:
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
 		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
 		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
-		$(if $(KEEP_SOURCE), --build-arg KEEP_SOURCE="$(KEEP_SOURCE)") \
-		$(if $(image_src_key), --build-arg image_src_key="$(image_src_key)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \

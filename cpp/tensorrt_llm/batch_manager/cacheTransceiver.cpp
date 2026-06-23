@@ -628,6 +628,16 @@ CacheTransceiver::~CacheTransceiver()
     }
 }
 
+size_t CacheTransceiver::getTotalPreAllocBufferSize() const
+{
+    size_t totalPreAllocBufferSize = 0;
+    for (auto const* manager : mCacheTransBufferManagerPtrs)
+    {
+        totalPreAllocBufferSize += manager->getPreAllocBufferSize();
+    }
+    return totalPreAllocBufferSize;
+}
+
 void CacheTransceiver::initializeCommState()
 {
     mCommState = std::addressof(mCacheSender->getCommState());
@@ -822,8 +832,8 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     }
 }
 
-RequestStatuses CacheTransceiver::checkContextTransferStatus(
-    std::optional<int> const& atLeastRequestNum, bool markComplete, bool collectKvTransferEvents,
+RequestStatuses CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum,
+    bool markComplete, bool collectKvTransferEvents,
     std::vector<LlmRequest::RequestIdType> const& timedOutContextRequestIds)
 {
     RequestStatuses requestsStatus{};

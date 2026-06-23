@@ -431,6 +431,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_prop_ro("tokens_per_block", &BaseKVCacheManager::getTokensPerBlock)
         .def_prop_ro("max_num_blocks", &BaseKVCacheManager::getMaxNumBlocks)
         .def_prop_ro("num_pools", &BaseKVCacheManager::getNumPools)
+        .def_prop_ro("enable_indexer_k_cache", &BaseKVCacheManager::isEnableIndexerKCache)
         .def("get_kv_cache_stats", &BaseKVCacheManager::getKvCacheStats, nb::call_guard<nb::gil_scoped_release>())
         .def("get_iteration_stats", &BaseKVCacheManager::getIterationStats, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_blocks_per_seq",

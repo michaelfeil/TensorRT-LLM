@@ -29,6 +29,7 @@
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -279,9 +280,8 @@ public:
     virtual void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
     /// Check all requests transferring context, and return the requests that have completed or encountered an error.
-    virtual RequestStatuses checkContextTransferStatus(
-        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false,
-        bool collectKvTransferEvents = false,
+    virtual RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt,
+        bool markComplete = false, bool collectKvTransferEvents = false,
         std::vector<LlmRequest::RequestIdType> const& timedOutContextRequestIds = {})
         = 0;
 
@@ -333,6 +333,8 @@ public:
 
     virtual ~CacheTransceiver();
 
+    [[nodiscard]] size_t getTotalPreAllocBufferSize() const;
+
     void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     void respondAndSendLayerWise(
@@ -341,9 +343,8 @@ public:
     void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) override;
     void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
-    RequestStatuses checkContextTransferStatus(
-        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false,
-        bool collectKvTransferEvents = false,
+    RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt,
+        bool markComplete = false, bool collectKvTransferEvents = false,
         std::vector<LlmRequest::RequestIdType> const& timedOutContextRequestIds = {}) override;
 
     RequestStatuses checkGenTransferStatus(

@@ -134,10 +134,9 @@ class KvCacheTransceiver(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def check_gen_transfer_status(
-            self,
-            at_least_request_num: int,
-            collect_kv_transfer_events: bool = False):
+    def check_gen_transfer_status(self,
+                                  at_least_request_num: int,
+                                  collect_kv_transfer_events: bool = False):
         raise NotImplementedError
 
     @abstractmethod
@@ -243,6 +242,9 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             cache_transceiver_config._to_pybind(), rnn_state_manager,
             rnn_layer_num_per_pp_rank)
 
+    def get_total_pre_alloc_buffer_size(self) -> int:
+        return self.impl.get_total_pre_alloc_buffer_size()
+
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
 
@@ -267,10 +269,9 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def take_context_kv_transfer_event_report(self, req: LlmRequest):
         return self.impl.take_context_kv_transfer_event_report(req)
 
-    def check_gen_transfer_status(
-            self,
-            at_least_request_num: int,
-            collect_kv_transfer_events: bool = False):
+    def check_gen_transfer_status(self,
+                                  at_least_request_num: int,
+                                  collect_kv_transfer_events: bool = False):
         return self.impl.check_gen_transfer_status(
             at_least_request_num,
             collect_kv_transfer_events=collect_kv_transfer_events)

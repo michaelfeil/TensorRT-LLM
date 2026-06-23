@@ -61,9 +61,8 @@ public:
         NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }
 
-    tb::RequestStatuses checkContextTransferStatus(
-        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false,
-        bool collectKvTransferEvents = false,
+    tb::RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt,
+        bool markComplete = false, bool collectKvTransferEvents = false,
         std::vector<tb::LlmRequest::RequestIdType> const& timedOutContextRequestIds = {}) override
     {
         NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum, markComplete, collectKvTransferEvents,
@@ -158,8 +157,7 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
             nb::arg("at_least_request_num") = std::nullopt, nb::arg("collect_kv_transfer_events") = false)
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
         .def("has_pending_gen_transfer", &BaseCacheTransceiver::hasPendingGenTransfer)
-        .def("record_context_kv_transfer_failure_event",
-            &BaseCacheTransceiver::recordContextKvTransferFailureEvent)
+        .def("record_context_kv_transfer_failure_event", &BaseCacheTransceiver::recordContextKvTransferFailureEvent)
         .def("record_generation_kv_transfer_failure_event",
             &BaseCacheTransceiver::recordGenerationKvTransferFailureEvent)
         .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
@@ -176,7 +174,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
             nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt,
-            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
+            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{})
+        .def("get_total_pre_alloc_buffer_size", &tb::CacheTransceiver::getTotalPreAllocBufferSize);
 
     nb::class_<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(

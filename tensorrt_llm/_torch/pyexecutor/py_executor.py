@@ -55,6 +55,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from . import hbm_stats
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -65,7 +66,7 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_manager_v2 import KVCacheManagerV2
-from .kv_cache_transceiver import KvCacheTransceiver
+from .kv_cache_transceiver import BindKvCacheTransceiver, KvCacheTransceiver
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -406,6 +407,7 @@ class PyExecutor:
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
         self.guided_decoder = guided_decoder
+        self.kv_cache_transceiver = kv_cache_transceiver
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         self.enable_early_first_token_response = enable_early_first_token_response
@@ -545,6 +547,20 @@ class PyExecutor:
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
+        self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
+                                    and self.kv_cache_transceiver is not None)
+        # True while the benchmark disagg fill phase is in progress (waiting
+        # for all benchmark requests to complete KV transfer before the first
+        # forward pass).  Cleared by _check_benchmark_disagg_gate when the
+        # can_forward gate opens.  Used by _should_skip_dummy_for_benchmark_disagg
+        # to prevent permanent dummy insertion during fill; once False, the
+        # normal dummy add-forward-terminate lifecycle handles taper-down.
+        # Only relevant in benchmark disagg mode; False otherwise.
+        self._benchmark_fill_phase_active = self.is_benchmark_disagg
+        # Slow-start admission cap for benchmark disagg fill (see
+        # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
+        # seeds it to tp_size and each subsequent iter doubles it.
+        self._fill_admit_cap: int = 0
 
         # list of requests in each PP micro batch
         self.num_micro_batches = max(self.dist.pp_size,
@@ -596,6 +612,13 @@ class PyExecutor:
         # Ensure the default stream waits for execution_stream to complete
         # before subsequent operations.
         torch.cuda.current_stream().wait_stream(self.execution_stream)
+        self._hbm_model_weights_bytes = torch.cuda.memory_allocated(
+            self.device_id)
+        if isinstance(self.kv_cache_transceiver, BindKvCacheTransceiver):
+            self._kv_cache_transfer_buffer_bytes = (
+                self.kv_cache_transceiver.get_total_pre_alloc_buffer_size())
+        else:
+            self._kv_cache_transfer_buffer_bytes = 0
         self.is_warmup = False
 
         # Snapshot some cumulative KV cache counters so that stats reported to
@@ -691,22 +714,6 @@ class PyExecutor:
             canceled_req_ids=lambda: self.canceled_req_ids,
         )
         self.gather_all_responses = False
-
-        self.kv_cache_transceiver = kv_cache_transceiver
-        self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
-                                    and self.kv_cache_transceiver is not None)
-        # True while the benchmark disagg fill phase is in progress (waiting
-        # for all benchmark requests to complete KV transfer before the first
-        # forward pass).  Cleared by _check_benchmark_disagg_gate when the
-        # can_forward gate opens.  Used by _should_skip_dummy_for_benchmark_disagg
-        # to prevent permanent dummy insertion during fill; once False, the
-        # normal dummy add-forward-terminate lifecycle handles taper-down.
-        # Only relevant in benchmark disagg mode; False otherwise.
-        self._benchmark_fill_phase_active = self.is_benchmark_disagg
-        # Slow-start admission cap for benchmark disagg fill (see
-        # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
-        # seeds it to tp_size and each subsequent iter doubles it.
-        self._fill_admit_cap: int = 0
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -1487,6 +1494,65 @@ class PyExecutor:
 
         return req_stats
 
+    def _build_kv_pool_hbm_stats(
+            self,
+            kv_stats,
+            allocated_bytes: Optional[int] = None) -> hbm_stats.KvPoolHbmStats:
+        max_num_blocks = kv_stats.max_num_blocks
+        used_num_blocks = kv_stats.used_num_blocks
+        free_num_blocks = kv_stats.free_num_blocks
+        if allocated_bytes is None:
+            allocated_bytes = kv_stats.allocated_bytes
+
+        bytes_per_block = (allocated_bytes //
+                           max_num_blocks) if max_num_blocks > 0 else 0
+
+        return hbm_stats.KvPoolHbmStats(
+            allocated_bytes=allocated_bytes,
+            used_bytes=used_num_blocks * bytes_per_block,
+            free_bytes=free_num_blocks * bytes_per_block,
+        )
+
+    def _build_dsa_indexer_k_cache_hbm_stats(
+            self, kv_stats, kv_cache_manager) -> hbm_stats.KvPoolHbmStats:
+        indexer_k_cache_pool = kv_cache_manager.impl.get_indexer_k_cache_pool()
+        allocated_bytes = (indexer_k_cache_pool.numel() *
+                           indexer_k_cache_pool.element_size())
+        return self._build_kv_pool_hbm_stats(kv_stats, allocated_bytes)
+
+    def _build_hbm_stats(
+        self, cuda_free_bytes: int, cuda_total_bytes: int,
+        kv_pools: dict[ResourceManagerType, hbm_stats.KvPoolHbmStats]
+    ) -> hbm_stats.HbmStats:
+        total_hbm_used_bytes = cuda_total_bytes - cuda_free_bytes
+        torch_memory_stats = torch.cuda.memory_stats(self.device_id)
+        torch_allocated_bytes = torch_memory_stats[
+            "allocated_bytes.all.current"]
+        torch_reserved_bytes = torch_memory_stats["reserved_bytes.all.current"]
+        model_weights_bytes = self._hbm_model_weights_bytes
+        activations_bytes = torch_reserved_bytes - model_weights_bytes
+        kv_allocated_bytes = sum(pool.allocated_bytes
+                                 for pool in kv_pools.values())
+        kv_cache_transfer_buffer_bytes = self._kv_cache_transfer_buffer_bytes
+        other_non_torch_bytes = (total_hbm_used_bytes - torch_reserved_bytes -
+                                 kv_allocated_bytes -
+                                 kv_cache_transfer_buffer_bytes)
+
+        return hbm_stats.HbmStats(
+            rank=self.global_rank,
+            device_id=self.device_id,
+            cuda_total_bytes=cuda_total_bytes,
+            cuda_free_bytes=cuda_free_bytes,
+            total_hbm_used_bytes=total_hbm_used_bytes,
+            torch_allocated_bytes=torch_allocated_bytes,
+            torch_reserved_bytes=torch_reserved_bytes,
+            model_weights_bytes=model_weights_bytes,
+            activations_bytes=activations_bytes,
+            other_non_torch_bytes=other_non_torch_bytes,
+            kv_cache_transfer_buffer_bytes=kv_cache_transfer_buffer_bytes,
+            kv_pools=kv_pools,
+        )
+
     def _update_iter_stats(
         self,
         stats,
@@ -1517,10 +1583,22 @@ class PyExecutor:
         # loop than the one that built the batch, so the live counter would
         # mislabel the record.
 
+        kv_pools: dict[ResourceManagerType, hbm_stats.KvPoolHbmStats] = {}
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
         if kv_cache_manager is not None:
             kv_stats = kv_cache_manager.get_kv_cache_stats()
+            kv_allocated_bytes = kv_stats.allocated_bytes
+            dsa_indexer_stats = None
+            if kv_cache_manager.impl.enable_indexer_k_cache:
+                dsa_indexer_stats = self._build_dsa_indexer_k_cache_hbm_stats(
+                    kv_stats, kv_cache_manager)
+                kv_allocated_bytes -= dsa_indexer_stats.allocated_bytes
+            kv_pools[ResourceManagerType.KV_CACHE_MANAGER] = (
+                self._build_kv_pool_hbm_stats(kv_stats, kv_allocated_bytes))
+            if dsa_indexer_stats is not None:
+                kv_pools[ResourceManagerType.DSA_INDEXER_K_CACHE] = (
+                    dsa_indexer_stats)
             kv_stats_to_save = KvCacheStats()
             kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
             kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
@@ -1543,6 +1621,16 @@ class PyExecutor:
                 self._last_kv_iter_stats_fetch_iter = self.iter_counter
             else:
                 self._latest_kv_iter_stats = None
+
+        draft_kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        if draft_kv_cache_manager is not None:
+            kv_pools[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = (
+                self._build_kv_pool_hbm_stats(
+                    draft_kv_cache_manager.get_kv_cache_stats()))
+
+        extra_stats["hbmStats"] = self._build_hbm_stats(end, total_gpu_memory,
+                                                        kv_pools).to_dict()
 
         # Attention-DP may add dummy requests to keep ranks aligned during
         # distributed scheduling. CUDA graph padding can add dummies too.

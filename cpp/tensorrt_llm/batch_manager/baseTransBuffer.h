@@ -230,6 +230,12 @@ public:
     /// @brief Get the number of send buffers.
     size_t getSendBufferCount();
 
+    /// @brief Get the total bytes pre-allocated by this manager.
+    [[nodiscard]] size_t getPreAllocBufferSize() const noexcept
+    {
+        return mPreAllocBufferSize;
+    }
+
     /// @brief Get the maximum number of tokens configured.
     std::optional<size_t> getMaxNumTokens()
     {
