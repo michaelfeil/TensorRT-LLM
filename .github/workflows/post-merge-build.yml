@@ -1,0 +1,104 @@
+name: Post-Merge Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      amd64_cuda_archs:
+        description: CUDA architectures for amd64
+        required: true
+        default: "80-real;86-real;90-real;100-real"
+        type: string
+      arm64_cuda_archs:
+        description: CUDA architectures for arm64
+        required: true
+        default: "100-real;103-real"
+        type: string
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: baseten/tensorrt_llm-release
+
+jobs:
+  resolve-image-tag:
+    outputs:
+      image_tag: ${{ steps.tags.outputs.image_tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve image tag
+        id: tags
+        run: |
+          short_sha="${GITHUB_SHA::10}"
+          echo "image_tag=${IMAGE_REPO}:${short_sha}" >> "${GITHUB_OUTPUT}"
+
+  build-and-push:
+    needs: resolve-image-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            cuda_archs: "${{ inputs.amd64_cuda_archs || '80-real;86-real;90-real;100-real' }}"
+            runner: depot-ubuntu-24.04-192
+          - arch: arm64
+            cuda_archs: "${{ inputs.arm64_cuda_archs || '100-real;103-real' }}"
+            runner: depot-ubuntu-24.04-arm-192
+    name: Build and push ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            env.BUILDKIT_STEP_LOG_MAX_SIZE=50000000
+            env.BUILDKIT_STEP_LOG_MAX_SPEED=10000000
+
+      - name: Build and push
+        env:
+          ARCH: ${{ matrix.arch }}
+          BUILD_WHEEL_OPTS: "--clean -D CMAKE_CXX_COMPILER_LAUNCHER=sccache -D CMAKE_CUDA_COMPILER_LAUNCHER=sccache"
+          CUDA_ARCHS: ${{ matrix.cuda_archs }}
+          DOCKER_BUILD_OPTS: "--pull --push"
+        run: |
+          DOCKER_BUILD_ARGS="--secret id=SCCACHE_WEBDAV_TOKEN,env=SCCACHE_WEBDAV_TOKEN --build-arg SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT:-https://cache.depot.dev}" \
+            scripts/build_trtllm_release_image.sh
+
+  publish-multi-arch-image:
+    needs:
+      - resolve-image-tag
+      - build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifest
+        env:
+          IMAGE_TAG: ${{ needs.resolve-image-tag.outputs.image_tag }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE_TAG}" \
+            "${IMAGE_TAG}-amd64" \
+            "${IMAGE_TAG}-arm64"

@@ -169,6 +169,15 @@ CI is triggered by posting comments on the PR. Basic commands:
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 
+### Post-Merge Release Image Build
+
+`.github/workflows/post-merge-build.yml` builds and pushes `baseten/tensorrt_llm-release` images for amd64
+(`80-real;86-real;90-real;100-real`) and arm64 (`100-real;103-real`) using
+`scripts/build_trtllm_release_image.sh`. The workflow uses Depot 192-core runners and the Depot
+runner-provided `SCCACHE_WEBDAV_TOKEN` build secret for persistent `sccache`. Manual script runs default to
+`ccache`; CI passes `BUILD_WHEEL_OPTS` for `sccache`. Manual workflow dispatch exposes per-arch CUDA
+architecture overrides.
+
 ### Trouble Shooting
 
 - Use `TLLM_LOG_LEVEL_BY_MODULE` to enable per-module log filtering (e.g., `"debug:_torch,runtime;info:serve"`); see [Module-Level Logging](docs/source/developer-guide/overview.md#module-level-logging) for details.

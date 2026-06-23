@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
@@ -62,7 +63,8 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
-         --tensorrt --polygraphy --mpi4py --pytorch --opencv
+         --tensorrt --polygraphy --mpi4py --pytorch --opencv && \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_sccache.sh
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
@@ -129,13 +131,30 @@ COPY triton_kernels triton_kernels
 COPY 3rdparty 3rdparty
 COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt README.md ./
 
+# Create cache directories for pip and compiler caches
+RUN mkdir -p /root/.cache/pip /root/.cache/ccache /root/.cache/sccache
 ENV CCACHE_DIR=/root/.cache/ccache
+ENV SCCACHE_DIR=/root/.cache/sccache
 # Build the TRT-LLM wheel
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
+ARG SCCACHE_WEBDAV_ENDPOINT=https://cache.depot.dev
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    --mount=type=cache,target=${SCCACHE_DIR} --mount=type=secret,id=SCCACHE_WEBDAV_TOKEN,env=SCCACHE_WEBDAV_TOKEN,required=false \
+    sccache_enabled=0; \
+    if [ -n "${SCCACHE_WEBDAV_TOKEN:-}" ] && command -v sccache >/dev/null 2>&1; then \
+        export SCCACHE_WEBDAV_ENDPOINT="${SCCACHE_WEBDAV_ENDPOINT}"; \
+        sccache --start-server && sccache --zero-stats && sccache_enabled=1; \
+    fi; \
+    build_status=0; \
+    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS} || build_status=$?; \
+    if [ "${sccache_enabled}" = 1 ]; then \
+        echo "SCCACHE_STATS_BEGIN"; \
+        sccache --show-stats || true; \
+        echo "SCCACHE_STATS_END"; \
+    fi; \
+    exit "${build_status}"
 
 FROM ${DEVEL_IMAGE} AS release
 
