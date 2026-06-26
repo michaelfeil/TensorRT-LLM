@@ -31,6 +31,10 @@ class MetricNames(Enum):
     SPEC_DEC_DRAFTED_PER_POS = "spec_dec_drafted_per_pos"
     PREFILL_PERPLEXITY = "prefill_perplexity"
     GENERATION_PERPLEXITY = "generation_perplexity"
+    AVG_DECODED_TOKENS_PER_ITER = "avg_decoded_tokens_per_iter"
+    INPUT_TOKENS = "input_tokens"
+    OUTPUT_TOKENS = "output_tokens"
+    CACHED_TOKENS = "cached_tokens"
 
 
 class RequestEventTiming(Enum):

@@ -40,8 +40,7 @@ from ..pyexecutor.sampler import (
     int_tensor,
 )
 from ..pyexecutor.scheduler import ScheduledRequests
-
-from .b10_hs_capture import trt_prepare_api, is_setup as is_hs_capture_setup
+from .b10_hs_capture import is_setup as is_hs_capture_setup, trt_prepare_api
 
 _DYNAMIC_TEMPERATURE_PAD_TOKEN = -1
 

@@ -23,27 +23,36 @@ from ..llmapi.tokenizer import TransformersTokenizer
 from .chat_utils import make_tool_call_id
 from .harmony_adapter import (handle_non_streaming_response,
                               handle_streaming_response)
-from .openai_protocol import (ChatCompletionLogProbs,
-                              ChatCompletionLogProbsContent,
-                              ChatCompletionNamedToolChoiceParam,
-                              ChatCompletionRequest, ChatCompletionResponse,
-                              ChatCompletionResponseChoice,
-                              ChatCompletionResponseStreamChoice,
-                              ChatCompletionStreamResponse,
-                              ChatCompletionToolsParam, ChatMessage,
-                              CompletionLogProbs, CompletionRequest,
-                              CompletionResponse, CompletionResponseChoice,
-                              CompletionResponseStreamChoice,
-                              CompletionStreamResponse, DeltaFunctionCall,
-                              DeltaMessage, DeltaToolCall, FunctionCall,
-                              PromptTokensDetails, ResponsesRequest,
-                              ResponsesResponse, StreamOptions, ToolCall,
-                              UsageInfo, to_disaggregated_params)
+from .openai_protocol import (  # CompletionTokensDetails,  # disabled: see openai_protocol.py
+    ChatCompletionLogProbs, ChatCompletionLogProbsContent,
+    ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
+    ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,
+    ChatCompletionToolsParam, ChatMessage, CompletionLogProbs,
+    CompletionRequest, CompletionResponse, CompletionResponseChoice,
+    CompletionResponseStreamChoice, CompletionStreamResponse, DeltaFunctionCall,
+    DeltaMessage, DeltaToolCall, FunctionCall, PromptTokensDetails,
+    ResponsesRequest, ResponsesResponse, StreamOptions, ToolCall, UsageInfo,
+    to_disaggregated_params)
 from .tool_parser.base_tool_parser import BaseToolParser
 from .tool_parser.core_types import ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
 
 # yapf: enable
+
+# Acceptance-metric helper is disabled by default; uncomment locally (along
+# with CompletionTokensDetails in openai_protocol.py and the call sites below)
+# to expose speculative-decoding accept stats in the API response.
+# def _get_completion_tokens_details(rsp) -> Optional[CompletionTokensDetails]:
+#     """Return speculative-decoding acceptance stats for the response."""
+#     avg_decoded = getattr(rsp, "avg_decoded_tokens_per_iter", None)
+#     if avg_decoded is None:
+#         return None
+#     avg_accepted = max(0.0, float(avg_decoded) - 1.0)
+#     return CompletionTokensDetails(
+#         avg_decoded_tokens_per_iter=float(avg_decoded),
+#         avg_accepted_draft_tokens_per_iter=avg_accepted,
+#     )
 
 
 def _ctx_usage_from_outputs(outputs: List[Any]) -> Optional[UsageInfo]:
@@ -369,6 +378,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=PromptTokensDetails(
                 cached_tokens=rsp.cached_tokens),
+            # completion_tokens_details=_get_completion_tokens_details(rsp),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
@@ -450,6 +460,7 @@ def chat_response_post_processor(
         total_tokens=num_prompt_tokens + num_generated_tokens,
         prompt_tokens_details=PromptTokensDetails(
             cached_tokens=rsp.cached_tokens),
+        # completion_tokens_details=_get_completion_tokens_details(rsp),
     )
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     response = ChatCompletionResponse(
@@ -581,6 +592,7 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=PromptTokensDetails(
                 cached_tokens=rsp.cached_tokens),
+            # completion_tokens_details=_get_completion_tokens_details(rsp),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
@@ -630,11 +642,14 @@ def completion_response_post_processor(
         completion_tokens += output.length
         choices.append(choice)
 
-    usage = UsageInfo(prompt_tokens=prompt_tokens,
-                      completion_tokens=completion_tokens,
-                      total_tokens=completion_tokens + prompt_tokens,
-                      prompt_tokens_details=PromptTokensDetails(
-                          cached_tokens=rsp.cached_tokens))
+    usage = UsageInfo(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=completion_tokens + prompt_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=rsp.cached_tokens),
+        # completion_tokens_details=_get_completion_tokens_details(rsp),
+    )
     response = CompletionResponse(choices=choices,
                                   model=args.model,
                                   usage=usage)

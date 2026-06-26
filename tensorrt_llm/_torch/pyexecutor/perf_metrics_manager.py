@@ -189,7 +189,7 @@ class PerfMetricsManager:
             if target is None:
                 continue
 
-            # Compute once per batch, reuse for all requests
+            # Compute once per batch, reuse for all requests.
             if batch_gpu_forward_time is None:
                 if not perf.gpu_forward_end_event.query():
                     perf.gpu_forward_end_event.synchronize()

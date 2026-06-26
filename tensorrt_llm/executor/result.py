@@ -689,22 +689,32 @@ class GenerationResultBase:
                 MetricsCollector.labelname_finish_reason:
                 output.finish_reason
             })
+        output_token_count = len(output.token_ids) if output.token_ids else 0
         processed_metrics_stat = _process_req_perf_metrics(
-            stats, len(output.token_ids))
+            stats, output_token_count)
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
+        if output_token_count > 0:
+            metrics_stats[MetricNames.OUTPUT_TOKENS] = float(output_token_count)
         # Record prompt tokens only for the first candidate to avoid
         # double-counting the shared prompt across n candidates.
         prompt_token_ids = getattr(self, "prompt_token_ids", None)
         if output.finish_reason and sequence_index == 0:
             if prompt_token_ids is not None and len(prompt_token_ids) > 0:
                 metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+                metrics_stats[MetricNames.INPUT_TOKENS] = float(
+                    len(prompt_token_ids))
 
         # Request-scoped metrics: only record for the first candidate to avoid
         # double-counting across n candidates.
         if output.finish_reason and sequence_index == 0:
             metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS] = \
                 self.cached_tokens
+            metrics_stats[MetricNames.CACHED_TOKENS] = float(self.cached_tokens)
+            if self.avg_decoded_tokens_per_iter is not None:
+                metrics_stats[
+                    MetricNames.
+                    AVG_DECODED_TOKENS_PER_ITER] = self.avg_decoded_tokens_per_iter
 
             spec_dec_logged = False
             if self.per_pos_drafted is not None and any(

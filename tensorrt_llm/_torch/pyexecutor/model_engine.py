@@ -372,7 +372,6 @@ class PyTorchModelEngine(ModelEngine):
             'batch_sizes'].default
         cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
             'enable_padding'].default
-
         # Encode-only CUDA graph detection. Decode configs do not define these
         # encoder-specific bucket fields.
         cuda_graph_num_tokens = []
@@ -5056,7 +5055,7 @@ class PyTorchModelEngine(ModelEngine):
         """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""
         return getattr(self.model, 'spec_worker', None)
 
-    def model_forward(self, **kwargs):
+    def _setup_model_attrs(self, kwargs):
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
@@ -5069,23 +5068,47 @@ class PyTorchModelEngine(ModelEngine):
             attrs["events"] = weakref.ref(self._torch_compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 
+    def model_forward(self, **kwargs):
+        self._setup_model_attrs(kwargs)
+
         if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
             return trace_func(self.model.forward)(**kwargs)
         else:
             return self.model.forward(**kwargs)
 
+    def target_model_forward(self, **kwargs):
+        if not hasattr(self.model, 'forward_target'):
+            raise NotImplementedError(
+                "The model does not have forward_target method")
+        self._setup_model_attrs(kwargs)
+
+        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+            return trace_func(self.model.forward_target)(**kwargs)
+        else:
+            return self.model.forward_target(**kwargs)
+
+    def spec_model_forward(self, **kwargs):
+        if not hasattr(self.model, 'forward_draft'):
+            raise NotImplementedError(
+                "The model does not have forward_draft method")
+        self._setup_model_attrs(kwargs)
+
+        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+            return trace_func(self.model.forward_draft)(**kwargs)
+        else:
+            return self.model.forward_draft(**kwargs)
+
     @nvtx_range("_forward_step")
     def _forward_step(self,
                       inputs: Dict[str, Any],
-                      *,
                       gather_ids: Optional[torch.Tensor] = None,
                       gather_context_logits: bool = False) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
 
-        # For simplicity, just return all the the logits if we have special gather_ids
-        # from speculative decoding.
+        # For simplicity, just return all the logits if speculative decoding
+        # provided special gather ids.
         outputs = self.model_forward(
             **inputs,
             return_context_logits=gather_ids is not None

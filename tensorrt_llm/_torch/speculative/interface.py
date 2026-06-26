@@ -1245,6 +1245,190 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens, sampled_log_probs
 
+    def _check_relaxed_acceptance_greedy_only(
+            self, spec_metadata: "SpecMetadata") -> None:
+        if (spec_metadata.is_all_greedy_sample
+                or getattr(spec_metadata, "_force_non_greedy_for_capture",
+                           False)):
+            return
+        raise AssertionError(
+            "Relaxed acceptance only supports greedy sampling")
+
+    def _update_relaxed_acceptance_deltas(
+        self,
+        relaxed_delta_pool: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        relaxed_delta_value: float,
+        begin_thinking_phase_token: Optional[int] = None,
+        end_thinking_phase_token: Optional[int] = None,
+    ):
+
+        def token_in_accepted_prefix(token: int):
+            prefix_matches = torch.cumsum(
+                (accepted_tokens == token).int(),
+                dim=1,
+            )
+            last_accepted_token = (num_accepted_tokens - 1).clamp_min(0).long()
+            return torch.gather(
+                prefix_matches,
+                dim=1,
+                index=last_accepted_token.unsqueeze(1),
+            ).squeeze(1) > 0
+
+        if begin_thinking_phase_token is not None:
+            turn_thinking_on = token_in_accepted_prefix(
+                begin_thinking_phase_token)
+            relaxed_delta_pool = torch.where(
+                turn_thinking_on,
+                relaxed_delta_value,
+                relaxed_delta_pool,
+            )
+
+        if end_thinking_phase_token is not None:
+            turn_thinking_off = token_in_accepted_prefix(
+                end_thinking_phase_token)
+            relaxed_delta_pool = torch.where(
+                turn_thinking_off,
+                0.0,
+                relaxed_delta_pool,
+            )
+
+        return relaxed_delta_pool
+
+    def _relaxed_sample_and_accept_draft_tokens(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        spec_metadata,
+        relaxed_delta_pool: torch.Tensor,
+        relaxed_topk: int = 10,
+        use_multiplicative_threshold: bool = True,
+    ):
+        runtime_draft_len = draft_tokens.shape[-1]
+        num_gens = batch_size - num_contexts
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        self._check_relaxed_acceptance_greedy_only(spec_metadata)
+
+        sampled_log_probs = torch.zeros((batch_size, runtime_draft_len + 1),
+                                        dtype=torch.float32,
+                                        device=logits.device)
+
+        if num_contexts > 0:
+            context_logits = logits[:num_contexts]
+            context_target_tokens = context_logits.argmax(dim=-1)
+            context_target_logprobs = torch.gather(
+                context_logits,
+                dim=-1,
+                index=context_target_tokens.unsqueeze(1),
+            ).squeeze(1)
+            context_target_logprobs -= torch.logsumexp(context_logits, dim=-1)
+            accepted_tokens[:num_contexts, 0] = context_target_tokens
+            sampled_log_probs[:num_contexts, 0] = context_target_logprobs
+
+        if num_gens == 0:
+            return accepted_tokens, num_accepted_tokens, sampled_log_probs
+
+        gen_logits = logits[num_contexts:].reshape(num_gens,
+                                                   runtime_draft_len + 1,
+                                                   logits.shape[-1])
+
+        threshold, values, target_tokens, target_values = self._get_relaxed_acceptance_threshold(
+            gen_logits,
+            spec_metadata,
+            relaxed_delta_pool,
+            relaxed_topk,
+            use_multiplicative_threshold,
+        )
+
+        draft_token_values = torch.gather(
+            values[:, :runtime_draft_len, :],
+            dim=-1,
+            index=draft_tokens.long().unsqueeze(-1),
+        ).squeeze(-1)
+        is_accepted = draft_token_values >= threshold[:, :runtime_draft_len]
+        accepted_prefix = torch.cumprod(is_accepted.int(), dim=-1).bool()
+        num_accepted_tokens[num_contexts:] += accepted_prefix.sum(1)
+
+        accepted_tokens[num_contexts:batch_size] = target_tokens
+        accepted_tokens[
+            num_contexts:batch_size, :runtime_draft_len] = torch.where(
+                accepted_prefix,
+                draft_tokens,
+                accepted_tokens[num_contexts:batch_size, :runtime_draft_len],
+            )
+
+        target_values[:, :runtime_draft_len] = torch.where(
+            accepted_prefix,
+            draft_token_values,
+            target_values[:, :runtime_draft_len],
+        )
+        if use_multiplicative_threshold:
+            gen_log_probs = target_values - torch.logsumexp(values, dim=-1)
+        else:
+            gen_log_probs = torch.log(target_values)
+        sampled_log_probs[num_contexts:batch_size] = gen_log_probs
+
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, runtime_draft_len)
+
+        return accepted_tokens, num_accepted_tokens, sampled_log_probs
+
+    def _get_relaxed_acceptance_threshold(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: "SpecMetadata",
+        relaxed_delta_pool: torch.Tensor,
+        relaxed_topk: int = 10,
+        use_multiplicative_threshold: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._check_relaxed_acceptance_greedy_only(spec_metadata)
+
+        def get_topk(logits):
+            k = min(max(relaxed_topk, 1), logits.shape[-1])
+            if k == 1:
+                top_logit, top_index = torch.max(logits, dim=-1)
+                return top_logit, top_logit, top_index
+
+            topk_return = torch.topk(logits, k=k, dim=-1)
+            topk_logits = topk_return.values
+            topk_indices = topk_return.indices
+
+            kth_logit = topk_logits[..., -1]
+            top_logit = topk_logits[..., 0]
+            top_index = topk_indices[..., 0]
+            return kth_logit, top_logit, top_index
+
+        if use_multiplicative_threshold:
+            kth_logit, top_logit, top_index = get_topk(logits)
+            delta = relaxed_delta_pool
+            if delta.dim() == top_logit.dim() - 1:
+                delta = delta.unsqueeze(-1)
+            threshold = torch.maximum(top_logit + delta, kth_logit)
+
+            return threshold, logits, top_index, top_logit
+
+        probs = torch.softmax(logits, dim=-1)
+        kth_prob, top_prob, top_index = get_topk(probs)
+        delta = relaxed_delta_pool
+        if delta.dim() == top_prob.dim() - 1:
+            delta = delta.unsqueeze(-1)
+        threshold = torch.maximum(top_prob - delta, kth_prob)
+
+        return threshold, probs, top_index, top_prob
+
     def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
                              batch_size, spec_metadata):
         """

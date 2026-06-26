@@ -307,7 +307,8 @@ class Eagle3DraftModel(DecoderModel):
             self.hidden_size_in = config.hidden_size
 
         self._return_hidden_post_norm = eagle_config.get(
-            "return_hidden_post_norm", False)
+            "return_hidden_post_norm", False) or getattr(
+                config, "norm_output", False)
 
         # Create auxiliary CUDA stream for MLA operations (only needed for MLA)
         self.aux_stream = torch.cuda.Stream() if use_mla else None
@@ -329,6 +330,20 @@ class Eagle3DraftModel(DecoderModel):
             )
         else:
             self.input_norm = None
+
+        self.apply_fc_norm = getattr(config, "fc_norm", False)
+        if self.apply_fc_norm:
+            self.fc_norm = nn.ModuleList([
+                RMSNorm(
+                    hidden_size=self.hidden_size_in,
+                    eps=config.rms_norm_eps,
+                    dtype=config.torch_dtype,
+                ) for _ in range(self.spec_config.num_capture_layers)
+            ])
+        else:
+            self.fc_norm = None
+
+        self.num_capture_layers = self.spec_config.num_capture_layers
 
         if self.num_layers > 1:
             self.midlayer = nn.ModuleList([
@@ -590,11 +605,36 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
 
         expected_hidden_size = self.model.hidden_size
         if hidden_states.shape[-1] != expected_hidden_size:
-            if self.model._norm_before_fc:
+            if self.model.apply_fc_norm:
+                hidden_states = self.apply_fc_norm(hidden_states)
+            elif self.model._norm_before_fc:
                 hidden_states = self.model.input_norm(hidden_states)
             hidden_states = self.model.fc(hidden_states)
 
         return hidden_states
+
+    def apply_fc_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Eagle3.1 applies RMS norm to each captured hidden state separately
+        just before the FC layer.
+        """
+        num_capture_layers = self.model.num_capture_layers
+        hidden_size_in = self.model.hidden_size_in
+        expected_size = num_capture_layers * hidden_size_in
+        if hidden_states.shape[-1] != expected_size:
+            raise ValueError(
+                f"Hidden states shape {hidden_states.shape} does not match "
+                f"the expected fc_norm input size "
+                f"{num_capture_layers} * {hidden_size_in} = {expected_size}")
+
+        chunks = hidden_states.chunk(num_capture_layers, dim=-1)
+        return torch.cat(
+            [
+                norm(chunk.contiguous())
+                for norm, chunk in zip(self.model.fc_norm, chunks)
+            ],
+            dim=-1,
+        )
 
 
 class MistralLarge3DraftModel(DecoderModel):
@@ -1730,7 +1770,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
-    def forward(
+    def forward_target(
         self,
         attn_metadata: AttentionMetadata,
         input_ids: torch.LongTensor = None,
@@ -1740,7 +1780,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_metadata: Optional[SpecMetadata] = None,
         resource_manager=None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict]:
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1775,21 +1815,76 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)
 
-            # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=spec_input_ids,
-                                    position_ids=spec_position_ids,
-                                    hidden_states=hidden_states,
-                                    logits=logits,
-                                    attn_metadata=attn_metadata,
-                                    spec_metadata=spec_metadata,
-                                    draft_model=self.draft_model,
-                                    resource_manager=resource_manager)
-        else:
-            logits = self.logits_processor.forward(
-                hidden_states,
-                self.lm_head,
-                attn_metadata,
-                return_context_logits,
+            return logits, {
+                "hidden_states": hidden_states,
+                "spec_input_ids": spec_input_ids,
+                "spec_position_ids": spec_position_ids,
+            }
+
+        logits = self.logits_processor.forward(
+            hidden_states,
+            self.lm_head,
+            attn_metadata,
+            return_context_logits,
+        )
+
+        return logits, {}
+
+    def forward_draft(
+        self,
+        attn_metadata: AttentionMetadata,
+        logits: torch.Tensor,
+        spec_dict: Dict,
+        input_ids: torch.LongTensor = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = spec_dict.get("hidden_states", None)
+        spec_input_ids = spec_dict.get("spec_input_ids", input_ids)
+        spec_position_ids = spec_dict.get("spec_position_ids", position_ids)
+        return self.spec_worker(input_ids=spec_input_ids,
+                                position_ids=spec_position_ids,
+                                hidden_states=hidden_states,
+                                logits=logits,
+                                attn_metadata=attn_metadata,
+                                spec_metadata=spec_metadata,
+                                draft_model=self.draft_model,
+                                resource_manager=resource_manager)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        logits, spec_dict = self.forward_target(
+            attn_metadata=attn_metadata,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            return_context_logits=return_context_logits,
+            spec_metadata=spec_metadata,
+            resource_manager=resource_manager,
+            **kwargs,
+        )
+
+        if self.spec_worker is not None:
+            return self.forward_draft(
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                logits=logits,
+                spec_metadata=spec_metadata,
+                spec_dict=spec_dict,
+                resource_manager=resource_manager,
             )
 
         return logits

@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright 2025 Baseten
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
-
 from collections import OrderedDict
 
+import torch
+
+from tensorrt_llm._utils import prefer_pinned
 
 try:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -17,8 +18,7 @@ from ._sampling import resample
 
 
 def singleton(cls):
-    """
-    Decorator that makes a class a singleton using a metaclass.
+    """Decorator that makes a class a singleton using a metaclass.
 
     Usage:
         @singleton
@@ -30,7 +30,6 @@ def singleton(cls):
         b = B()
         result = B().some_func()  # calls the same function everywhere
     """
-
 
     class SingletonMeta(type):
         _instances = {}
@@ -45,7 +44,6 @@ def singleton(cls):
                 cls._instances[cls] = super().__call__()
             return getattr(cls._instances[cls], name)
 
-
     return SingletonMeta(cls.__name__, cls.__bases__, dict(cls.__dict__))
 
 
@@ -56,19 +54,19 @@ class _MetadataStore:
 
         torch.manual_seed(42)
 
-        self.temp_pinned = torch.empty(0, device="cpu", pin_memory=True)
-        self.top_p_pinned = torch.empty(0, device="cpu", pin_memory=True)
-        self.top_k_pinned = torch.empty(0, device="cpu", pin_memory=True)
+        self.temp_pinned = torch.empty(0, device="cpu", pin_memory=prefer_pinned())
+        self.top_p_pinned = torch.empty(0, device="cpu", pin_memory=prefer_pinned())
+        self.top_k_pinned = torch.empty(0, device="cpu", pin_memory=prefer_pinned())
 
     def get(self, request_ids: list[int]):
         temp, top_p, top_k = zip(*[self.metadata[request_id] for request_id in request_ids])
 
         if len(temp) > len(self.temp_pinned):
-            self.temp_pinned = torch.empty(len(temp), device="cpu", pin_memory=True)
+            self.temp_pinned = torch.empty(len(temp), device="cpu", pin_memory=prefer_pinned())
         if len(top_p) > len(self.top_p_pinned):
-            self.top_p_pinned = torch.empty(len(top_p), device="cpu", pin_memory=True)
+            self.top_p_pinned = torch.empty(len(top_p), device="cpu", pin_memory=prefer_pinned())
         if len(top_k) > len(self.top_k_pinned):
-            self.top_k_pinned = torch.empty(len(top_k), device="cpu", pin_memory=True)
+            self.top_k_pinned = torch.empty(len(top_k), device="cpu", pin_memory=prefer_pinned())
 
         self.temp_pinned[:len(temp)].copy_(torch.tensor(temp, dtype=torch.float32, device="cpu"), non_blocking=True)
         self.top_p_pinned[:len(top_p)].copy_(torch.tensor(top_p, dtype=torch.float32, device="cpu"), non_blocking=True)
@@ -96,14 +94,15 @@ def _get_temperature(request):
     if not request.sampling_config.temperature:
         return 0
 
-    if type(request.sampling_config.temperature) == float:
+    if isinstance(request.sampling_config.temperature, float):
         return request.sampling_config.temperature
 
-    if type(request.sampling_config.temperature) == list:
+    if isinstance(request.sampling_config.temperature, list):
         assert len(request.sampling_config.temperature) == 1
         return request.sampling_config.temperature[0]
 
     assert False, "Invalid temperature type"
+
 
 def _get_top_p(request):
     if not request.sampling_config:
@@ -112,14 +111,15 @@ def _get_top_p(request):
     if not request.sampling_config.top_p:
         return 1
 
-    if type(request.sampling_config.top_p) == float:
+    if isinstance(request.sampling_config.top_p, float):
         return request.sampling_config.top_p
 
-    if type(request.sampling_config.top_p) == list:
+    if isinstance(request.sampling_config.top_p, list):
         assert len(request.sampling_config.top_p) == 1
         return request.sampling_config.top_p[0]
 
     assert False, "Invalid top_p type"
+
 
 def _get_top_k(request):
     if not request.sampling_config:
@@ -128,14 +128,15 @@ def _get_top_k(request):
     if not request.sampling_config.top_k:
         return 50
 
-    if type(request.sampling_config.top_k) == int:
+    if isinstance(request.sampling_config.top_k, int):
         return request.sampling_config.top_k
 
-    if type(request.sampling_config.top_k) == list:
+    if isinstance(request.sampling_config.top_k, list):
         assert len(request.sampling_config.top_k) == 1
         return request.sampling_config.top_k[0]
 
     assert False, "Invalid top_k type"
+
 
 def store_sampling_metadata(request: LlmRequest):
     if not _MetadataStore().has(request.py_request_id):
@@ -151,7 +152,6 @@ def get_sampling_metadata(request_ids: list[int]):
     return _MetadataStore().get(request_ids)
 
 
-
 @torch.compile(options={"max-autotune": True})
 def apply_resampling(
     accepted_tokens: torch.Tensor,
@@ -165,11 +165,12 @@ def apply_resampling(
     extern_top_k: torch.Tensor,
     batch_indices_cuda: torch.Tensor,
 ):
-    """Baseten fast rejection sampling: resample the first generation token for
-    context requests (first token after context) and the first rejected draft
-    token for generation requests.
-    Writes accepted_tokens and num_accepted_tokens in place."""
+    """Baseten fast rejection sampling.
 
+    Resample the first generation token for context requests (first token after
+    context) and the first rejected draft token for generation requests.
+    Writes accepted_tokens and num_accepted_tokens in place.
+    """
     num_gens = num_seqs - num_contexts
 
     if num_contexts > 0:

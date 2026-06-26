@@ -1372,6 +1372,10 @@ class DecodingBaseConfig(StrictBaseModel):
         default=False,
         description="Enables Baseten fast rejection sampling.")
 
+    enable_training: bool = Field(
+        default=False,
+        description="Enables Baseten speculative decoding training support.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -2109,15 +2113,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "Auto-populated from the model's pretrained config. Do not set manually."
     )
 
-    begin_thinking_phase_token: NonNegativeInt = Field(
+    begin_thinking_phase_token: Optional[int] = Field(
         default=128798,
         description=
-        "Token ID marking start of thinking phase. Relaxed acceptance only applies within this phase."
+        "Token ID marking start of thinking phase. Relaxed acceptance only applies within this phase. "
+        "If None, relaxed acceptance is enabled from the start (default thinking)."
     )
-    end_thinking_phase_token: NonNegativeInt = Field(
+    end_thinking_phase_token: Optional[int] = Field(
         default=128799,
         description=
-        "Token ID marking end of thinking phase. Strict acceptance resumes after this."
+        "Token ID marking end of thinking phase. Strict acceptance resumes after this. "
+        "If None (together with begin_thinking_phase_token=None), relaxed acceptance is always on."
     )
 
     @model_validator(mode="before")

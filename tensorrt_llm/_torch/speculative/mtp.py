@@ -1,3 +1,4 @@
+import math
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -77,12 +78,35 @@ class MTPHiddenStatesManager(BaseResourceManager):
             dtype=torch.int,
         )
         if self.use_relaxed_acceptance_for_thinking:
-            # The relaxed_delta for relaxed acceptance
-            self.mtp_relaxed_delta_pool = torch.zeros(
-                (slot_pool_size),
+            self.default_thinking = False
+            self.always_thinking = False
+            if config.begin_thinking_phase_token is None:
+                self.default_thinking = True
+                if config.end_thinking_phase_token is None:
+                    self.always_thinking = True
+
+            self.raw_relaxed_delta = config.relaxed_delta
+            if config.multiplicative_relaxed_acceptance:
+                self.relaxed_delta = math.log(max(1e-4, self.raw_relaxed_delta))
+            else:
+                self.relaxed_delta = self.raw_relaxed_delta
+
+            initial_relaxed_delta = (self.relaxed_delta
+                                     if self.default_thinking else 0.0)
+            self.mtp_relaxed_delta_pool = torch.full(
+                (slot_pool_size, ),
+                initial_relaxed_delta,
                 dtype=torch.float,
                 device='cuda',
             )
+
+    def _reset_relaxed_delta(self, slot_id: int):
+        if not self.use_relaxed_acceptance_for_thinking:
+            return
+        if self.default_thinking:
+            self.mtp_relaxed_delta_pool[slot_id].fill_(self.relaxed_delta)
+        else:
+            self.mtp_relaxed_delta_pool[slot_id].fill_(0)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
@@ -90,25 +114,22 @@ class MTPHiddenStatesManager(BaseResourceManager):
         for req in context_batch:
             if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
-                if self.use_relaxed_acceptance_for_thinking:
-                    self.mtp_relaxed_delta_pool[slot_id].copy_(
-                        0, non_blocking=True)
+                self._reset_relaxed_delta(slot_id)
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
     def free_resources(self, request: LlmRequest):
         free_slot_id = self.slot_manager.get_slot(request.request_id)
-        if self.use_relaxed_acceptance_for_thinking:
-            self.mtp_relaxed_delta_pool[free_slot_id].copy_(0,
-                                                            non_blocking=True)
+        self._reset_relaxed_delta(free_slot_id)
         self.slot_manager.remove_slot(request.request_id)
         if self.sa_manager is not None:
             self.sa_manager.remove_request(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            self.slot_manager.add_slot(rid)
+            slot_id = self.slot_manager.add_slot(rid)
+            self._reset_relaxed_delta(slot_id)
         if self.sa_manager is not None:
             self.sa_manager.add_dummy_requests(request_ids)
 
@@ -841,6 +862,10 @@ class MTPWorker(SpecWorkerBase):
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
+        relaxed_resource_manager = None
+        relaxed_slot_ids = None
+        relaxed_delta_pool = None
+
         # The return buffer
         if self.spec_config.use_relaxed_acceptance_for_thinking or not self.is_thop:
             accepted_tokens = torch.ones((batch_size, (mtp_num_modules + 1)),
@@ -850,49 +875,32 @@ class MTPWorker(SpecWorkerBase):
                                              dtype=torch.int,
                                              device=logits.device)
         if self.spec_config.use_relaxed_acceptance_for_thinking:
-            mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
+            relaxed_resource_manager = spec_metadata.mtp_hidden_states_manager
+            if relaxed_resource_manager is None or not hasattr(
+                    relaxed_resource_manager, "mtp_relaxed_delta_pool"):
+                raise RuntimeError(
+                    "Relaxed acceptance requires an MTPHiddenStatesManager with "
+                    "a relaxed delta pool")
+            assert spec_metadata.slot_ids is not None
 
-            # context
-            con_logits = logits[:num_contexts]
-            con_target_tokens = torch.argmax(con_logits, dim=-1)
-            accepted_tokens[:num_contexts, 0] = con_target_tokens[:num_contexts]
-            last_tokens_idx = torch.cumsum(
-                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
-            ctx_is_think = (ctx_input_ids ==
-                            self.spec_config.begin_thinking_phase_token).int()
-            ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
-            ctx_last_cumsum = ctx_is_think_cumsum[
-                last_tokens_idx[:num_contexts]]
-            ctx_think_tokens_num = torch.diff(
-                ctx_last_cumsum,
-                dim=0,
-                prepend=torch.zeros(1,
-                                    dtype=torch.int,
-                                    device=ctx_last_cumsum.device))
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, mtp_num_modules)
+            relaxed_slot_ids = spec_metadata.slot_ids[:batch_size]
+            relaxed_delta_pool = (
+                relaxed_resource_manager.mtp_relaxed_delta_pool.index_select(
+                    0, relaxed_slot_ids))
 
-            ctx_delta = (ctx_think_tokens_num
-                         >= 1).int() * self.spec_config.relaxed_delta
-            ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
-            mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
-
-            # generation
-            gen_logprobs = self.process_generation_logits(logits, num_contexts)
-            topk_value, topk_indices, draft_tokens = self.topk_kernel(
-                gen_logprobs, num_gens, mtp_num_modules, spec_metadata)
-
-            accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
-                spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
-                mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
-                mtp_num_modules, batch_size, num_contexts,
-                self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
-                self.spec_config.begin_thinking_phase_token,
-                self.spec_config.end_thinking_phase_token)
-
-            # Apply force override for relaxed acceptance path
-            num_accepted_tokens = self._apply_force_accepted_tokens(
-                num_accepted_tokens, num_contexts,
-                spec_metadata.runtime_draft_len)
+            accepted_tokens, num_accepted_tokens, sampled_log_probs = (
+                self._relaxed_sample_and_accept_draft_tokens(
+                    logits,
+                    draft_tokens,
+                    num_contexts,
+                    batch_size,
+                    spec_metadata,
+                    relaxed_delta_pool[num_contexts:batch_size],
+                    self.spec_config.relaxed_topk,
+                    self.spec_config.multiplicative_relaxed_acceptance,
+                ))
 
         # Strict acceptance
         else:
@@ -944,10 +952,19 @@ class MTPWorker(SpecWorkerBase):
             num_accepted_tokens,
         )
 
-        if self.is_thop or self.spec_config.use_relaxed_acceptance_for_thinking:
-            sampled_log_probs = self._compute_log_probs_for_accepted_tokens(
-                logits, accepted_tokens, num_contexts, batch_size,
-                mtp_num_modules)
+        if self.spec_config.use_relaxed_acceptance_for_thinking:
+            relaxed_delta_pool = self._update_relaxed_acceptance_deltas(
+                relaxed_delta_pool,
+                accepted_tokens[:batch_size],
+                num_accepted_tokens[:batch_size],
+                relaxed_resource_manager.relaxed_delta,
+                self.spec_config.begin_thinking_phase_token,
+                self.spec_config.end_thinking_phase_token,
+            )
+            relaxed_resource_manager.mtp_relaxed_delta_pool.index_copy_(
+                0, relaxed_slot_ids, relaxed_delta_pool)
+        elif self.is_thop:
+            sampled_log_probs = None
 
         return accepted_tokens, num_accepted_tokens, sampled_log_probs
 

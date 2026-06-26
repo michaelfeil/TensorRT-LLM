@@ -22,6 +22,7 @@ from .interface import (SpecMetadata, SpecWorkerBase,
                         apply_one_model_fast_sampling_from_spec_metadata)
 from .mtp import MTPSampler, _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
+from .b10_hs_capture import trt_prepare_api
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
@@ -84,9 +85,25 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.use_relaxed_acceptance_for_thinking = getattr(
             config, 'use_relaxed_acceptance_for_thinking', False)
         if self.use_relaxed_acceptance_for_thinking:
-            self.relaxed_delta_pool = torch.zeros((slot_size, ),
-                                                  dtype=torch.float,
-                                                  device='cuda')
+            self.default_thinking = False
+            self.always_thinking = False
+            if config.begin_thinking_phase_token is None:
+                self.default_thinking = True
+                if config.end_thinking_phase_token is None:
+                    self.always_thinking = True
+
+            self.raw_relaxed_delta = config.relaxed_delta
+            if config.multiplicative_relaxed_acceptance:
+                self.relaxed_delta = math.log(max(1e-4, self.raw_relaxed_delta))
+            else:
+                self.relaxed_delta = self.raw_relaxed_delta
+
+            initial_relaxed_delta = (self.relaxed_delta
+                                     if self.default_thinking else 0.0)
+            self.relaxed_delta_pool = torch.full((slot_size, ),
+                                                 initial_relaxed_delta,
+                                                 dtype=torch.float,
+                                                 device='cuda')
         # start indices of each slot
         self.start_indices = {i: 0 for i in range(slot_size)}
         # whether the next draft forward is the first
@@ -105,6 +122,14 @@ class Eagle3ResourceManager(BaseResourceManager):
                 dynamic_tree_max_topK=config.dynamic_tree_max_topK,
             )
 
+    def _reset_relaxed_delta(self, slot_id: int):
+        if not self.use_relaxed_acceptance_for_thinking:
+            return
+        if self.default_thinking:
+            self.relaxed_delta_pool[slot_id].fill_(self.relaxed_delta)
+        else:
+            self.relaxed_delta_pool[slot_id].fill_(0)
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
         # allocate hidden state tensors and update slot ids
@@ -113,8 +138,7 @@ class Eagle3ResourceManager(BaseResourceManager):
             if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 self.slot_ids.append(slot_id)
-                if self.use_relaxed_acceptance_for_thinking:
-                    self.relaxed_delta_pool[slot_id].fill_(0)
+                self._reset_relaxed_delta(slot_id)
         # reset the flag before model forward
         self.is_first_draft = True
 
@@ -125,15 +149,15 @@ class Eagle3ResourceManager(BaseResourceManager):
         slot_id = self.slot_manager.get_slot(request.request_id)
         self.seq_lens[slot_id] = 0
         self.start_indices[slot_id] = 0
-        if self.use_relaxed_acceptance_for_thinking:
-            self.relaxed_delta_pool[slot_id].fill_(0)
+        self._reset_relaxed_delta(slot_id)
         self.slot_manager.remove_slot(request.request_id)
         if self.sa_manager is not None:
             self.sa_manager.remove_request(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            self.slot_manager.add_slot(rid)
+            slot_id = self.slot_manager.add_slot(rid)
+            self._reset_relaxed_delta(slot_id)
         if self.sa_manager is not None:
             self.sa_manager.add_dummy_requests(request_ids)
 
@@ -399,6 +423,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     subseq_all_rank_num_tokens: Optional[List[int]] = None
     # From DecodingBaseConfig; allocates Baseten fast rejection sampling buffers when supported.
     enable_fast_sampling: bool = False
+    hs_capture_enabled: bool = False
+    # From DecodingBaseConfig; enables training support for spec decode models.
+    enable_training: bool = False
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -494,6 +521,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             self.is_spec_dec_tree = False
             self.is_spec_dec_dynamic_tree = False
 
+        self.offloader_hidden_states = None
+        self.offloader_target_hidden_states = None
+        self.offloader_input_ids = None
+        self.offloader_position_ids = None
+        if self.hs_capture_enabled:
+            trt_prepare_api().alloc_capture_buffers(self)
+
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
@@ -542,6 +576,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             if gen_request_ids:
                 sa_manager.prepare(gen_request_ids, self.max_draft_len)
         _prepare_fast_sampling_metadata(self)
+        if self.hs_capture_enabled:
+            trt_prepare_api().prepare(self)
 
     def maybe_capture_hidden_states(
             self,
@@ -551,11 +587,29 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
         for i, captured_layer_id in enumerate(self.layers_to_capture):
             if captured_layer_id == layer_id:
+                num_tokens = hidden_states.shape[0]
                 to_save = hidden_states + residual if residual is not None else hidden_states
+                hidden_start = i * self.hidden_size
+                hidden_end = hidden_start + self.hidden_size
+                hidden_slice = slice(hidden_start, hidden_end)
                 inplace_slice_copy(self.hidden_states, to_save,
-                                   i * self.hidden_size,
-                                   (i + 1) * self.hidden_size)
+                                   hidden_start, hidden_end)
+
+                offloader_hidden_states = getattr(self,
+                                                  'offloader_hidden_states',
+                                                  None)
+                if offloader_hidden_states is not None:
+                    offloader_hidden_states[:, :num_tokens,
+                                            hidden_slice].index_copy_(
+                                                0,
+                                                self.hidden_idx_cuda,
+                                                to_save.unsqueeze(0),
+                                            )
                 break
+
+    def __del__(self):
+        if hasattr(self, 'offloader_hidden_states'):
+            del self.offloader_hidden_states
 
 
 class Eagle3OneModelSampler(MTPSampler):
@@ -679,6 +733,29 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
+
+        if (off_input_ids := getattr(spec_metadata, 'offloader_input_ids',
+                                     None)) is not None:
+            n = input_ids.shape[0]
+            off_input_ids[:, :n].index_copy_(0, spec_metadata.hidden_idx_cuda,
+                                             input_ids.unsqueeze(0))
+
+        position_ids_1d = position_ids.squeeze(0)
+
+        if (off_position_ids := getattr(spec_metadata, 'offloader_position_ids',
+                                        None)) is not None:
+            n = position_ids_1d.shape[0]
+            off_position_ids[:, :n].index_copy_(0,
+                                                spec_metadata.hidden_idx_cuda,
+                                                position_ids_1d.unsqueeze(0))
+
+        if (off_target_hidden_states :=
+                getattr(spec_metadata, 'offloader_target_hidden_states',
+                        None)) is not None:
+            n = hidden_states.shape[0]
+            off_target_hidden_states[:, :n].index_copy_(
+                0, spec_metadata.hidden_idx_cuda, hidden_states.unsqueeze(0))
+
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
             return self.skip_drafting(input_ids, position_ids, hidden_states,
@@ -1127,64 +1204,35 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         if getattr(self.spec_config, 'use_relaxed_acceptance_for_thinking',
                    False):
-            # Relaxed acceptance — common path for Eagle3 and MTP Eagle.
-            # Accepts draft tokens that fall within the top-K candidates of the
-            # target distribution during the thinking phase.
             if logits.dim() == 1:
                 logits = logits.unsqueeze(0)
 
-            accepted_tokens = torch.ones((batch_size, runtime_draft_len + 1),
-                                         dtype=torch.int,
-                                         device=logits.device)
-            num_accepted_tokens = torch.ones(batch_size,
-                                             dtype=torch.int,
-                                             device=logits.device)
-
             resource_manager = spec_metadata.spec_resource_manager
-            relaxed_delta_pool = resource_manager.relaxed_delta_pool
+            if resource_manager is None or not hasattr(resource_manager,
+                                                       "relaxed_delta_pool"):
+                raise RuntimeError(
+                    "Relaxed acceptance requires an Eagle3ResourceManager with "
+                    "a relaxed delta pool")
+            assert spec_metadata.slot_ids is not None
 
-            # Context phase: detect thinking tokens and update the delta pool
-            con_logits = logits[:num_contexts]
-            con_target_tokens = torch.argmax(con_logits, dim=-1)
-            accepted_tokens[:num_contexts, 0] = con_target_tokens[:num_contexts]
-            last_tokens_idx_for_thinking = torch.cumsum(
-                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
-            ctx_is_think = (ctx_input_ids ==
-                            self.spec_config.begin_thinking_phase_token).int()
-            ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
-            ctx_last_cumsum = ctx_is_think_cumsum[
-                last_tokens_idx_for_thinking[:num_contexts]]
-            ctx_think_tokens_num = torch.diff(
-                ctx_last_cumsum,
-                dim=0,
-                prepend=torch.zeros(1,
-                                    dtype=torch.int,
-                                    device=ctx_last_cumsum.device))
-            ctx_delta = (ctx_think_tokens_num
-                         >= 1).int() * self.spec_config.relaxed_delta
-            ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
-            relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, runtime_draft_len) if num_gens > 0 else torch.empty(
+                    0, runtime_draft_len, dtype=torch.int, device=logits.device)
+            slot_ids = spec_metadata.slot_ids[:batch_size]
+            relaxed_delta_pool = resource_manager.relaxed_delta_pool.index_select(
+                0, slot_ids)
 
-            # Generation phase: top-k logprobs + relaxed acceptance op
-            gen_logprobs = self._process_generation_logits(logits, num_contexts)
-            topk_value, topk_indices, draft_tokens = self._topk_kernel(
-                gen_logprobs, num_gens, runtime_draft_len, spec_metadata)
-
-            accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
-                spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
-                relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
-                runtime_draft_len, batch_size, num_contexts,
-                self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
-                self.spec_config.begin_thinking_phase_token,
-                self.spec_config.end_thinking_phase_token)
-
-            num_accepted_tokens = self._apply_force_accepted_tokens(
-                num_accepted_tokens, num_contexts, runtime_draft_len)
-
-            sampled_log_probs = self._compute_log_probs_for_accepted_tokens(
-                logits, accepted_tokens, num_contexts, batch_size,
-                runtime_draft_len)
+            accepted_tokens, num_accepted_tokens, sampled_log_probs = (
+                self._relaxed_sample_and_accept_draft_tokens(
+                    logits,
+                    draft_tokens,
+                    num_contexts,
+                    batch_size,
+                    spec_metadata,
+                    relaxed_delta_pool[num_contexts:batch_size],
+                    self.spec_config.relaxed_topk,
+                    self.spec_config.multiplicative_relaxed_acceptance,
+                ))
 
             apply_one_model_fast_sampling_from_spec_metadata(
                 spec_metadata,
@@ -1196,6 +1244,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 accepted_tokens,
                 num_accepted_tokens,
             )
+
+            relaxed_delta_pool = self._update_relaxed_acceptance_deltas(
+                relaxed_delta_pool,
+                accepted_tokens[:batch_size],
+                num_accepted_tokens[:batch_size],
+                resource_manager.relaxed_delta,
+                self.spec_config.begin_thinking_phase_token,
+                self.spec_config.end_thinking_phase_token,
+            )
+            resource_manager.relaxed_delta_pool.index_copy_(
+                0, slot_ids, relaxed_delta_pool)
 
             return accepted_tokens, num_accepted_tokens, sampled_log_probs
 

@@ -2296,6 +2296,9 @@ def create_torch_sampler_args(
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
                               speculative_config.tokens_per_gen_step - 1)
+    block_size = (speculative_config.block_size if
+                  (speculative_config is not None
+                   and speculative_config.spec_dec_mode.is_dflash()) else None)
 
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
@@ -2307,6 +2310,7 @@ def create_torch_sampler_args(
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
+        block_size=block_size,
     )
 
 

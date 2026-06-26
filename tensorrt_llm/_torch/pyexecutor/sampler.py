@@ -2350,6 +2350,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         disable_flashinfer_sampling: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
+        # DFlash block size.
+        block_size: int | None = None
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len

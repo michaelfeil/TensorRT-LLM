@@ -70,7 +70,8 @@ from .kv_cache_transceiver import BindKvCacheTransceiver, KvCacheTransceiver
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length)
+                          get_draft_token_length,
+                          get_spec_decode_token_counts)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -4925,11 +4926,14 @@ class PyExecutor:
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
             dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+            draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(

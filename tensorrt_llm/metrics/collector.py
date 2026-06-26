@@ -451,6 +451,42 @@ class MetricsCollector:
             buckets=[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0],
             labelnames=self.labels.keys())
 
+        self.histogram_avg_decoded_tokens_per_iter = Histogram(
+            name=self.metric_prefix + "avg_decoded_tokens_per_iter",
+            documentation="Histogram of average decoded tokens per iteration.",
+            buckets=[
+                0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0
+            ],
+            labelnames=self.labels.keys())
+
+        self.histogram_input_tokens = Histogram(
+            name=self.metric_prefix + "input_tokens",
+            documentation="Histogram of number of input tokens per request.",
+            buckets=[
+                1, 10, 50, 100, 200, 500, 1000, 2000, 4000, 8000, 16000, 32000,
+                64000, 128000, 256000, 512000, 1000000
+            ],
+            labelnames=self.labels.keys())
+
+        self.histogram_output_tokens = Histogram(
+            name=self.metric_prefix + "output_tokens",
+            documentation="Histogram of number of output tokens per request.",
+            buckets=[
+                1, 10, 50, 100, 200, 500, 1000, 2000, 4000, 8000, 16000, 32000,
+                64000, 128000, 256000, 512000, 1000000
+            ],
+            labelnames=self.labels.keys())
+
+        self.histogram_cached_tokens = Histogram(
+            name=self.metric_prefix + "cached_tokens",
+            documentation="Histogram of number of cached tokens per request.",
+            buckets=[
+                1, 10, 50, 100, 200, 500, 1000, 2000, 4000, 8000, 16000, 32000,
+                64000, 128000, 256000, 512000, 1000000
+            ],
+            labelnames=self.labels.keys())
+
         # Prefill batch occupancy / context token distribution
         self.gauge_prefill_batch_occupancy = Gauge(
             name=self.metric_prefix + "prefill_batch_occupancy",
@@ -648,6 +684,17 @@ class MetricsCollector:
             if gen_ppl is not None and math.isfinite(gen_ppl):
                 self._log_histogram(self.histogram_generation_perplexity,
                                     gen_ppl)
+            if avg_decoded_tokens_per_iter := metrics_dict.get(
+                    MetricNames.AVG_DECODED_TOKENS_PER_ITER, 0):
+                self._log_histogram(
+                    self.histogram_avg_decoded_tokens_per_iter,
+                    avg_decoded_tokens_per_iter)
+            if input_tokens := metrics_dict.get(MetricNames.INPUT_TOKENS, 0):
+                self._log_histogram(self.histogram_input_tokens, input_tokens)
+            if output_tokens := metrics_dict.get(MetricNames.OUTPUT_TOKENS, 0):
+                self._log_histogram(self.histogram_output_tokens, output_tokens)
+            if cached_tokens := metrics_dict.get(MetricNames.CACHED_TOKENS, 0):
+                self._log_histogram(self.histogram_cached_tokens, cached_tokens)
 
             self.last_log_time = time.time()
 

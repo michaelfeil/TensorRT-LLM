@@ -355,6 +355,9 @@ class KVCacheManager(BaseResourceManager):
         self.max_total_draft_tokens = (spec_config.tokens_per_gen_step -
                                        1) if spec_config is not None else 0
         self.linear_attention_metadata = linear_attention_metadata
+        self.dflash_block_size = (
+            spec_config.block_size if spec_config is not None
+            and spec_config.spec_dec_mode.is_dflash() else None)
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.kv_cache_pool_pointers = None
@@ -871,7 +874,14 @@ class KVCacheManager(BaseResourceManager):
                         continue
                 draft_len = get_draft_token_length(req)
                 self.impl.add_token(req.py_request_id)
-                for _ in range(max(draft_len, self._kv_reserve_draft_tokens)):
+                extra_len_for_draft = max(draft_len,
+                                          self._kv_reserve_draft_tokens)
+                if self.dflash_block_size is not None:
+                    assert draft_len <= self.dflash_block_size
+                    extra_len_for_draft = max(
+                        self.dflash_block_size,
+                        self._kv_reserve_draft_tokens)
+                for _ in range(extra_len_for_draft):
                     self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching

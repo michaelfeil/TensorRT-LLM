@@ -123,6 +123,7 @@ def get_spec_metadata(spec_config,
             use_dynamic_tree=spec_config.use_dynamic_tree,
             eagle_choices=spec_config.eagle_choices,
             enable_fast_sampling=spec_config.enable_fast_sampling,
+            enable_training=spec_config.enable_training,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(
