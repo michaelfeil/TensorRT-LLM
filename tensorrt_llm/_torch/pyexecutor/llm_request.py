@@ -622,7 +622,8 @@ class LlmResult:
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
                  py_result: PyResult,
                  is_final: bool = False,
-                 time_breakdown_metrics: Optional[Dict] = None):
+                 time_breakdown_metrics: Optional[Dict] = None,
+                 spec_decode_stats: Optional[Dict[str, int]] = None):
         self._result = result
         self._py_result = py_result
         self.is_final = is_final
@@ -633,6 +634,7 @@ class LlmResult:
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
+        self.spec_decode_stats = spec_decode_stats
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
@@ -775,6 +777,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
+        self.py_total_spec_decode_num_draft_tokens = 0
+        self.py_total_spec_decode_num_accepted_tokens = 0
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
@@ -980,13 +984,21 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
+        spec_decode_stats = None
+        if self.py_total_spec_decode_num_draft_tokens > 0:
+            spec_decode_stats = {
+                "num_draft_tokens": self.py_total_spec_decode_num_draft_tokens,
+                "num_accepted_tokens": self.py_total_spec_decode_num_accepted_tokens,
+            }
+
         return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,
             result=LlmResult(result,
                              py_result,
                              is_final,
-                             time_breakdown_metrics=time_breakdown_metrics),
+                             time_breakdown_metrics=time_breakdown_metrics,
+                             spec_decode_stats=spec_decode_stats),
             client_id=self.py_client_id) if len(result) > 0 else None
 
     @property
@@ -1303,3 +1315,12 @@ def get_draft_token_length(request: LlmRequest) -> int:
     if request.py_draft_tokens is not None:
         return len(request.py_draft_tokens)
     return 0
+
+
+def get_spec_decode_token_counts(request: LlmRequest) -> tuple[int, int]:
+    """Extract per-iteration spec decode counts from pyexecutor request state."""
+    draft_len = request.num_draft_tokens
+    if draft_len == 0:
+        return 0, 0
+
+    return draft_len, request.py_num_accepted_draft_tokens

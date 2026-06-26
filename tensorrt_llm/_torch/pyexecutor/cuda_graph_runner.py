@@ -112,6 +112,7 @@ class CUDAGraphRunner:
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
+        self.graph_capture_inputs: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
         self.padding_dummy_requests: Dict[int, "Request"] = {}
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
@@ -408,6 +409,7 @@ class CUDAGraphRunner:
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
+        self.graph_capture_inputs[key] = capture_inputs
         self.memory_pool = graph.pool()
 
     def replay(self, key: KeyType,
@@ -576,6 +578,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self.graph_capture_inputs.clear()
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None

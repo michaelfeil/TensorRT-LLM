@@ -13,7 +13,9 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import (SpecMetadata, SpecWorkerBase,
+                        _prepare_fast_sampling_metadata,
+                        apply_one_model_fast_sampling_from_spec_metadata)
 from .sa_enhancer import SADraftEnhancer
 from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
 
@@ -142,6 +144,8 @@ class MTPSpecMetadata(SpecMetadata):
     # CUDA graph, we use this tensor to store the number of input tokens for the
     # subsequent draft forward.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
+    # From DecodingBaseConfig; allocates Baseten fast rejection sampling buffers when supported.
+    enable_fast_sampling: bool = False
 
     def __post_init__(self) -> None:
         if self.mtp_hidden_states_manager is not None:
@@ -171,6 +175,23 @@ class MTPSpecMetadata(SpecMetadata):
             self.mtp_num_modules,
             device='cuda',
         )
+        if (self.enable_fast_sampling
+                and self.spec_dec_mode.supports_fast_sampling()):
+            self.extern_temperature = torch.zeros(
+                (self.max_num_requests, ),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            self.extern_top_p = torch.zeros(
+                (self.max_num_requests, ),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            self.extern_top_k = torch.zeros(
+                (self.max_num_requests, ),
+                device="cuda",
+                dtype=torch.int32,
+            )
 
     @property
     def all_rank_num_seqs(self):
@@ -239,6 +260,10 @@ class MTPSpecMetadata(SpecMetadata):
             gen_request_ids = self.request_ids[num_contexts:]
             if gen_request_ids:
                 sa_manager.prepare(gen_request_ids, self.max_draft_len)
+
+        # Baseten fast rejection sampling: sync extern tensors from store
+        _prepare_fast_sampling_metadata(self)
+
 
 
 class MTPSampler(SpecSamplerBase):
@@ -907,6 +932,17 @@ class MTPWorker(SpecWorkerBase):
                 num_contexts=num_contexts,
                 max_draft_len=mtp_num_modules,
             )
+
+        apply_one_model_fast_sampling_from_spec_metadata(
+            spec_metadata,
+            self.spec_config.enable_fast_sampling,
+            batch_size,
+            num_contexts,
+            spec_metadata.runtime_draft_len,
+            logits,
+            accepted_tokens,
+            num_accepted_tokens,
+        )
 
         if self.is_thop or self.spec_config.use_relaxed_acceptance_for_thinking:
             sampled_log_probs = self._compute_log_probs_for_accepted_tokens(

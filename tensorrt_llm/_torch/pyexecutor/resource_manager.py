@@ -26,6 +26,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DEFAULT_BEAM_INDEX
 
 # isort: off
 # isort: on
@@ -1159,13 +1160,13 @@ class KVCacheManager(BaseResourceManager):
         if reusable_tokens_cap == 0:
             return 0
 
-        new_context_block = self.impl.find_new_context_block(
-            unique_tokens, request)
-        if new_context_block is None:
-            return reusable_tokens_cap
+        analyze_prefix_reuse = getattr(self.impl, "analyze_prefix_reuse", None)
+        if analyze_prefix_reuse is None:
+            return 0
 
-        return max(
-            len(new_context_block.unique_tokens) - self.tokens_per_block, 0)
+        summary = analyze_prefix_reuse(unique_tokens, request)
+        return min(summary.reusable_blocks_all * self.tokens_per_block,
+                   reusable_tokens_cap)
 
     @staticmethod
     def calculate_scaling_factor_size_bytes(

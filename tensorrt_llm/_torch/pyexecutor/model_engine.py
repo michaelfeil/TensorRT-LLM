@@ -14,6 +14,7 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+import tensorrt_llm.one_model_sampling as one_model_sampling
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
@@ -4492,6 +4493,9 @@ class PyTorchModelEngine(ModelEngine):
                                                request.get_tokens(0))
                         sa_manager._initialized_requests.add(
                             request.py_request_id)
+
+        for request in scheduled_requests.all_requests():
+            one_model_sampling.store_sampling_metadata(request)
 
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,

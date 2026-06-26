@@ -25,6 +25,7 @@ import torch
 from packaging.version import Version
 from torch import nn
 
+import tensorrt_llm.one_model_sampling as one_model_sampling
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
@@ -318,6 +319,10 @@ class SpeculativeDecodingMode(IntEnum):
         # TODO: expand to all one-model algorithms
         return self.is_eagle3_one_model() or self.is_mtp_eagle_one_model()
 
+    def supports_fast_sampling(self) -> bool:
+        """Whether this decoding mode supports Baseten fast rejection sampling."""
+        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
 
@@ -482,6 +487,10 @@ class SpecMetadata:
     request_temperatures: Optional[torch.Tensor] = None
     request_top_ks: Optional[torch.Tensor] = None
     request_top_ps: Optional[torch.Tensor] = None
+    # Baseten fast rejection sampling: per-sequence extern temperature / top-p / top-k.
+    extern_temperature: Optional[torch.Tensor] = None
+    extern_top_p: Optional[torch.Tensor] = None
+    extern_top_k: Optional[torch.Tensor] = None
     # Whether to use sampling parameters when sampling draft tokens.
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
@@ -840,6 +849,73 @@ class SpecMetadata:
         _disable_topk = torch.iinfo(torch.int32).max
         self.top_k_max = max(
             (tk for tk in request_top_ks if 0 < tk < _disable_topk), default=0)
+
+
+def _prepare_fast_sampling_metadata(spec_metadata: SpecMetadata) -> None:
+    """Sync per-request sampling params from the one_model_sampling store into
+    ``spec_metadata.extern_*``"""
+    if spec_metadata.extern_temperature is None:
+        return
+
+    assert spec_metadata.extern_top_p is not None
+    assert spec_metadata.extern_top_k is not None
+    assert spec_metadata.request_ids is not None
+
+    num_seqs = len(spec_metadata.request_ids)
+    temp, top_p, top_k = one_model_sampling.get_sampling_metadata(
+        spec_metadata.request_ids[:num_seqs])
+    assert temp.is_pinned() and top_p.is_pinned() and top_k.is_pinned()
+
+    spec_metadata.extern_temperature[:num_seqs].copy_(
+        temp,
+        non_blocking=True,
+    )
+    spec_metadata.extern_top_p[:num_seqs].copy_(
+        top_p,
+        non_blocking=True,
+    )
+    spec_metadata.extern_top_k[:num_seqs].copy_(
+        top_k,
+        non_blocking=True,
+    )
+
+
+def apply_one_model_fast_sampling_from_spec_metadata(
+    spec_metadata: SpecMetadata,
+    enable_fast_sampling: bool,
+    batch_size: int,
+    num_contexts: int,
+    draft_len: int,
+    logits: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+) -> None:
+    """
+    Applies Baseten fast rejection sampling in place (via ``one_model_sampling``).
+    Extern tensors must already be populated by ``prepare()``.
+    Invoked from MTP and Eagle3 one-model workers only.
+    """
+    if not enable_fast_sampling or not spec_metadata.spec_dec_mode.supports_fast_sampling(
+    ):
+        return
+    if spec_metadata.extern_temperature is None:
+        return
+    assert spec_metadata.extern_top_p is not None
+    assert spec_metadata.extern_top_k is not None
+    batch_indices_cuda = getattr(spec_metadata, "batch_indices_cuda", None)
+    assert batch_indices_cuda is not None
+    one_model_sampling.apply_resampling(
+        accepted_tokens,
+        num_accepted_tokens,
+        batch_size,
+        num_contexts,
+        draft_len,
+        logits,
+        spec_metadata.extern_temperature,
+        spec_metadata.extern_top_p,
+        spec_metadata.extern_top_k,
+        batch_indices_cuda,
+    )
 
 
 class SpecWorkerBase(nn.Module, ABC):

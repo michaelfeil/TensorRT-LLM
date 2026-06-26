@@ -41,6 +41,8 @@ from ..pyexecutor.sampler import (
 )
 from ..pyexecutor.scheduler import ScheduledRequests
 
+from .b10_hs_capture import trt_prepare_api, is_setup as is_hs_capture_setup
+
 _DYNAMIC_TEMPERATURE_PAD_TOKEN = -1
 
 
@@ -483,6 +485,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.mapping = None
         self.draft_len = draft_len
         self.max_seq_len = args.max_seq_len
+        self.block_size: None | int = getattr(args, "block_size", None)
 
         seq_slots = args.max_num_sequences
         max_tokens = self._get_max_tokens(args, draft_len)
@@ -584,7 +587,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """
         assert isinstance(state, SampleStateSpec)
 
-        state.sampler_event.synchronize()
+        if is_hs_capture_setup():
+            trt_prepare_api().work_until(lambda: state.sampler_event.query())
+        else:
+            state.sampler_event.synchronize()
+
         self.finalize_sample_state_for_next_forward(state)
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
@@ -613,7 +620,13 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             if simple_logprobs:
                 req.py_result.append_log_probs([simple_logprobs])
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+
+            last_draft_len = runtime_draft_len
+            if self.block_size is not None:
+                assert last_draft_len <= self.block_size
+                last_draft_len = self.block_size
+
+            req.py_rewind_len = last_draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def finalize_sample_state_for_next_forward(self, state: SampleStateSpec) -> None:

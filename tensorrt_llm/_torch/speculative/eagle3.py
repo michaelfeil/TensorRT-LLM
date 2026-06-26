@@ -17,7 +17,9 @@ from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import (SpecMetadata, SpecWorkerBase,
+                        _prepare_fast_sampling_metadata,
+                        apply_one_model_fast_sampling_from_spec_metadata)
 from .mtp import MTPSampler, _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -395,6 +397,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # for the first loop iteration and per-sequence token counts for
     # subsequent iterations.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
+    # From DecodingBaseConfig; allocates Baseten fast rejection sampling buffers when supported.
+    enable_fast_sampling: bool = False
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -461,6 +465,23 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             dtype=torch.long,
             device='cuda',
         )
+        if (self.enable_fast_sampling
+                and self.spec_dec_mode.supports_fast_sampling()):
+            self.extern_temperature = torch.zeros(
+                (self.max_num_requests, ),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            self.extern_top_p = torch.zeros(
+                (self.max_num_requests, ),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            self.extern_top_k = torch.zeros(
+                (self.max_num_requests, ),
+                device="cuda",
+                dtype=torch.int32,
+            )
 
         # Set tree flags based on config
         if self.use_dynamic_tree:
@@ -520,6 +541,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             gen_request_ids = self.request_ids[num_seqs - self.num_generations:]
             if gen_request_ids:
                 sa_manager.prepare(gen_request_ids, self.max_draft_len)
+        _prepare_fast_sampling_metadata(self)
 
     def maybe_capture_hidden_states(
             self,
@@ -1164,6 +1186,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 logits, accepted_tokens, num_contexts, batch_size,
                 runtime_draft_len)
 
+            apply_one_model_fast_sampling_from_spec_metadata(
+                spec_metadata,
+                self.spec_config.enable_fast_sampling,
+                batch_size,
+                num_contexts,
+                runtime_draft_len,
+                logits,
+                accepted_tokens,
+                num_accepted_tokens,
+            )
+
             return accepted_tokens, num_accepted_tokens, sampled_log_probs
 
         # Strict acceptance — common path for Eagle3 and MTP Eagle. Both modes
@@ -1173,8 +1206,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, runtime_draft_len) if num_gens > 0 else torch.empty(
                 0, runtime_draft_len, dtype=torch.int, device=logits.device)
-        return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
-                                         batch_size, spec_metadata)
+        accepted_tokens, num_accepted_tokens, sampled_log_probs = (
+            self._accept_draft_tokens(logits, draft_tokens, num_contexts,
+                                      batch_size, spec_metadata))
+        apply_one_model_fast_sampling_from_spec_metadata(
+            spec_metadata,
+            self.spec_config.enable_fast_sampling,
+            batch_size,
+            num_contexts,
+            runtime_draft_len,
+            logits,
+            accepted_tokens,
+            num_accepted_tokens,
+        )
+        return accepted_tokens, num_accepted_tokens, sampled_log_probs
 
     def draft_decoder(
         self,

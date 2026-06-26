@@ -61,6 +61,7 @@ def get_spec_metadata(spec_config,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
+            enable_fast_sampling=spec_config.enable_fast_sampling,
         )
     if spec_config.spec_dec_mode.is_mtp_vanilla():
         return MTPSpecMetadata(
@@ -70,6 +71,7 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.max_draft_len,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
+            enable_fast_sampling=spec_config.enable_fast_sampling,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
@@ -120,6 +122,7 @@ def get_spec_metadata(spec_config,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=spec_config.use_dynamic_tree,
             eagle_choices=spec_config.eagle_choices,
+            enable_fast_sampling=spec_config.enable_fast_sampling,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(

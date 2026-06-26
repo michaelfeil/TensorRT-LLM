@@ -389,7 +389,7 @@ class AttentionMetadata:
         return cuda_graph_metadata
 
     def prepare_for_spec_dec(self, *fields) -> None:
-        assert len(self._saved_tensors) == 0
+        self._saved_tensors.clear()
         for f in fields:
             v = getattr(self, f)
             assert isinstance(v, torch.Tensor)

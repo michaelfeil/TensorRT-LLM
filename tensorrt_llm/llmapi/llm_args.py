@@ -1368,6 +1368,10 @@ class DecodingBaseConfig(StrictBaseModel):
         "in a future release. Non-greedy sampling is now auto-detected per "
         "request; this flag no longer has any effect.")
 
+    enable_fast_sampling: bool = Field(
+        default=False,
+        description="Enables Baseten fast rejection sampling.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -4870,6 +4874,15 @@ class TorchLlmArgs(BaseLlmArgs):
                 # so new spec algorithms get rejection sampling for free; once
                 # all paths are covered this whitelist guard can be removed.
                 self.speculative_config.use_rejection_sampling = False
+
+            if (self.speculative_config.enable_fast_sampling
+                    and not self.speculative_config.spec_dec_mode
+                    .supports_fast_sampling()):
+                raise ValueError(
+                    f"enable_fast_sampling is not supported for decoding type "
+                    f"'{self.speculative_config.decoding_type}'. Only MTP "
+                    f"one-model and Eagle3 one-model modes support Baseten "
+                    f"fast rejection sampling.")
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
