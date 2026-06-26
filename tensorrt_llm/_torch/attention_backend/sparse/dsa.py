@@ -72,6 +72,7 @@ class DSAMetadataParams(SparseMetadataParams):
     enable_heuristic_topk: bool
     use_cute_dsl_paged_mqa_logits: bool
     q_split_threshold: int
+    index_share_for_mtp_iteration: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,8 @@ class DSAParams(SparseParams):
     indexer_rope_interleave: bool = False
     enable_heuristic_topk: bool = False
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
+    is_full_indexer_layer: bool = True
+    index_share_for_mtp_iteration: bool = False
 
     @property
     def indices_block_size(self) -> int:
@@ -497,6 +500,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     skip_indexer_for_gen_reqs: bool = False
     # Whether to use the expanded buffers for MTP support
     use_expanded_buffers_for_mtp: bool = False
+    # Previous full layer's TopK for cross-layer DSA indexer sharing.
+    shared_topk_indices: Optional[torch.Tensor] = None
+    # Whether MTP draft iterations after the first reuse TopK indices.
+    index_share_for_mtp_iteration: bool = False
+    # Runtime flags controlled by MTP loops for shared TopK indices.
+    reuse_dsa_topk_indices: bool = False
+    cache_dsa_topk_indices: bool = False
+    require_dsa_topk_indices: bool = False
+    has_shared_dsa_topk_indices: bool = False
     # Whether to reshape the DSL paged MQA logits Q tensor into a kernel-
     # supported `effective_next_n` via caller-side atom-split (FP4: {1,2,3};
     # FP8: {1,2,3,4}; see `_pick_dsl_expand`). Reuses
@@ -546,6 +558,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             raise ValueError("DSA sparse attention metadata params are not set")
         self.num_sparse_topk = sparse_metadata_params.max_sparse_topk
         self.enable_indexer_skip = (sparse_metadata_params.enable_indexer_skip)
+        self.index_share_for_mtp_iteration = (
+            sparse_metadata_params.index_share_for_mtp_iteration)
         capture_graph = self.is_cuda_graph
 
         self.indexer_k_cache_block_offsets = self.get_empty(
@@ -703,8 +717,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # Topk indices buffer to support skip indexer for requests with short sequence lengths
-        if self.enable_indexer_skip:
+        # Topk indices buffer supports short-sequence dense fallback and MTP
+        # draft-iteration index sharing.
+        if self.enable_indexer_skip or self.index_share_for_mtp_iteration:
             self.topk_indices_buffer = self.get_empty(
                 self.cuda_graph_buffers,
                 (self.max_num_tokens, self.num_sparse_topk),
@@ -988,6 +1003,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
         self._invalidate_pool_view_cache()
+        self.shared_topk_indices = None
+        self.has_shared_dsa_topk_indices = False
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -1247,6 +1264,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
+        self.shared_topk_indices = None
+        self.has_shared_dsa_topk_indices = False
 
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
@@ -2503,9 +2522,14 @@ class DSATrtllmAttention(TrtllmAttention):
             attention_chunk_size=attention_chunk_size,
             **kwargs)
 
-        self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
-                               skip_create_weights_in_init, sparse_params,
-                               dtype, layer_idx, aux_stream)
+        self.is_full_indexer_layer = getattr(sparse_params,
+                                             "is_full_indexer_layer", True)
+        if self.is_full_indexer_layer:
+            self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
+                                   skip_create_weights_in_init, sparse_params,
+                                   dtype, layer_idx, aux_stream)
+        else:
+            self.indexer = None
 
     def sparse_attn_predict(
         self,

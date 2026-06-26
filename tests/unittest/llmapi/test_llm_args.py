@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 
 import pydantic_core
@@ -32,6 +33,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -98,6 +100,55 @@ def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     assert explicit_config.max_draft_len == 1
     assert explicit_config.max_total_draft_tokens == 1
     assert "max_draft_len" in explicit_config.model_fields_set
+
+
+class TestDeepSeekSparseAttentionConfig:
+
+    @staticmethod
+    def _params(pretrained_config=None, layer_idx=None):
+        return DeepSeekSparseAttentionConfig(index_topk=2048).to_sparse_params(
+            pretrained_config=pretrained_config,
+            layer_idx=layer_idx,
+        )
+
+    def test_pattern_resolves_shared_indexer_layers(self):
+        pretrained_config = SimpleNamespace(num_hidden_layers=4,
+                                            index_topk_pattern="NSSN")
+
+        assert self._params(pretrained_config, 0).is_full_indexer_layer is True
+        assert self._params(pretrained_config, 1).is_full_indexer_layer is False
+        assert self._params(pretrained_config, 2).is_full_indexer_layer is False
+        assert self._params(pretrained_config, 3).is_full_indexer_layer is True
+
+    def test_frequency_resolves_shared_indexer_layers(self):
+        pretrained_config = SimpleNamespace(num_hidden_layers=4,
+                                            index_topk_freq=2,
+                                            index_skip_topk_offset=2)
+
+        assert self._params(pretrained_config, 0).is_full_indexer_layer is True
+        assert self._params(pretrained_config, 1).is_full_indexer_layer is True
+        assert self._params(pretrained_config, 2).is_full_indexer_layer is False
+        assert self._params(pretrained_config, 3).is_full_indexer_layer is True
+
+    def test_first_and_mtp_layers_are_always_full_indexer_layers(self):
+        first_shared = SimpleNamespace(num_hidden_layers=4,
+                                       index_topk_pattern="SNNN")
+
+        assert self._params(first_shared, 0).is_full_indexer_layer is True
+        assert self._params(first_shared, 4).is_full_indexer_layer is True
+        assert self._params(None, None).is_full_indexer_layer is True
+
+    def test_mtp_iteration_index_sharing_lowers_to_runtime_params(self):
+        config = DeepSeekSparseAttentionConfig(
+            index_topk=2048,
+            index_share_for_mtp_iteration=True,
+        )
+
+        sparse_params = config.to_sparse_params()
+        sparse_metadata_params = config.to_sparse_metadata_params()
+
+        assert sparse_params.index_share_for_mtp_iteration is True
+        assert sparse_metadata_params.index_share_for_mtp_iteration is True
 
 
 class TestYaml:

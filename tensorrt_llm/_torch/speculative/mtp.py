@@ -291,6 +291,37 @@ class MTPWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def _set_mtp_index_reuse(self, attn_metadata, reuse: bool) -> bool:
+        if attn_metadata is None:
+            return False
+        sparse_metadata_params = getattr(attn_metadata,
+                                         "sparse_metadata_params", None)
+        if not getattr(sparse_metadata_params,
+                       "index_share_for_mtp_iteration", False):
+            return False
+
+        attn_metadata.reuse_dsa_topk_indices = reuse
+        attn_metadata.cache_dsa_topk_indices = True
+        # MTP layers keep indexer weights, so later iterations can recompute if
+        # iteration 0 did not populate the cache.
+        attn_metadata.require_dsa_topk_indices = False
+        return True
+
+    @staticmethod
+    def _clear_mtp_index_reuse(attn_metadata) -> None:
+        if attn_metadata is None:
+            return
+        if hasattr(attn_metadata, "reuse_dsa_topk_indices"):
+            attn_metadata.reuse_dsa_topk_indices = False
+        if hasattr(attn_metadata, "cache_dsa_topk_indices"):
+            attn_metadata.cache_dsa_topk_indices = False
+        if hasattr(attn_metadata, "require_dsa_topk_indices"):
+            attn_metadata.require_dsa_topk_indices = False
+        if hasattr(attn_metadata, "has_shared_dsa_topk_indices"):
+            attn_metadata.has_shared_dsa_topk_indices = False
+        if hasattr(attn_metadata, "shared_topk_indices"):
+            attn_metadata.shared_topk_indices = None
+
     def forward(
         self,
         input_ids,
@@ -441,39 +472,49 @@ class MTPWorker(SpecWorkerBase):
             resource_manager)
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i, mtp_layer in enumerate(draft_model.mtp_layers):
-                if self.guided_decoder is not None:
-                    new_tokens = draft_inputs['input_ids'][last_tokens_idx]
-                    self.guided_decoder.add_draft_batch(new_tokens,
-                                                        num_accepted_tokens,
-                                                        draft_step=i)
-
-                hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
-                                          **draft_inputs)
-
-                logits = mtp_layer.shared_head(hidden_states,
-                                               draft_model.lm_head,
-                                               attn_metadata).float()
-                if self.guided_decoder is not None:
-                    self.guided_decoder.execute_draft_batch(logits,
+            mtp_index_share_enabled = self._set_mtp_index_reuse(
+                attn_metadata, False)
+            if mtp_index_share_enabled:
+                attn_metadata.has_shared_dsa_topk_indices = False
+                attn_metadata.shared_topk_indices = None
+            try:
+                for i, mtp_layer in enumerate(draft_model.mtp_layers):
+                    self._set_mtp_index_reuse(attn_metadata, i > 0)
+                    if self.guided_decoder is not None:
+                        new_tokens = draft_inputs['input_ids'][last_tokens_idx]
+                        self.guided_decoder.add_draft_batch(new_tokens,
+                                                            num_accepted_tokens,
                                                             draft_step=i)
 
-                new_draft_token = self.draft_sampler(logits)
-                next_draft_tokens.append(new_draft_token)
-                # shift input_ids and hidden_states
-                input_ids = draft_inputs["input_ids"]
-                input_ids[:-1] = input_ids[1:].clone()
-                input_ids[last_tokens_idx] = new_draft_token
-                draft_hidden_states = draft_inputs["hidden_states"]
-                draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
-                draft_hidden_states[last_tokens_idx] = hidden_states[
-                    last_tokens_idx, :]
-                draft_inputs = {
-                    "input_ids": input_ids,
-                    "position_ids": draft_inputs["position_ids"],
-                    "hidden_states": draft_hidden_states,
-                    "attn_metadata": draft_inputs["attn_metadata"],
-                }
+                    hidden_states = mtp_layer(
+                        embed_tokens=draft_model.embed_tokens, **draft_inputs)
+
+                    logits = mtp_layer.shared_head(hidden_states,
+                                                   draft_model.lm_head,
+                                                   attn_metadata).float()
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.execute_draft_batch(logits,
+                                                                draft_step=i)
+
+                    new_draft_token = self.draft_sampler(logits)
+                    next_draft_tokens.append(new_draft_token)
+                    # shift input_ids and hidden_states
+                    input_ids = draft_inputs["input_ids"]
+                    input_ids[:-1] = input_ids[1:].clone()
+                    input_ids[last_tokens_idx] = new_draft_token
+                    draft_hidden_states = draft_inputs["hidden_states"]
+                    draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
+                    draft_hidden_states[last_tokens_idx] = hidden_states[
+                        last_tokens_idx, :]
+                    draft_inputs = {
+                        "input_ids": input_ids,
+                        "position_ids": draft_inputs["position_ids"],
+                        "hidden_states": draft_hidden_states,
+                        "attn_metadata": draft_inputs["attn_metadata"],
+                    }
+            finally:
+                if mtp_index_share_enabled:
+                    self._clear_mtp_index_reuse(attn_metadata)
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # Override with SA draft tokens after all MTP layers have run,

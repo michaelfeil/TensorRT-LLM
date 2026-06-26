@@ -1099,8 +1099,8 @@ def _mla_dsa_proj_fake(
     layer_idx: str,
 ) -> List[torch.Tensor]:
     # Under torch compile _should_use_short_mha is False, so the result is
-    # always 9 tensors (4 attention inputs + 5 indexer intermediates, with
-    # q_scale as the 9th carried for the FP4 dispatch).
+    # 9 tensors for full indexer layers, or 4 attention inputs for shared
+    # layers that reuse top-k from a previous full layer.
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
     num_tokens = hidden_states.shape[0]
     indexer = mla_layer.mqa.indexer
@@ -1111,6 +1111,9 @@ def _mla_dsa_proj_fake(
     k_pe = hidden_states.new_empty([num_tokens, mla_layer.qk_rope_head_dim])
     latent_cache = hidden_states.new_empty(
         [num_tokens, mla_layer.kv_lora_rank + mla_layer.qk_rope_head_dim])
+    if indexer is None:
+        return [q, compressed_kv, k_pe, latent_cache]
+
     # Indexer intermediates: q_fp8, k_fp8, k_scale, weights, q_scale.
     # Under FP4 q_fp8's trailing dim is head_dim // 2 (two E2M1 codes per
     # byte) and q_scale carries one int32 per (token, head) packing four
@@ -1878,10 +1881,12 @@ class MLA(nn.Module):
         to num_tokens happens in forward_dsa_attn (Op 2, outside graph).
 
         Returns [q, compressed_kv, k_pe, latent_cache] when short-MHA
-        handles all tokens (eager only), or
+        handles all tokens (eager only) or this DSA layer reuses a previous
+        layer's top-k, or
         [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
-        weights] when the indexer runs.  Under torch compile
-        _should_use_short_mha returns False so it is always length 8.
+        weights, q_scale] when the indexer runs.  Under torch compile
+        _should_use_short_mha returns False, but shared layers still return
+        only the four base tensors.
         """
         assert self.mqa is not None, "DSA is only supported in MQA mode"
 
@@ -1906,6 +1911,9 @@ class MLA(nn.Module):
         # Skip the indexer when the short MHA path handles all context
         # tokens and there are no generation tokens.
         if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
+            return [q, compressed_kv, k_pe, latent_cache]
+
+        if self.mqa.indexer is None:
             return [q, compressed_kv, k_pe, latent_cache]
 
         # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
@@ -1935,7 +1943,8 @@ class MLA(nn.Module):
         """Batch-structure-dependent attention for DSA MLA (Op 2, not graph-captured).
 
         indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale]
-        when the indexer ran in Op 1, or [] when short-MHA handled all tokens.
+        when the indexer ran in Op 1, or [] when short-MHA handled all tokens
+        or this DSA layer reuses a previous layer's top-k.
 
         All num_tokens slicing happens here (not in Op 1) because
         num_tokens comes from batch-specific metadata and must not be
@@ -1961,24 +1970,58 @@ class MLA(nn.Module):
 
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
+        elif self.mqa.indexer is None:
+            topk_indices = getattr(attn_metadata, "shared_topk_indices", None)
+            assert topk_indices is not None, (
+                "DSA shared layer has no top-k from a preceding full indexer "
+                "layer; check the index_topk_pattern/freq schedule.")
         else:
-            q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
-            # Slice indexer intermediates to actual num_tokens (they were
-            # computed on the full padded tensor in Op 1).
-            q_fp8 = q_fp8[:num_tokens, ...]
-            k_fp8 = k_fp8[:num_tokens, ...]
-            k_scale = k_scale[:num_tokens, ...]
-            weights = weights[:num_tokens, ...]
-            q_scale = q_scale[:num_tokens, ...]
-            topk_indices = self.mqa.indexer.sparse_attn_indexer(
-                attn_metadata,
-                q,  # only used for shape/device in buffer allocation
-                q_fp8,
-                k_fp8,
-                k_scale,
-                weights,
-                q_scale=q_scale,
-            )
+            topk_indices = None
+            if getattr(attn_metadata, "reuse_dsa_topk_indices", False):
+                if getattr(attn_metadata, "has_shared_dsa_topk_indices",
+                           False):
+                    topk_indices_buffer = getattr(attn_metadata,
+                                                  "topk_indices_buffer", None)
+                    if topk_indices_buffer is not None:
+                        topk_indices = topk_indices_buffer[:num_tokens, :]
+                elif getattr(attn_metadata, "require_dsa_topk_indices",
+                             False):
+                    raise RuntimeError(
+                        "DSA TopK index sharing was requested before any "
+                        "TopK indices were cached.")
+
+            if topk_indices is None:
+                q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
+                # Slice indexer intermediates to actual num_tokens (they were
+                # computed on the full padded tensor in Op 1).
+                q_fp8 = q_fp8[:num_tokens, ...]
+                k_fp8 = k_fp8[:num_tokens, ...]
+                k_scale = k_scale[:num_tokens, ...]
+                weights = weights[:num_tokens, ...]
+                q_scale = q_scale[:num_tokens, ...]
+                topk_indices = self.mqa.indexer.sparse_attn_indexer(
+                    attn_metadata,
+                    q,  # only used for shape/device in buffer allocation
+                    q_fp8,
+                    k_fp8,
+                    k_scale,
+                    weights,
+                    q_scale=q_scale,
+                )
+                if getattr(attn_metadata, "cache_dsa_topk_indices", False):
+                    topk_indices_buffer = getattr(attn_metadata,
+                                                  "topk_indices_buffer", None)
+                    if topk_indices_buffer is not None:
+                        if topk_indices.shape[1] != topk_indices_buffer.shape[
+                                1]:
+                            raise RuntimeError(
+                                "DSA TopK index sharing requires matching "
+                                "TopK widths between computed indices and "
+                                "cache buffer.")
+                        topk_indices_buffer[:num_tokens, :].copy_(
+                            topk_indices[:num_tokens, :])
+                        attn_metadata.has_shared_dsa_topk_indices = True
+                attn_metadata.shared_topk_indices = topk_indices
 
         assert output is not None, "output must be provided"
 

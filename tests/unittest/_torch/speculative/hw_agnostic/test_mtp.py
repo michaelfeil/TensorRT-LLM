@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 from parameterized import parameterized
@@ -21,6 +22,35 @@ def unittest_name_func(testcase_func, param_num, param):
 class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level("warning")
+
+    def test_set_mtp_index_reuse_follows_sparse_attention_config(self):
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2))
+        attn_metadata = SimpleNamespace(
+            reuse_dsa_topk_indices=False,
+            cache_dsa_topk_indices=False,
+            require_dsa_topk_indices=True,
+            sparse_metadata_params=SimpleNamespace(
+                index_share_for_mtp_iteration=True),
+        )
+
+        assert worker._set_mtp_index_reuse(attn_metadata, True) is True
+        assert attn_metadata.reuse_dsa_topk_indices is True
+        assert attn_metadata.cache_dsa_topk_indices is True
+        assert attn_metadata.require_dsa_topk_indices is False
+
+        assert worker._set_mtp_index_reuse(attn_metadata, False) is True
+        assert attn_metadata.reuse_dsa_topk_indices is False
+
+    def test_set_mtp_index_reuse_ignores_disabled_config(self):
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2))
+        attn_metadata = SimpleNamespace(
+            reuse_dsa_topk_indices=False,
+            sparse_metadata_params=SimpleNamespace(
+                index_share_for_mtp_iteration=False),
+        )
+
+        assert worker._set_mtp_index_reuse(attn_metadata, True) is False
+        assert attn_metadata.reuse_dsa_topk_indices is False
 
     def load_sample_and_accept_draft_tokens_test_cases():
         test_cases = []

@@ -701,6 +701,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
         "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
         "per-token footprint from 132 B to 68 B.")
+    index_share_for_mtp_iteration: bool = Field(
+        default=False,
+        description=
+        "Whether MTP draft iterations after the first reuse TopK indices "
+        "computed by the first MTP iteration.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -741,6 +746,40 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
 
+    @staticmethod
+    def _is_full_indexer_layer(pretrained_config, layer_idx) -> bool:
+        """Return whether a DSA layer computes its own TopK indices."""
+        if pretrained_config is None or layer_idx is None:
+            return True
+
+        num_hidden_layers = getattr(pretrained_config, "num_hidden_layers",
+                                    None)
+        if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+            return True
+
+        index_topk_pattern = getattr(pretrained_config, "index_topk_pattern",
+                                     None)
+        if index_topk_pattern is not None:
+            is_full = not (layer_idx < len(index_topk_pattern)
+                           and str(index_topk_pattern[layer_idx]).upper()
+                           == "S")
+        else:
+            index_topk_freq = max(
+                getattr(pretrained_config, "index_topk_freq", 1) or 1, 1)
+            index_skip_topk_offset = getattr(pretrained_config,
+                                             "index_skip_topk_offset", 2)
+            is_full = (
+                max(layer_idx - index_skip_topk_offset + 1, 0) %
+                index_topk_freq) == 0
+
+        if layer_idx == 0 and not is_full:
+            logger.warning(
+                "DSA layer 0 resolved to 'shared' but has no prior full "
+                "layer's top-k to reuse; forcing it to 'full'. Check "
+                "index_topk_pattern.")
+            return True
+        return is_full
+
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention_backend.sparse.dsa import DSAParams
 
@@ -766,6 +805,10 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
+            is_full_indexer_layer=self._is_full_indexer_layer(
+                pretrained_config, kwargs.get("layer_idx")),
+            index_share_for_mtp_iteration=(
+                self.index_share_for_mtp_iteration),
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -789,6 +832,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
+            index_share_for_mtp_iteration=(
+                self.index_share_for_mtp_iteration),
         )
 
 
