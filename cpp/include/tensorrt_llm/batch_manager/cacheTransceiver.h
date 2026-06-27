@@ -73,12 +73,6 @@ struct TransferFuture
     {
     }
 
-    TransferFuture(std::shared_ptr<LlmRequest> request_, std::future<void>&& future_,
-        std::shared_ptr<std::atomic<bool>> hasError_ = nullptr)
-        : TransferFuture(request_->mRequestId, std::move(request_), std::move(future_), std::move(hasError_))
-    {
-    }
-
     LlmRequest::RequestIdType requestId;
     std::shared_ptr<LlmRequest> request;
     std::future<void> future;

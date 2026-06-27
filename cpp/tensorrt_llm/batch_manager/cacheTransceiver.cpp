@@ -676,8 +676,9 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         return;
     }
     setContextState(llmRequest.get());
+    auto const requestId = llmRequest->mRequestId;
     auto future = mCacheSender->sendAsync(llmRequest);
-    mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
+    mSenderFutures.emplace_back(requestId, std::move(llmRequest), std::move(future));
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -692,8 +693,9 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
+        auto const requestId = llmRequest->mRequestId;
         auto future = mCacheSender->sendAsync(llmRequest);
-        mSenderFutures.emplace_back(llmRequest, std::move(future));
+        mSenderFutures.emplace_back(requestId, llmRequest, std::move(future));
     }
 }
 
@@ -721,7 +723,8 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     }
 
     auto statusFuture = mCacheReceiver->receiveAsyncWithStatus(llmRequest);
-    mRequesterFutures.emplace_back(llmRequest, std::move(statusFuture.future), std::move(statusFuture.hasError));
+    mRequesterFutures.emplace_back(
+        requestId, llmRequest, std::move(statusFuture.future), std::move(statusFuture.hasError));
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
 }
 
