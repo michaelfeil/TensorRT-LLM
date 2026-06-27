@@ -50,6 +50,14 @@ if TYPE_CHECKING:
     from .sampling_utils import Strategy
 
 
+def _is_simple_log_probs(
+        log_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs]) -> bool:
+    for beam_log_probs in log_probs:
+        if beam_log_probs:
+            return not isinstance(beam_log_probs[0], dict)
+    return False
+
+
 @dataclass(slots=True)
 class PerfTimingInfo:
     """Stores performance timing information for a request."""
@@ -220,9 +228,9 @@ class LogitsStorage:
 class LogProbStorage:
     """Stores per-token logprobs.
 
-    ``log_probs`` stores one list per beam. Each per-token entry is either a
-    ``dict[int, Logprob]`` (top-k/default format) or a ``float`` (simple
-    sampled-token format).
+    Top-k logprobs use the generic ``log_probs`` storage. Simple logprobs use
+    a separate raw-float storage so the sampler hot path does not populate the
+    generic diff/list machinery.
     """
 
     beam_width: int = -1
@@ -230,24 +238,73 @@ class LogProbStorage:
 
     def __init__(self):
         self.beam_width = -1
-        self._log_probs_data: list[TokenLogprobs] | list[
-            SimpleTokenLogprobs] = []
+        self._log_probs_data: list[TokenLogprobs] = []
+        self._simple_log_probs_data: list[SimpleTokenLogprobs] = []
+        self._simple_mode = False
         self.cum_log_probs = []
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | list[SimpleTokenLogprobs]:
+        if self._simple_mode:
+            return self._simple_log_probs_data
         return self._log_probs_data
 
     @log_probs.setter
     def log_probs(self, value: list[TokenLogprobs]
                   | list[SimpleTokenLogprobs]):
-        self._log_probs_data = value
+        if _is_simple_log_probs(value):
+            self._simple_mode = True
+            self._simple_log_probs_data = cast(list[SimpleTokenLogprobs],
+                                               value)
+            self._log_probs_data = [[] for _ in range(len(value))]
+        else:
+            self._simple_mode = False
+            self._log_probs_data = cast(list[TokenLogprobs], value)
+            self._simple_log_probs_data = [[] for _ in range(len(value))]
 
     def _init(self, first_input: list[TokenLogprobs]
               | list[SimpleTokenLogprobs]):
         self.beam_width = len(first_input)
         self._log_probs_data = [[] for _ in range(self.beam_width)]
+        self._simple_log_probs_data = [[] for _ in range(self.beam_width)]
+        self._simple_mode = False
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
+
+    def _init_simple(self, beam_width: int):
+        self.beam_width = beam_width
+        self._log_probs_data = [[] for _ in range(self.beam_width)]
+        self._simple_log_probs_data = [[] for _ in range(self.beam_width)]
+        self._simple_mode = True
+        self.cum_log_probs = [0 for _ in range(self.beam_width)]
+
+    @property
+    def simple_mode(self) -> bool:
+        return self._simple_mode
+
+    @property
+    def simple_log_probs(self) -> list[SimpleTokenLogprobs] | None:
+        if not self._simple_mode:
+            return None
+        return self._simple_log_probs_data
+
+    def append_simple(self,
+                      new_probs: list[SimpleTokenLogprobs],
+                      cum_log_probs: Optional[list[float]] = None):
+        """
+        new_probs: [beam_width, num_tokens], one float per sampled token.
+        cum_log_probs: [beam_width]
+        """
+        if self.beam_width == -1:
+            self._init_simple(len(new_probs))
+
+        assert self._simple_mode, "Cannot mix simple and top-k logprob storage"
+        assert len(new_probs) == self.beam_width, "Beam width mismatch"
+        for beam_idx, probs in enumerate(new_probs):
+            self._simple_log_probs_data[beam_idx].extend(probs)
+            if cum_log_probs is not None:
+                self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
+            elif probs:
+                self.cum_log_probs[beam_idx] += sum(probs)
 
     def append(self,
                new_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs],
@@ -257,24 +314,28 @@ class LogProbStorage:
             ``dict[int, Logprob]`` (default) or a ``float`` (simple format).
         cum_log_probs: [beam_width]
         """
+        if _is_simple_log_probs(new_probs):
+            self.append_simple(cast(list[SimpleTokenLogprobs], new_probs),
+                               cum_log_probs)
+            return
+
         if self.beam_width == -1:
             self._init(new_probs)
 
+        assert not self._simple_mode, "Cannot mix top-k and simple logprob storage"
         assert len(new_probs) == self.beam_width, "Beam width mismatch"
         for beam_idx, probs in enumerate(new_probs):
-            self._log_probs_data[beam_idx].extend(probs)
+            self._log_probs_data[beam_idx].extend(
+                cast(TokenLogprobs, probs))
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             elif probs:
-                if isinstance(probs[0], dict):
-                    # FIXME: This relies on the ordering of LogProb's in the dictionary.
-                    #        TorchSampler ensures that the sampled logprob is in the
-                    #        first position.
-                    self.cum_log_probs[beam_idx] += sum(
-                        next(iter(prob.values())).logprob for prob in probs)
-                else:
-                    # Simple format: probs is SimpleTokenLogprobs (list[float]).
-                    self.cum_log_probs[beam_idx] += sum(probs)
+                # FIXME: This relies on the ordering of LogProb's in the dictionary.
+                #        TorchSampler ensures that the sampled logprob is in the
+                #        first position.
+                self.cum_log_probs[beam_idx] += sum(
+                    next(iter(prob.values())).logprob
+                    for prob in cast(TokenLogprobs, probs))
 
     def set_log_probs(self, log_probs: list[TokenLogprobs]
                       | list[SimpleTokenLogprobs], cum_log_probs: list[float]):
@@ -284,7 +345,10 @@ class LogProbStorage:
         cum_log_probs: [beam_width]
         """
         # reinitialize the storage to clear the lists
-        self._init(log_probs)
+        if _is_simple_log_probs(log_probs):
+            self._init_simple(len(log_probs))
+        else:
+            self._init(log_probs)
         # append the new values
         self.append(log_probs, cum_log_probs)
 
@@ -431,8 +495,20 @@ class PyResult:
                          | list[SimpleTokenLogprobs],
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
+            if _is_simple_log_probs(log_probs):
+                self.append_log_probs_simple(
+                    cast(list[SimpleTokenLogprobs], log_probs), cum_log_probs)
+                return
             self._log_probs.append(log_probs, cum_log_probs)
             self.diff.log_probs_list.append((log_probs, cum_log_probs))
+
+    def append_log_probs_simple(
+            self,
+            log_probs: list[SimpleTokenLogprobs],
+            cum_log_probs: Optional[list[float]] = None):
+        """Append simple logprobs without populating the generic PP diff."""
+        if self._log_probs:
+            self._log_probs.append_simple(log_probs, cum_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              mm_embedding_lengths: List[int]):
@@ -554,6 +630,12 @@ class PyResult:
         return self._log_probs.log_probs
 
     @property
+    def simple_log_probs(self) -> list[SimpleTokenLogprobs] | None:
+        if not self._log_probs or self._log_probs.beam_width == -1:
+            return None
+        return self._log_probs.simple_log_probs
+
+    @property
     def cum_log_probs(self) -> list[float] | None:
         if not self._log_probs or self._log_probs.beam_width == -1:
             return None
@@ -612,8 +694,9 @@ class PyResult:
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'first_gen_log_probs', 'mm_embedding_handles',
+        ('context_logits', 'generation_logits', 'log_probs',
+         'simple_log_probs', 'cum_log_probs', 'first_gen_log_probs',
+         'mm_embedding_handles',
          'additional_context_outputs', 'additional_generation_outputs',
          'encoder_output', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
@@ -944,8 +1027,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self.py_result._log_probs = LogProbStorage()
                 # Reinitialize the fresh storage. We only need the beam_width
                 # and previous cum_log_probs to continue accumulating.
-                self.py_result._log_probs._init(
-                    [[] for _ in range(old_storage.beam_width)])
+                if old_storage.simple_mode:
+                    self.py_result._log_probs._init_simple(
+                        old_storage.beam_width)
+                else:
+                    self.py_result._log_probs._init(
+                        [[] for _ in range(old_storage.beam_width)])
                 self.py_result._log_probs.cum_log_probs = list(
                     old_storage.cum_log_probs)
 

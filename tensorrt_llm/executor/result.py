@@ -322,6 +322,41 @@ class GenerationResultBase:
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs += logprobs_result.generation
+        elif getattr(response_tensors, 'simple_log_probs',
+                     None) is not None:  # PyTorch simple fast path
+            simple_log_probs = response_tensors.simple_log_probs
+            output._last_logprobs_len = len(output.logprobs)
+            if self.use_trtllm_sampler:
+                assert output._last_logprobs_len <= len(
+                    simple_log_probs[src_idx]
+                ), (f"_last_logprobs_len ({output._last_logprobs_len}) > simple_log_probs length ("
+                    f"{len(simple_log_probs[src_idx])})")
+                output.logprobs += simple_log_probs[src_idx][
+                    output._last_logprobs_len:]
+            else:
+                output.logprobs += simple_log_probs[src_idx]
+
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                is_generation_only = (self.disaggregated_params is not None
+                                      and self.disaggregated_params.request_type
+                                      == "generation_only")
+                if is_generation_only:
+                    assert len(output.logprobs) >= output.length - 1, (
+                        f"logprobs length: {len(output.logprobs)} < "
+                        f"output.length - 1: {output.length - 1}")
+                    if len(output.logprobs) < output.length:
+                        logger.warning(
+                            "Disaggregated serving: the response contains "
+                            "%d logprob entries instead of %d because "
+                            "logprobs for the first generated token were "
+                            "not transferred from the context server. "
+                            "Enable logprobs on both the prefill and "
+                            "decode servers to receive complete results.",
+                            len(output.logprobs), output.length)
+                else:
+                    assert len(output.logprobs) == output.length, (
+                        f"logprobs length: {len(output.logprobs)} != "
+                        f"output.length: {output.length}")
         elif response_tensors.log_probs is not None:  # PyTorch backend
             # handle logprobs directly from response tensors given by sampler
             output._last_logprobs_len = len(output.logprobs)

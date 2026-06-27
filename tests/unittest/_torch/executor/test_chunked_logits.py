@@ -11,6 +11,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LogitsStorage, PyResult)
 from tensorrt_llm.bindings import SamplingConfig
+from tensorrt_llm.executor.result import Logprob
 
 
 # Test fixtures
@@ -145,6 +146,33 @@ class TestPyResult:
         assert diff.encoder_output.device.type == "cpu"
         assert result.encoder_output is encoder_output
         torch.testing.assert_close(diff.encoder_output, encoder_output.cpu())
+
+    def test_append_simple_logprobs_uses_fast_storage(self):
+        """Simple logprobs avoid the generic top-k diff path."""
+        result = PyResult(prompt_len=5,
+                          max_new_tokens=10,
+                          return_log_probs=True)
+
+        result.append_log_probs([[-0.25, -0.5]])
+
+        assert result.simple_log_probs == [[-0.25, -0.5]]
+        assert result.log_probs == [[-0.25, -0.5]]
+        assert result.diff.log_probs_list == []
+        assert result.cum_log_probs == [-0.75]
+
+    def test_append_topk_logprobs_keeps_generic_diff(self):
+        """Top-k logprobs still use the generic syncable diff path."""
+        result = PyResult(prompt_len=5,
+                          max_new_tokens=10,
+                          return_log_probs=True)
+        log_probs = [[{7: Logprob(logprob=-0.25, rank=1)}]]
+
+        result.append_log_probs(log_probs)
+
+        assert result.simple_log_probs is None
+        assert result.log_probs == log_probs
+        assert result.diff.log_probs_list == [(log_probs, None)]
+        assert result.cum_log_probs == [-0.25]
 
 
 class TestGetLatestLogitsUnexcluded:
