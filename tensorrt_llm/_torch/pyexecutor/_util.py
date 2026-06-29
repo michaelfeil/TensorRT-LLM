@@ -399,21 +399,17 @@ class KvCacheCreator:
             # For PP, draft layers are only on the last rank (see
             # get_pp_layers), so only that rank should include draft cost.
             effective_draft_config = self._get_effective_draft_config()
+            draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
+                kv_cache_config_override=kv_cache_config, log_warning=False)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
-                # Resolve draft manager class from draft config — may differ
-                # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-                    effective_draft_config,
-                    kv_cache_config,
-                    is_disagg=self._is_disagg)
                 total += self._per_manager_cache_cost(
                     draft_kv_cache_manager_cls, effective_draft_config,
                     kv_cache_config)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 total += self._per_manager_cache_cost(
-                    self._kv_cache_manager_cls,
+                    draft_kv_cache_manager_cls,
                     effective_draft_config,
                     kv_cache_config,
                     num_layers=self._get_num_draft_layers())
@@ -833,13 +829,25 @@ class KvCacheCreator:
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine, kv_cache_config)
 
+        # Select the KV cache manager class and sparse attention config based on
+        # the engine being built. In two-model speculative decoding the draft
+        # engine may use a different attention family than the target (e.g. an
+        # MHA draft on a sparse-attention / MLA target), so reusing the target's
+        # manager class and sparse config would build a manager that is
+        # inconsistent with the per-token size estimated in _get_kv_size_per_token.
+        model_config = model_engine.model.model_config
+        if model_engine.is_draft_model:
+            sparse_attention_config = model_config.sparse_attention_config
+        else:
+            sparse_attention_config = self._sparse_attention_config
+
         # When using separate draft KV cache in one-model speculative decoding,
         # use layer_mask to include only target layers. The draft layers should
         # only be in the separate draft KV cache manager.
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
         spec_dec_layer_mask = None
         if self._should_create_separate_draft_kv_cache():
-            num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
+            num_target_layers = model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
@@ -852,7 +860,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attention_config=self._sparse_attention_config,
+            sparse_attention_config=sparse_attention_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,

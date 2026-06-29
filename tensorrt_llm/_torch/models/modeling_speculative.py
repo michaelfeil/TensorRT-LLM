@@ -1760,6 +1760,31 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     ) and self.draft_model is not None:
                     self.draft_model.logits_processor = self.logits_processor
 
+            spec_mode = model_config.spec_config.spec_dec_mode
+            is_dflash_one_model = getattr(spec_mode, "is_dflash_one_model",
+                                          lambda: False)()
+            is_dflash_mla = (is_dflash_one_model and bool(
+                getattr(model_config.spec_config, 'use_mla', False)))
+            is_eagle3_llama3 = (spec_mode.is_eagle3_one_model()
+                                and model_config.spec_config.eagle3_model_arch
+                                == "llama3"
+                                and not is_dflash_one_model)
+            if (self.draft_config is not None
+                    and (is_eagle3_llama3 or is_dflash_mla)):
+                for key, value in self.draft_config.extra_attrs.items():
+                    assert key in ('attn_layers', 'mla_layers')
+                    if self.use_separate_draft_kv_cache:
+                        model_config.extra_attrs.setdefault(key,
+                                                            {}).update(value)
+                    else:
+                        if key not in model_config.extra_attrs:
+                            raise ValueError(
+                                f"Draft extra_attrs key {key!r} not present on the target. "
+                                f"Mixed attention families (e.g. MHA draft on MLA target) "
+                                 f"require allow_separate_draft_kv_cache=True since they "
+                                 f"cannot share a single KV cache layout.")
+                        model_config.extra_attrs[key].update(value)
+
             # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
