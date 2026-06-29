@@ -242,12 +242,12 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
     return maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
 }
 
-CacheTransBufferManager::CacheTransBufferManager(
-    KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
+CacheTransBufferManager::CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
+    std::optional<size_t> maxNumTokens, bool transferIndexerKCache, runtime::MemoryType bufferMemoryType)
     : BaseTransBufferManager(computeTransferBufferSize(cacheManager, maxNumTokens, transferIndexerKCache),
         transferIndexerKCache ? cacheManager->getIndexerKCachePool()->getDataType()
                               : cacheManager->getPrimaryPool(0)->getDataType(),
-        maxNumTokens)
+        maxNumTokens, bufferMemoryType)
     , mCacheManager{cacheManager}
     , mTransferIndexerKCache{transferIndexerKCache}
 {

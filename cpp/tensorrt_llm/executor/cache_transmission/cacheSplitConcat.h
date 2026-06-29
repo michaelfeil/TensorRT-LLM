@@ -73,6 +73,8 @@ TargetRanksInfo targetIRanksForRnn(
  */
 int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks);
 
+int computeDimsPerHead(kv_cache::CacheState const& cacheState, bool isIndexerKCache);
+
 void concatKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum,
     std::vector<int> const& inputRanks, kv_cache::CacheState const& peerCacheState,
     runtime::ITensor::SharedPtr* outputBlocks, int outputBlockNum, int selfRank,

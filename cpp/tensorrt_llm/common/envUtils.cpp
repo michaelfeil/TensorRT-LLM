@@ -407,6 +407,12 @@ bool getEnvTryZCopyForKVCacheTransfer()
     return zcopyForSysmmetricKVCache;
 }
 
+bool getEnvMLAKVCacheTransferUseCpuBuffer()
+{
+    // Keep this dynamic so tests can validate both the default and enabled paths in one process.
+    return getBoolEnv("TRTLLM_MLA_KVCACHE_TRANSFER_USE_CPU_BUFFER");
+}
+
 bool getEnvForceDeterministic()
 {
     static bool const forceDeterministic = getBoolEnv("FORCE_DETERMINISTIC");

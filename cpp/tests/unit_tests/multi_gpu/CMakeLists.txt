@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -15,7 +15,9 @@
 
 add_subdirectory(kernels)
 
-add_gtest(cacheTransceiverTest cacheTransceiverTest.cpp)
+set(CACHE_TRANSCEIVER_TEST_SRC cacheTransceiverTest.cpp
+                               mlaCacheFormatterCpuTest.cpp)
+add_gtest(cacheTransceiverTest "${CACHE_TRANSCEIVER_TEST_SRC}")
 target_link_libraries(cacheTransceiverTest PRIVATE ${Python3_LIBRARIES})
 
 add_gtest(mpiUtilsTest mpiUtilsTest.cpp)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +32,7 @@ public:
         , mCacheTransBufferManagers{cacheTransBufferManagers}
     {
         TLLM_CHECK(mCacheManager);
+        TLLM_CHECK(!mCacheTransBufferManagers.empty());
     }
 
     void format(tensorrt_llm::batch_manager::TransferSession& session) override;

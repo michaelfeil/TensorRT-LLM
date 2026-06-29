@@ -139,17 +139,22 @@ void BufferIndexHolder::release() noexcept
     mHeld = false;
 }
 
-BaseTransBufferManager::BaseTransBufferManager(
-    size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
+BaseTransBufferManager::BaseTransBufferManager(size_t transferBufferSize, nvinfer1::DataType dataType,
+    std::optional<size_t> maxNumTokens, runtime::MemoryType bufferMemoryType)
     : mDataType{dataType}
+    , mBufferMemoryType{bufferMemoryType}
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
     , mMaxNumTokens{maxNumTokens}
 {
+    TLLM_CHECK_WITH_INFO(
+        mBufferMemoryType == runtime::MemoryType::kGPU || mBufferMemoryType == runtime::MemoryType::kPINNEDPOOL,
+        "Cache transfer buffers only support GPU or pinned-pool CPU memory.");
     mTransferBufferSize = transferBufferSize;
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
-    mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
+    mUseFabricMemory = mBufferMemoryType == runtime::MemoryType::kGPU
+        && !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
         && kv_cache_manager::FabricMemory::supportFbaricMemory();
     if (mUseFabricMemory)
     {
@@ -160,9 +165,10 @@ BaseTransBufferManager::BaseTransBufferManager(
     TLLM_LOG_INFO(
         "BaseTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
         "mSendBufferCount:%ld, mTransferBufferSize:%ld, mPreAllocBufferSize:%ld, mOnlyUseDynamicBuffer:%d, "
-        "mUseFabricMemory:%d, mDataType:%d",
+        "mUseFabricMemory:%d, mDataType:%d, mBufferMemoryType:%d",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
-        mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory, static_cast<int>(mDataType));
+        mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory, static_cast<int>(mDataType),
+        static_cast<int>(mBufferMemoryType));
 
     allocateBuffer();
 }
@@ -253,6 +259,9 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> BaseTransBuff
             }
             else
             {
+                TLLM_CHECK_WITH_INFO(mBufferMemoryType == runtime::MemoryType::kGPU,
+                    "Persistent pinned CPU cache transfer buffer is too small. Increase "
+                    "cache_transceiver_config.max_tokens_in_buffer or TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE.");
                 retSplitCaches.push_back(bufferManagerToUse.gpu(
                     runtime::ITensor::makeShape({static_cast<int64_t>(requestedNumberOfElements[i])}), mDataType));
             }
@@ -273,6 +282,9 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> BaseTransBuff
     }
     else
     {
+        TLLM_CHECK_WITH_INFO(mBufferMemoryType == runtime::MemoryType::kGPU,
+            "Pinned CPU cache transfer buffers must be persistent. Increase "
+            "cache_transceiver_config.max_tokens_in_buffer or TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE.");
         for (int i = 0; i < targetNum; i++)
         {
             retSplitCaches.push_back(bufferManagerToUse.gpu(
@@ -293,6 +305,12 @@ void BaseTransBufferManager::allocateBuffer()
     mNumberOfElements = mTransferBufferSize / common::getDTypeSize(mDataType);
     mConcurrenceSendResource.mBufferIndexFlag.resize(mSendBufferCount, 0);
     mConcurrenceRecvResource.mBufferIndexFlag.resize(mRecvBufferCount, 0);
+    if (mBufferMemoryType == runtime::MemoryType::kPINNEDPOOL)
+    {
+        allocateBuffer(mConcurrenceSendResource, mSendBufferCount);
+        allocateBuffer(mConcurrenceRecvResource, mRecvBufferCount);
+        return;
+    }
     if (mUseFabricMemory)
     {
         mFabricMemory.reserve(mSendBufferCount + mRecvBufferCount);
@@ -335,6 +353,15 @@ void BaseTransBufferManager::allocateBuffer()
             mConcurrenceRecvResource.mBuffers[i] = mBufferManager.gpuSync(
                 runtime::ITensor::makeShape({static_cast<int64_t>(mNumberOfElements)}), mDataType);
         }
+    }
+}
+
+void BaseTransBufferManager::allocateBuffer(ConcurrenceResource& resource, size_t bufferCount)
+{
+    auto const shape = runtime::ITensor::makeShape({static_cast<int64_t>(mNumberOfElements)});
+    for (size_t i = 0; i < bufferCount; i++)
+    {
+        resource.mBuffers[i] = mBufferManager.allocate(mBufferMemoryType, shape, mDataType);
     }
 }
 

@@ -45,6 +45,7 @@
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
@@ -451,12 +452,22 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
 
-    mCacheTransBufferManagers.push_back(
-        std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens));
+    bool const backendUsesAgentConnection = backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL
+        || backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE;
+    bool const useMlaCpuTransferBuffer
+        = isMLA && common::getEnvMLAKVCacheTransferUseCpuBuffer() && !backendUsesAgentConnection;
+    auto const kvTransferBufferMemoryType
+        = useMlaCpuTransferBuffer ? runtime::MemoryType::kPINNEDPOOL : runtime::MemoryType::kGPU;
+    if (useMlaCpuTransferBuffer)
+    {
+        TLLM_LOG_INFO("MLA CPU KV cache transfer buffer mode enabled; using persistent pinned CPU transfer buffers.");
+    }
+    mCacheTransBufferManagers.push_back(std::make_unique<kv_cache_manager::CacheTransBufferManager>(
+        cacheManager, maxNumTokens, /*transferIndexerKCache=*/false, kvTransferBufferMemoryType));
     if (isMLA && cacheManager->isEnableIndexerKCache())
     {
-        mCacheTransBufferManagers.push_back(
-            std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
+        mCacheTransBufferManagers.push_back(std::make_unique<kv_cache_manager::CacheTransBufferManager>(
+            cacheManager, maxNumTokens, /*transferIndexerKCache=*/true, kvTransferBufferMemoryType));
     }
 
     // RNN specific setup

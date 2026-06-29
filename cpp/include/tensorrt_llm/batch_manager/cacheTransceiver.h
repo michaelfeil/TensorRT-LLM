@@ -50,6 +50,7 @@ namespace tensorrt_llm::batch_manager
 
 class ContextProgress;
 class BaseCacheTransceiver;
+class CacheTransceiverTestAccessor;
 
 namespace kv_cache_manager
 {
@@ -357,6 +358,8 @@ public:
     [[nodiscard]] bool takeContextKvTransferEventReport(LlmRequest* llmRequest) override;
 
 private:
+    friend class CacheTransceiverTestAccessor;
+
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,7 +45,7 @@ inline bool isPowerOfTwo(int n)
 }
 } // namespace
 
-static inline int computeDimsPerHead(kv_cache::CacheState const& cacheState, bool isIndexerKCache)
+int computeDimsPerHead(kv_cache::CacheState const& cacheState, bool isIndexerKCache)
 {
     if (!isIndexerKCache)
     {
@@ -53,6 +53,8 @@ static inline int computeDimsPerHead(kv_cache::CacheState const& cacheState, boo
     }
     auto const dim = cacheState.getIndexerDimPerHead();
     auto const q = cacheState.getIndexerKCacheQuantBlockSize();
+    TLLM_CHECK(q != 0);
+    TLLM_CHECK(dim % q == 0);
     // Scale bytes: dim / quantBlockSize * 4 (same for FP8 and FP4).
     // Data bytes: dim for FP8 (one byte per element), dim / 2 for FP4
     // (two packed E2M1 codes per byte).

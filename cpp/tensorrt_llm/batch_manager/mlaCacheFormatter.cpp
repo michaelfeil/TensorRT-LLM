@@ -17,6 +17,7 @@
 
 #include "mlaCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
+#include "tensorrt_llm/batch_manager/mlaCacheFormatterCpu.h"
 #include "tensorrt_llm/batch_manager/perRequestActivityLog.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -162,7 +163,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
-        TLLM_LOG_REQ_DEBUG(llmRequest.mRequestId, "No targets to send KV cache to");
+        TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
         return;
     }
 
@@ -235,8 +236,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 
         TLLM_CHECK(blockNum > 0);
         int deviceId = mCacheManager->getBlockManager().getStreamDevice();
+        auto* transBufferManager = mCacheTransBufferManagers.at(transferIndexerKCache);
+        bool const useCpuTransferBuffer = mla_cache_formatter_cpu::shouldUseTransferBuffer(
+            connections, pickUpConnections, bufferKind, *transBufferManager);
 
-        if (common::getEnvTryZCopyForKVCacheTransfer()
+        if (!useCpuTransferBuffer && common::getEnvTryZCopyForKVCacheTransfer()
             && destConfig.getParallelConfig().mPipelineParallelism
                 == selfConfig.getParallelConfig().mPipelineParallelism)
         {
@@ -287,6 +291,14 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
+        if (useCpuTransferBuffer)
+        {
+            mla_cache_formatter_cpu::format(session, inputKvCacheBlocks, pickUpConnections, destConfig, selfConfig,
+                selfIdx, transferIndexerKCache, *transBufferManager, bufferEleSizes, pPDomainSize, cPDomainSize,
+                deviceId);
+            continue;
+        }
+
         auto sendBufferLease = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSendLease();
         auto cacheBufferId = sendBufferLease.get();
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
@@ -444,7 +456,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto localRankIndices = std::get<1>(pickRecvConnResult);
     if (pickUpConnections.empty())
     {
-        TLLM_LOG_REQ_DEBUG(llmRequest.mRequestId, "No targets to receive KV cache");
+        TLLM_LOG_DEBUG("No targets to receive KV cache for request ID: %ld", llmRequest.mRequestId);
         return;
     }
     bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
@@ -495,8 +507,14 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
 
         std::optional<int> cacheBufferId = std::nullopt;
         std::optional<BaseTransBufferManager::BufferLease> recvBufferLease;
+        auto bufferKind = transferIndexerKCache ? static_cast<uint8_t>(BufferKind::kKV_INDEXER)
+                                                : static_cast<uint8_t>(BufferKind::kKV);
+        auto preAssignedId = connections[pickUpConnections[0]]->getPreAssignedBufferId(bufferKind);
+        auto* transBufferManager = mCacheTransBufferManagers.at(transferIndexerKCache);
+        bool const useCpuTransferBuffer = mla_cache_formatter_cpu::shouldUseTransferBuffer(
+            connections, pickUpConnections, bufferKind, *transBufferManager);
 
-        if (common::getEnvTryZCopyForKVCacheTransfer()
+        if (!useCpuTransferBuffer && common::getEnvTryZCopyForKVCacheTransfer()
             && destConfig.getParallelConfig().mPipelineParallelism
                 == selfConfig.getParallelConfig().mPipelineParallelism)
         {
@@ -520,19 +538,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         }
         else
         {
-            auto bufferKind = transferIndexerKCache ? static_cast<uint8_t>(BufferKind::kKV_INDEXER)
-                                                    : static_cast<uint8_t>(BufferKind::kKV);
-            auto preAssignedId = connections[pickUpConnections[0]]->getPreAssignedBufferId(bufferKind);
-            if (preAssignedId.has_value())
-            {
-                cacheBufferId = static_cast<int>(*preAssignedId);
-            }
-            else
-            {
-                recvBufferLease.emplace(
-                    mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecvLease());
-                cacheBufferId = recvBufferLease->get();
-            }
             auto targetNum = pickUpConnections.size();
 
             auto getBufferSizeForTarget = [&]()
@@ -555,6 +560,24 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 return bufferEleSizes;
             };
             auto bufferEleSizes = getBufferSizeForTarget();
+
+            if (useCpuTransferBuffer)
+            {
+                mla_cache_formatter_cpu::unformat(session, outputBuffers, pickUpConnections, destConfig, selfConfig,
+                    selfIdx, transferIndexerKCache, *transBufferManager, bufferEleSizes, deviceId);
+                continue;
+            }
+
+            if (preAssignedId.has_value())
+            {
+                cacheBufferId = static_cast<int>(*preAssignedId);
+            }
+            else
+            {
+                recvBufferLease.emplace(
+                    mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecvLease());
+                cacheBufferId = recvBufferLease->get();
+            }
 
             auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateRecvBuffers(
                 cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);

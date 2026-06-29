@@ -62,7 +62,8 @@ class CacheTransBufferManager : public BaseTransBufferManager
 {
 public:
     CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
-        std::optional<size_t> maxNumTokens = std::nullopt, bool transferIndexerKCache = false);
+        std::optional<size_t> maxNumTokens = std::nullopt, bool transferIndexerKCache = false,
+        runtime::MemoryType bufferMemoryType = runtime::MemoryType::kGPU);
 
     static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
         SizeType32 tokensPerBlock,

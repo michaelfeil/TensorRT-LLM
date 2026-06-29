@@ -224,6 +224,12 @@ public:
     /// @brief Get the receive buffer for a given buffer ID.
     runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
 
+    /// @brief Get the memory type used by persistent transfer buffers.
+    [[nodiscard]] runtime::MemoryType getBufferMemoryType() const noexcept
+    {
+        return mBufferMemoryType;
+    }
+
     /// @brief Get the number of receive buffers.
     size_t getRecvBufferCount();
 
@@ -247,8 +253,10 @@ protected:
     /// @param transferBufferSize Size of each transfer buffer in bytes.
     /// @param dataType Data type for the buffers.
     /// @param maxNumTokens Optional max tokens for sizing.
-    BaseTransBufferManager(
-        size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens = std::nullopt);
+    /// @param bufferMemoryType Memory type to use for persistent transfer buffers.
+    BaseTransBufferManager(size_t transferBufferSize, nvinfer1::DataType dataType,
+        std::optional<size_t> maxNumTokens = std::nullopt,
+        runtime::MemoryType bufferMemoryType = runtime::MemoryType::kGPU);
 
     struct ConcurrenceResource
     {
@@ -264,6 +272,7 @@ protected:
         runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource);
 
     void allocateBuffer();
+    void allocateBuffer(ConcurrenceResource& resource, size_t bufferCount);
     std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer);
     void freeBufferIndex(
         ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer);
@@ -276,6 +285,7 @@ protected:
     bool mUseFabricMemory;
     size_t mNumberOfElements;
     nvinfer1::DataType mDataType;
+    runtime::MemoryType mBufferMemoryType;
     ConcurrenceResource mConcurrenceSendResource;
     ConcurrenceResource mConcurrenceRecvResource;
     runtime::BufferManager mBufferManager;
