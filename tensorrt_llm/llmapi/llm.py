@@ -18,7 +18,7 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalParams)
+                                            MultimodalInput, MultimodalParams)
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -52,6 +52,41 @@ from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
+
+
+def _multimodal_embed_mask_cumsum_from_spans(
+        prompt_len: int, mm_positions: Sequence[int],
+        mm_lengths: Sequence[int]) -> List[int]:
+    if len(mm_positions) != len(mm_lengths):
+        raise ValueError(
+            "multimodal_positions and multimodal_lengths must have the same length"
+        )
+    if not mm_positions:
+        raise ValueError("multimodal_positions must not be empty")
+
+    embed_mask = [0] * prompt_len
+    for position, length in zip(mm_positions, mm_lengths):
+        if position < 0:
+            raise ValueError("multimodal_positions must be non-negative")
+        if length <= 0:
+            raise ValueError("multimodal_lengths must be positive")
+        end = position + length
+        if end > prompt_len:
+            raise ValueError(
+                "multimodal span exceeds prompt length: "
+                f"position={position}, length={length}, prompt_len={prompt_len}"
+            )
+        for idx in range(position, end):
+            if embed_mask[idx] != 0:
+                raise ValueError("multimodal spans must not overlap")
+            embed_mask[idx] = 1
+
+    total = 0
+    cumsum = []
+    for value in embed_mask:
+        total += value
+        cumsum.append(total)
+    return cumsum
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -827,6 +862,12 @@ class BaseLLM:
                 mm_pos = inputs.get("multimodal_positions")
                 mm_len = inputs.get("multimodal_lengths")
                 mm_hash = inputs.get("multimodal_hashes")
+                if mm_pos is not None and mm_len is not None:
+                    multimodal_data["multimodal_embed_mask_cumsum"] = (
+                        torch.tensor(
+                            _multimodal_embed_mask_cumsum_from_spans(
+                                len(prompt_token_ids), mm_pos, mm_len),
+                            dtype=torch.int64))
                 if mm_pos is not None and mm_len is not None and mm_hash is not None:
                     multimodal_input_obj = MultimodalInput.from_components(
                         mm_hashes=mm_hash,
