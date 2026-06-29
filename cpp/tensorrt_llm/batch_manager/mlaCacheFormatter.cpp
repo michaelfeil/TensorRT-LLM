@@ -260,7 +260,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
                 llmRequest.mRequestId);
 
-            return;
+            continue;
         }
 
         auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
@@ -534,7 +534,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
                 llmRequest.getContextPhaseParams().value().getReqId());
-            return;
+            continue;
         }
         else
         {
