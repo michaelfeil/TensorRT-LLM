@@ -861,6 +861,8 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
             defer_secondary_pool_allocation=defer_secondary_pool_allocation,
+            enable_token_budget_fallback=getattr(
+                self._llm_args, "enable_token_budget_fallback", True),
         )
 
         if not self._skip_est:
@@ -1577,7 +1579,8 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
-        defer_secondary_pool_allocation: bool = False) -> KVCacheManager:
+        defer_secondary_pool_allocation: bool = False,
+        enable_token_budget_fallback: bool = True) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1920,6 +1923,21 @@ def _create_kv_cache_manager(
     # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
     # via cache_layer_idx — shared layers use target layer's index for
     # get_buffers(). No layer_offsets remapping needed here.
+
+    # Propagate the finalized chunked-prefill flag so KVCacheManager._fit_token_budget
+    # only re-chunks context requests when the attention backend can consume a
+    # partial context chunk; otherwise it defers them instead. The flag is read
+    # from attn_runtime_features, which py_executor_creator finalizes (including
+    # the SM-version / attention-backend overrides) before build_managers runs.
+    if isinstance(kv_cache_manager,
+                  KVCacheManager) and model_engine is not None:
+        kv_cache_manager.enable_chunked_prefill = bool(
+            model_engine.attn_runtime_features.chunked_prefill)
+    # Opt-out switch (TorchLlmArgs.enable_token_budget_fallback) for the
+    # prep-boundary token-budget fallback in _fit_token_budget.
+    if isinstance(kv_cache_manager, KVCacheManager):
+        kv_cache_manager.enable_token_budget_fallback = (
+            enable_token_budget_fallback)
 
     return kv_cache_manager
 
