@@ -617,8 +617,8 @@ UcxCancelReason classifyCancelReason(char const* reason) noexcept
     return UcxCancelReason::kOther;
 }
 
-bool cancelRequest(std::shared_ptr<ucxx::Request> const& req, int rank, char const* operation, int tag,
-    ucxx::Worker& worker)
+bool cancelRequest(
+    std::shared_ptr<ucxx::Request> const& req, int rank, char const* operation, int tag, ucxx::Worker& worker)
 {
     try
     {
@@ -648,9 +648,8 @@ bool cancelRequest(std::shared_ptr<ucxx::Request> const& req, int rank, char con
 bool cancelRequestWithLog(std::shared_ptr<ucxx::Request> const& req, DataContext const& ctx, int rank,
     char const* operation, char const* reason, ucxx::Worker& worker)
 {
-    if (detail::isExpectedRequestInfoRecvConnectCleanupCancel(
-            ctx.getTag(), operation, reason, tensorrt_llm::batch_manager::TransceiverTag::kID_TAG,
-            ctx.isExpectedTransferTerminate()))
+    if (detail::isExpectedRequestInfoRecvConnectCleanupCancel(ctx.getTag(), operation, reason,
+            tensorrt_llm::batch_manager::TransceiverTag::kID_TAG, ctx.getTransferTerminate().load()))
     {
         TLLM_LOG_DEBUG(rank, "Scheduling expected UCX %s cancel for tag %d: %s", operation, ctx.getTag(), reason);
     }
@@ -798,9 +797,8 @@ void waitForPayloadChunk(PayloadChunkRequest& chunk, DataContext const& ctx, int
     chunk.request->checkError();
 }
 
-void quarantineActivePayloadChunks(
-    std::deque<PayloadChunkRequest>& chunks, DataContext const& ctx, int rank, char const* operation,
-    ucxx::Endpoint& endpoint) noexcept
+void quarantineActivePayloadChunks(std::deque<PayloadChunkRequest>& chunks, DataContext const& ctx, int rank,
+    char const* operation, ucxx::Endpoint& endpoint) noexcept
 {
     auto endpointWorker = endpoint.getWorker();
     TLLM_CHECK_WITH_INFO(endpointWorker != nullptr, "UCX endpoint worker must be available for request cancellation");
@@ -1152,7 +1150,8 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
         worker = endpointWorker.get();
     }
     TLLM_CHECK_WITH_INFO(worker != nullptr, "UCX worker must be available for request cancellation");
-    auto failCancelSchedule = [&](char const* reason, std::chrono::steady_clock::time_point now) {
+    auto failCancelSchedule = [&](char const* reason, std::chrono::steady_clock::time_point now)
+    {
         auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - operationStart).count();
         char const* const ucsStatus = ucs_status_string(req->getStatus());
         TLLM_LOG_ERROR(rank,
