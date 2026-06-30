@@ -318,6 +318,39 @@ class CacheSender::Impl
 public:
     using RequestIdType = LlmRequest::RequestIdType;
 
+    struct ReceiveInterruptContext
+    {
+        std::atomic<bool> mInterrupt{false};
+        std::atomic<bool> mAcceptsRequestInterrupt{true};
+    };
+
+    class ActiveReceiveGuard
+    {
+    public:
+        ActiveReceiveGuard(Impl& owner, std::shared_ptr<ReceiveInterruptContext> context)
+            : mOwner{owner}
+            , mContext{std::move(context)}
+        {
+        }
+
+        ~ActiveReceiveGuard()
+        {
+            if (mContext != nullptr)
+            {
+                mOwner.finishReceiveInterruptContext(mContext);
+            }
+        }
+
+        ActiveReceiveGuard(ActiveReceiveGuard const&) = delete;
+        ActiveReceiveGuard& operator=(ActiveReceiveGuard const&) = delete;
+        ActiveReceiveGuard(ActiveReceiveGuard&&) = delete;
+        ActiveReceiveGuard& operator=(ActiveReceiveGuard&&) = delete;
+
+    private:
+        Impl& mOwner;
+        std::shared_ptr<ReceiveInterruptContext> mContext;
+    };
+
     Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
         , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
@@ -511,6 +544,64 @@ public:
         PerRequestActivityLog::instance().record(requestId, "session_released", "CacheSender::release");
     }
 
+    [[nodiscard]] std::shared_ptr<ReceiveInterruptContext> beginReceiveInterruptContext()
+    {
+        std::scoped_lock lk(mSenderMutex);
+        if (mReadyResponses.empty())
+        {
+            return nullptr;
+        }
+        for (auto const& [requestId, _] : mReadyResponses)
+        {
+            if (mCancelledRequests.find(requestId) != mCancelledRequests.end())
+            {
+                return nullptr;
+            }
+        }
+        auto context = std::make_shared<ReceiveInterruptContext>();
+        mActiveReceiveInterrupt = context;
+        return context;
+    }
+
+    void finishReceiveInterruptContext(std::shared_ptr<ReceiveInterruptContext> const& context)
+    {
+        std::scoped_lock lk(mSenderMutex);
+        if (mActiveReceiveInterrupt == context)
+        {
+            mActiveReceiveInterrupt.reset();
+        }
+    }
+
+    void stopAcceptingReceiveInterrupt(std::shared_ptr<ReceiveInterruptContext> const& context)
+    {
+        std::scoped_lock lk(mSenderMutex);
+        if (mActiveReceiveInterrupt == context)
+        {
+            context->mAcceptsRequestInterrupt.store(false);
+            context->mInterrupt.store(false);
+        }
+    }
+
+    void interruptActiveReceive(bool quiet)
+    {
+        static_cast<void>(quiet);
+        std::shared_ptr<ReceiveInterruptContext> context;
+        {
+            std::scoped_lock lk(mSenderMutex);
+            context = mActiveReceiveInterrupt;
+            if (context == nullptr)
+            {
+                return;
+            }
+            if (!context->mAcceptsRequestInterrupt.load())
+            {
+                return;
+            }
+            context->mInterrupt.store(true);
+        }
+        mSenderCv.notify_all();
+    }
+
     [[nodiscard]] std::optional<RequestInfo> recvRequestInfo()
     {
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -518,12 +609,24 @@ public:
 
         TransceiverTag::Id id;
         RequestInfo info;
+        auto receiveInterrupt = isAgent ? nullptr : beginReceiveInterruptContext();
+        ActiveReceiveGuard receiveGuard{*this, receiveInterrupt};
+        if (!isAgent && receiveInterrupt == nullptr)
+        {
+            return std::nullopt;
+        }
         auto const* connection = isAgent
             ? agentConnectionManager->recvConnectionAndRequestInfo(info, mTerminate)
-            : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mReceiveInterrupt}, &id, sizeof(id));
+            : mManager->recvConnect(
+                DataContext{TransceiverTag::kID_TAG, receiveInterrupt->mInterrupt}, &id, sizeof(id));
         if (connection == nullptr)
         {
             return std::nullopt;
+        }
+        if (receiveInterrupt != nullptr)
+        {
+            // Once tag 19 has selected a connection, drain the rest of this request-info envelope.
+            stopAcceptingReceiveInterrupt(receiveInterrupt);
         }
 
         if (!isAgent)
@@ -533,15 +636,13 @@ public:
             std::string serializedInfo;
             try
             {
-                connection->recv(
-                    DataContext{TransceiverTag::kINFO_SIZE_TAG, mReceiveInterrupt}, &infoSize, sizeof(infoSize));
+                connection->recv(DataContext{TransceiverTag::kINFO_SIZE_TAG, mTerminate}, &infoSize, sizeof(infoSize));
                 serializedInfo.resize(infoSize);
-                connection->recv(
-                    DataContext{TransceiverTag::kINFO_TAG, mReceiveInterrupt}, serializedInfo.data(), infoSize);
+                connection->recv(DataContext{TransceiverTag::kINFO_TAG, mTerminate}, serializedInfo.data(), infoSize);
             }
             catch (std::exception const&)
             {
-                if (mReceiveInterrupt.load())
+                if (mTerminate.load())
                 {
                     return std::nullopt;
                 }
@@ -552,62 +653,107 @@ public:
         }
 
         auto requestId = info.getRequestId();
-        if (!isAgent)
+        try
         {
-            std::scoped_lock lk(mSenderMutex, mMtxForMap);
-            if (auto const* reason = getRequestInfoDiscardReasonUnlocked(requestId))
+            if (!isAgent)
             {
-                logDiscardedRequestInfo(requestId, reason);
-                return std::nullopt;
-            }
-        }
-        mCacheTransferLayer.validateSupport(info.getTransState());
-
-        auto allCounterparts = mCacheTransferLayer.computeCounterparts(
-            mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
-
-        auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx();
-        int peerIdx = std::distance(
-            allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
-
-        TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
-            "Peer rank %d not found in expected counterparts", peerSelfIdx);
-        auto const peerOffset = static_cast<size_t>(peerIdx);
-        {
-            std::scoped_lock lk(mSenderMutex, mMtxForMap);
-            auto it = mRequestToSession.find(requestId);
-            if (it == mRequestToSession.end())
-            {
-                if (!isAgent)
+                char const* discardReason{nullptr};
                 {
-                    if (auto const* reason = getRequestInfoDiscardReasonUnlocked(requestId))
+                    std::scoped_lock lk(mSenderMutex, mMtxForMap);
+                    discardReason = getRequestInfoDiscardReasonUnlocked(requestId);
+                }
+                if (discardReason != nullptr)
+                {
+                    logDiscardedRequestInfo(requestId, discardReason);
+                    sendRequestInfoRejectReadySignal(connection, requestId, discardReason);
+                    return std::nullopt;
+                }
+            }
+            mCacheTransferLayer.validateSupport(info.getTransState());
+
+            auto allCounterparts = mCacheTransferLayer.computeCounterparts(
+                mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
+
+            auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx();
+            int peerIdx = std::distance(
+                allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
+
+            TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
+                "Peer rank %d not found in expected counterparts", peerSelfIdx);
+            auto const peerOffset = static_cast<size_t>(peerIdx);
+            char const* discardReason{nullptr};
+            bool duplicatePeerConnection{false};
+            {
+                std::scoped_lock lk(mSenderMutex, mMtxForMap);
+                auto it = mRequestToSession.find(requestId);
+                if (it == mRequestToSession.end())
+                {
+                    if (!isAgent)
                     {
-                        logDiscardedRequestInfo(requestId, reason);
-                        return std::nullopt;
+                        discardReason = getRequestInfoDiscardReasonUnlocked(requestId);
+                    }
+                    if (discardReason == nullptr)
+                    {
+                        auto& requestCancelFlag = mRequestCancelFlags[requestId];
+                        if (requestCancelFlag == nullptr)
+                        {
+                            requestCancelFlag = std::make_shared<std::atomic<bool>>(false);
+                        }
+                        auto session = TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
+                            DataContext{tagFromRequestId(requestId), *requestCancelFlag}, allCounterparts, mSelfState,
+                            info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(),
+                            nullptr, !common::getEnvKVCacheTimeOutputPath().empty(), requestCancelFlag);
+                        session.setTime(TransferSession::kTimeRequestInfo);
+                        it = mRequestToSession.emplace(requestId, std::move(session)).first;
+                        PerRequestActivityLog::instance().record(
+                            requestId, "session_added", "CacheSender::recvRequestInfo");
                     }
                 }
-                auto& requestCancelFlag = mRequestCancelFlags[requestId];
-                if (requestCancelFlag == nullptr)
+                if (discardReason == nullptr && !isAgent && it->second.getConnections().at(peerOffset) != nullptr)
                 {
-                    requestCancelFlag = std::make_shared<std::atomic<bool>>(false);
+                    duplicatePeerConnection = true;
                 }
-                auto session = TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId), *requestCancelFlag}, allCounterparts, mSelfState,
-                    info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                    !common::getEnvKVCacheTimeOutputPath().empty(), requestCancelFlag);
-                session.setTime(TransferSession::kTimeRequestInfo);
-                it = mRequestToSession.emplace(requestId, std::move(session)).first;
-                PerRequestActivityLog::instance().record(requestId, "session_added", "CacheSender::recvRequestInfo");
+                if (discardReason == nullptr && !duplicatePeerConnection)
+                {
+                    it->second.setConnection(peerOffset, connection);
+                    recordContextKvTransferEventReportUnlocked(requestId, it->second);
+                }
             }
-            else if (!isAgent && it->second.getConnections().at(peerOffset) != nullptr)
+            if (duplicatePeerConnection)
             {
-                logDiscardedRequestInfo(requestId, "duplicate_peer_connection");
+                char const* reason = "duplicate_peer_connection";
+                logDiscardedRequestInfo(requestId, reason);
+                sendRequestInfoRejectReadySignal(connection, requestId, reason);
                 return std::nullopt;
             }
-            it->second.setConnection(peerOffset, connection);
-            recordContextKvTransferEventReportUnlocked(requestId, it->second);
+            if (discardReason != nullptr)
+            {
+                logDiscardedRequestInfo(requestId, discardReason);
+                sendRequestInfoRejectReadySignal(connection, requestId, discardReason);
+                return std::nullopt;
+            }
+            return info;
         }
-        return info;
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_REQ_ERROR(requestId, "Exception while handling request info: %s", e.what());
+            if (!isAgent)
+            {
+                sendRequestInfoRejectReadySignal(connection, requestId, "request_info_failure");
+            }
+            failAndRemoveResponseById(requestId, "request_info_failure", std::current_exception());
+            return std::nullopt;
+        }
+        catch (...)
+        {
+            TLLM_LOG_REQ_ERROR(requestId, "Exception while handling request info");
+            if (!isAgent)
+            {
+                sendRequestInfoRejectReadySignal(connection, requestId, "request_info_failure");
+            }
+            failAndRemoveResponseById(requestId, "request_info_failure", std::current_exception());
+            return std::nullopt;
+        }
     }
 
     void sendSync(LlmRequest const& llmRequest)
@@ -674,8 +820,7 @@ public:
         }
         if (isCancelled && dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) == nullptr)
         {
-            mReceiveInterrupt.store(true);
-            mSenderCv.notify_all();
+            interruptActiveReceive(/* quiet = */ false);
         }
         if (!isCancelled)
         {
@@ -757,6 +902,78 @@ private:
     void logDiscardedRequestInfo(RequestIdType requestId, char const* reason) const
     {
         TLLM_LOG_REQ_WARNING(requestId, "Discarding stale context transfer request info reason=%s", reason);
+    }
+
+    void failAndRemoveResponseById(
+        RequestIdType requestId, char const* reason, std::exception_ptr responseException) noexcept
+    {
+        std::optional<Response> response;
+        bool hasReadyResponses{false};
+        {
+            std::scoped_lock lk(mSenderMutex, mMtxForMap);
+            auto it = mReadyResponses.find(requestId);
+            if (it == mReadyResponses.end())
+            {
+                return;
+            }
+            response.emplace(std::move(it->second));
+            mReadyResponses.erase(it);
+            mCancelledRequests.erase(requestId);
+            mRemainSendCount.erase(requestId);
+            if (mCurrentRequest.has_value() && getCurrentRequestId() == requestId)
+            {
+                mCurrentRequest = std::nullopt;
+            }
+            mRequestToSession.erase(requestId);
+            mRequestCancelFlags.erase(requestId);
+            mReportableContextKvTransferRequestIds.insert(requestId);
+            hasReadyResponses = !mReadyResponses.empty();
+        }
+
+        if (!hasReadyResponses)
+        {
+            std::unique_lock lkCond(mCondMutex);
+            mAnyReady = false;
+        }
+
+        PerRequestActivityLog::instance().record(requestId, "request_info_failed", "CacheSender::recvRequestInfo");
+        try
+        {
+            response->mPromise.set_exception(std::move(responseException));
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_REQ_WARNING(
+                requestId, "Failed to set response exception after %s: %s", reason, e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_REQ_WARNING(requestId, "Failed to set response exception after %s", reason);
+        }
+    }
+
+    void sendRequestInfoRejectReadySignal(
+        Connection const* connection, RequestIdType requestId, char const* reason) noexcept
+    {
+        if (connection == nullptr)
+        {
+            return;
+        }
+        try
+        {
+            bool const isReady{false};
+            connection->send(executor::kv_cache::DataContext{readyTagFromRequestId(requestId), mTerminate}, &isReady,
+                sizeof(isReady));
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_REQ_WARNING(
+                requestId, "Failed to reject stale request info reason=%s error=%s", reason, e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_REQ_WARNING(requestId, "Failed to reject stale request info reason=%s", reason);
+        }
     }
 
     void handleAsyncSend(AsyncSendResource& resource)
@@ -935,10 +1152,7 @@ private:
                         {
                             return;
                         }
-                        if (mReceiveInterrupt.exchange(false))
-                        {
-                            completeCancelledResponsesForInterruptedReceive();
-                        }
+                        completeCancelledResponsesForInterruptedReceive();
                         continue;
                     }
                     if (mTerminate || !mManager->isRunning())
@@ -1021,7 +1235,7 @@ private:
             std::unique_lock lk(mCondMutex);
             mTerminate = true;
         }
-        mReceiveInterrupt.store(true);
+        interruptActiveReceive(/* quiet = */ false);
         cancelAllInFlightRequests();
         // We don't have to wait for the future. If another thread is sending data, it won't pay attention
         // to the terminate flag.
@@ -1164,7 +1378,7 @@ private:
     std::map<RequestIdType, Response> mReadyResponses;
     std::mutex mSenderMutex, mCondMutex;
     std::atomic<bool> mAnyReady{false}, mTerminate{false};
-    std::atomic<bool> mReceiveInterrupt{false};
+    std::shared_ptr<ReceiveInterruptContext> mActiveReceiveInterrupt;
     std::condition_variable mSenderCv, mResponderCv;
     std::future<void> mResponseFuture;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
