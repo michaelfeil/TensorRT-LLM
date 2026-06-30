@@ -77,6 +77,7 @@ def create_attention(
     sparse_params: Optional[SparseParams] = None,
     dtype: Optional[torch.dtype] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
+    owns_indexer: bool = True,
 ):
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -117,6 +118,8 @@ def create_attention(
     )
     if sparse_params is not None:
         kwargs["sparse_params"] = sparse_params
+        if getattr(sparse_params, "algorithm", None) == "dsa":
+            kwargs["owns_indexer"] = owns_indexer
 
     return attn_cls(
         layer_idx,

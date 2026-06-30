@@ -22,7 +22,6 @@ from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
 
 class _RemoteResult:
-
     def __init__(self, value):
         self._value = value
 
@@ -31,7 +30,6 @@ class _RemoteResult:
 
 
 class _StatsRpcClient:
-
     def __init__(self, stats):
         self._stats = deque(stats)
 
@@ -70,7 +68,8 @@ def test_proxy_aget_stats_result_from_callback_thread_drains_async():
         loop = asyncio.get_running_loop()
         with ThreadPoolExecutor(max_workers=1) as executor:
             stats_result = await loop.run_in_executor(
-                executor, lambda: proxy.aget_stats(timeout=0.01))
+                executor, lambda: proxy.aget_stats(timeout=0.01)
+            )
         stats_result.set_timeout(0.01)
         return await _collect_async_stats(stats_result)
 

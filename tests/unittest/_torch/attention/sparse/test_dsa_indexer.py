@@ -10,6 +10,7 @@ This file tests:
 
 import builtins
 import random
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -21,6 +22,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManager, DSAtrtllmAttentionMetadata, Indexer,
+    _should_reuse_shared_topk_for_scheduler,
     compute_cu_seqlen_kv_bounds_with_cache, split_prefill_chunks)
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
@@ -53,6 +55,23 @@ def _ceil_to_ue8m0(x: torch.Tensor):
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return (a + b - 1) // b
+
+
+def test_scheduler_metadata_reuse_covers_mtp_draft_window_before_skip_flag():
+    metadata = SimpleNamespace(
+        reuse_dsa_topk_indices=False,
+        cache_dsa_topk_indices=False,
+        has_shared_dsa_topk_indices=False,
+        index_share_for_mtp_iteration=True,
+        in_mtp_draft_loop=True,
+        indexer_skip_topk=False,
+        shared_topk_indices=object(),
+    )
+
+    assert _should_reuse_shared_topk_for_scheduler(metadata) is True
+
+    metadata.index_share_for_mtp_iteration = False
+    assert _should_reuse_shared_topk_for_scheduler(metadata) is False
 
 
 def create_dsa_cache_manager(

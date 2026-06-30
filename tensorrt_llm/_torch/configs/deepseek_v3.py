@@ -1,5 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: Apache-2.0
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
@@ -55,6 +56,7 @@ class DeepseekV3Config(PretrainedConfig):
         attention_dropout=0.0,
         **kwargs,
     ):
+        layer_types = kwargs.pop("layer_types", None)
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -101,3 +103,5 @@ class DeepseekV3Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        if layer_types is not None:
+            self.layer_types = layer_types

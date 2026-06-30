@@ -874,163 +874,187 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i in range(runtime_draft_len):
-                # Run draft model (mode-specific via helper). The helper
-                # passes ``all_rank_num_tokens`` as a kwarg so the draft model
-                # handles save/restore internally (Eagle3DraftModel.forward
-                # uses try/finally); attn_metadata is left untouched here.
-                hidden_states, hidden_states_to_save = self._run_draft_forward(
-                    draft_model, inputs, spec_metadata, i)
+        reuse_mtp_topk = (
+            self.is_mtp_eagle and hasattr(attn_metadata, "set_skip_topk")
+            and hasattr(attn_metadata, "set_in_mtp_draft_loop"))
+        if reuse_mtp_topk:
+            attn_metadata.set_in_mtp_draft_loop(True)
+        try:
+            with self.draft_kv_cache_context(attn_metadata,
+                                             draft_kv_cache_manager):
+                for i in range(runtime_draft_len):
+                    if reuse_mtp_topk:
+                        attn_metadata.set_skip_topk(i > 0)
+                    # Run draft model (mode-specific via helper). The helper
+                    # passes ``all_rank_num_tokens`` as a kwarg so the draft model
+                    # handles save/restore internally (Eagle3DraftModel.forward
+                    # uses try/finally); attn_metadata is left untouched here.
+                    hidden_states, hidden_states_to_save = self._run_draft_forward(
+                        draft_model, inputs, spec_metadata, i)
 
-                # Compute gather_ids: on the first draft step each generation
-                # request may have accepted multiple tokens, so we index into
-                # the flattened token sequence to find the last accepted one.
-                # From step 1 onwards every sequence has length 1, so
-                # ``batch_indices_cuda`` is sufficient.
-                if i == 0:
-                    start_ids_gen = (
-                        spec_metadata.batch_indices_cuda[:num_gens] *
-                        (runtime_draft_len + 1)).long()
-                    gather_ids_gen = (start_ids_gen +
-                                      num_accepted_tokens[num_contexts:] - 1 +
-                                      attn_metadata.num_ctx_tokens)
-                    gather_ids = torch.concat(
-                        [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
-                else:
-                    gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
-
-                if self.guided_decoder is not None:
-                    new_tokens = inputs["input_ids"][gather_ids]
-                    self.guided_decoder.add_draft_batch(new_tokens,
-                                                        num_accepted_tokens,
-                                                        draft_step=i)
-
-                # Compute logits.
-                # MTP Eagle: shared_head of the MTP layer, with optional
-                #   ADP+LM-head-TP padding to ``max_num_requests`` so every TP
-                #   rank produces logits of the same shape.
-                # Eagle3: logits_processor of the EAGLE draft model.
-                use_lm_head_tp_in_adp = (
-                    self.is_mtp_eagle and self.model_config is not None
-                    and self.model_config.mapping.enable_attention_dp
-                    and getattr(self.model_config.mapping,
-                                'enable_lm_head_tp_in_adp', False))
-                if self.is_mtp_eagle:
-                    if use_lm_head_tp_in_adp:
-                        hidden_states_gathered = hidden_states[gather_ids]
-                        token_count = hidden_states_gathered.view(
-                            -1, hidden_states_gathered.shape[-1]).shape[0]
-                        max_num_requests = spec_metadata.max_num_requests
-                        pad_len = max_num_requests - token_count
-                        if pad_len > 0:
-                            padded_hidden_states = F.pad(
-                                hidden_states_gathered.view(
-                                    -1, hidden_states_gathered.shape[-1]),
-                                (0, 0, 0, pad_len),
-                                mode="constant",
-                                value=0)
-                        elif pad_len == 0:
-                            padded_hidden_states = hidden_states_gathered.view(
-                                -1, hidden_states_gathered.shape[-1])
-                        else:
-                            raise ValueError(
-                                "Eagle3OneModelWorker (MTP Eagle mode): "
-                                "token_count > max_num_requests, which is not supported"
-                            )
-                        logits = draft_model.mtp_layers[0].shared_head(
-                            padded_hidden_states, draft_model.lm_head,
-                            attn_metadata, True)
+                    # Compute gather_ids: on the first draft step each generation
+                    # request may have accepted multiple tokens, so we index into
+                    # the flattened token sequence to find the last accepted one.
+                    # From step 1 onwards every sequence has length 1, so
+                    # ``batch_indices_cuda`` is sufficient.
+                    if i == 0:
+                        start_ids_gen = (
+                            spec_metadata.batch_indices_cuda[:num_gens] *
+                            (runtime_draft_len + 1)).long()
+                        gather_ids_gen = (
+                            start_ids_gen +
+                            num_accepted_tokens[num_contexts:] - 1 +
+                            attn_metadata.num_ctx_tokens)
+                        gather_ids = torch.concat([
+                            last_tokens_idx[:num_contexts], gather_ids_gen
+                        ],
+                                                  dim=0)
                     else:
-                        logits = draft_model.mtp_layers[0].shared_head(
+                        gather_ids = spec_metadata.batch_indices_cuda[:
+                                                                      batch_size]
+
+                    if self.guided_decoder is not None:
+                        new_tokens = inputs["input_ids"][gather_ids]
+                        self.guided_decoder.add_draft_batch(new_tokens,
+                                                            num_accepted_tokens,
+                                                            draft_step=i)
+
+                    # Compute logits.
+                    # MTP Eagle: shared_head of the MTP layer, with optional
+                    #   ADP+LM-head-TP padding to ``max_num_requests`` so every TP
+                    #   rank produces logits of the same shape.
+                    # Eagle3: logits_processor of the EAGLE draft model.
+                    use_lm_head_tp_in_adp = (
+                        self.is_mtp_eagle and self.model_config is not None
+                        and self.model_config.mapping.enable_attention_dp
+                        and getattr(self.model_config.mapping,
+                                    'enable_lm_head_tp_in_adp', False))
+                    if self.is_mtp_eagle:
+                        if use_lm_head_tp_in_adp:
+                            hidden_states_gathered = hidden_states[gather_ids]
+                            token_count = hidden_states_gathered.view(
+                                -1, hidden_states_gathered.shape[-1]).shape[0]
+                            max_num_requests = spec_metadata.max_num_requests
+                            pad_len = max_num_requests - token_count
+                            if pad_len > 0:
+                                padded_hidden_states = F.pad(
+                                    hidden_states_gathered.view(
+                                        -1, hidden_states_gathered.shape[-1]),
+                                    (0, 0, 0, pad_len),
+                                    mode="constant",
+                                    value=0)
+                            elif pad_len == 0:
+                                padded_hidden_states = hidden_states_gathered.view(
+                                    -1, hidden_states_gathered.shape[-1])
+                            else:
+                                raise ValueError(
+                                    "Eagle3OneModelWorker (MTP Eagle mode): "
+                                    "token_count > max_num_requests, which is not supported"
+                                )
+                            logits = draft_model.mtp_layers[0].shared_head(
+                                padded_hidden_states, draft_model.lm_head,
+                                attn_metadata, True)
+                        else:
+                            logits = draft_model.mtp_layers[0].shared_head(
+                                hidden_states[gather_ids], draft_model.lm_head,
+                                attn_metadata, True)
+                    else:
+                        logits = draft_model.logits_processor(
                             hidden_states[gather_ids], draft_model.lm_head,
                             attn_metadata, True)
-                else:
-                    logits = draft_model.logits_processor(
-                        hidden_states[gather_ids], draft_model.lm_head,
-                        attn_metadata, True)
 
-                if self.guided_decoder is not None:
-                    if self.is_mtp_eagle:
-                        self.guided_decoder.execute_draft_batch(logits,
-                                                                draft_step=i)
+                    if self.guided_decoder is not None:
+                        if self.is_mtp_eagle:
+                            self.guided_decoder.execute_draft_batch(
+                                logits, draft_step=i)
+                        else:
+                            d2t = getattr(draft_model.model, "d2t", None)
+                            self.guided_decoder.execute_draft_batch(
+                                logits, d2t, draft_step=i)
+
+                    if (use_lm_head_tp_in_adp
+                            and spec_metadata.is_all_greedy_sample):
+                        mapping_lm_head_tp = draft_model.mtp_layers[
+                            0].shared_head.mapping_lm_head_tp
+                        new_draft_token = self.draft_sampler(
+                            logits, mapping_lm_head_tp)
+                        new_draft_token = new_draft_token[:token_count]
                     else:
-                        d2t = getattr(draft_model.model, "d2t", None)
-                        self.guided_decoder.execute_draft_batch(logits,
-                                                                d2t,
-                                                                draft_step=i)
+                        # When ADP+LM-head-TP pads logits to max_num_requests,
+                        # the padded rows are zero-filled placeholders. The
+                        # advanced-sampling path below uses per-request sampling
+                        # params sized to token_count, so keep the existing trim
+                        # there. The all-greedy path above must sample before the
+                        # trim so the LM-head-TP global argmax sees the padded
+                        # shape expected by its collective.
+                        if use_lm_head_tp_in_adp:
+                            logits = logits[:token_count]
+                        new_draft_token = self.draft_decoder(logits,
+                                                             draft_model,
+                                                             spec_metadata,
+                                                             batch_size,
+                                                             draft_step=i)
+                    next_draft_tokens.append(new_draft_token)
 
-                # When ADP+LM-head-TP pads logits to max_num_requests, the
-                # padded rows are zero-filled placeholders only required so
-                # every TP rank produces logits of identical shape for the
-                # LM-head-TP all-gather. Drop them *before* sampling: the
-                # per-request sampling params (temperatures/top_k/top_p) are
-                # sized to token_count (== batch_size), so the padded logits
-                # would otherwise fail to broadcast in apply_temperature. This
-                # also keeps next_draft_tokens and the draft_probs buffer
-                # token_count-sized without a post-hoc trim.
-                if use_lm_head_tp_in_adp:
-                    logits = logits[:token_count]
-                new_draft_token = self.draft_decoder(logits,
-                                                     draft_model,
-                                                     spec_metadata,
-                                                     batch_size,
-                                                     draft_step=i)
-                next_draft_tokens.append(new_draft_token)
+                    # Update hidden states for the next iteration.
+                    # MTP Eagle: the MTP layer returns a single tensor; slice by
+                    #   gather_ids to get one hidden state per request.
+                    # Eagle3: the EAGLE draft model returns a secondary
+                    #   ``hidden_states_to_save`` specifically for this purpose.
+                    if self.is_mtp_eagle:
+                        hidden_states = hidden_states[gather_ids]
+                    else:
+                        hidden_states = hidden_states_to_save[gather_ids]
+                    position_ids = (_select_mtp_position_ids(
+                        inputs["position_ids"], gather_ids) + 1)
 
-                # Update hidden states for the next iteration.
-                # MTP Eagle: the MTP layer returns a single tensor; slice by
-                #   gather_ids to get one hidden state per request.
-                # Eagle3: the EAGLE draft model returns a secondary
-                #   ``hidden_states_to_save`` specifically for this purpose.
-                if self.is_mtp_eagle:
-                    hidden_states = hidden_states[gather_ids]
-                else:
-                    hidden_states = hidden_states_to_save[gather_ids]
-                position_ids = (_select_mtp_position_ids(
-                    inputs["position_ids"], gather_ids) + 1)
+                    # Update attn_metadata for the next iteration.
+                    if i == 0:
+                        attn_metadata._seq_lens[:batch_size].fill_(1)
+                        attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+                        attn_metadata.on_update()
+                        has_kv_cache = inputs[
+                            "attn_metadata"].kv_cache_manager is not None
+                        if has_kv_cache:
+                            attn_metadata.host_request_types[:attn_metadata.
+                                                             num_contexts].fill_(
+                                                                 1)
+                            attn_metadata.num_contexts = 0
+                        if hasattr(attn_metadata, 'kv_lens_cuda'):
+                            attn_metadata.kv_lens_cuda[
+                                num_contexts:batch_size] -= (
+                                    runtime_draft_len -
+                                    num_accepted_tokens[num_contexts:])
+                            attn_metadata.kv_lens_cuda[:num_contexts] += 1
 
-                # Update attn_metadata for the next iteration.
-                if i == 0:
-                    attn_metadata._seq_lens[:batch_size].fill_(1)
-                    attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-                    attn_metadata.on_update()
-                    has_kv_cache = inputs[
-                        "attn_metadata"].kv_cache_manager is not None
-                    if has_kv_cache:
-                        attn_metadata.host_request_types[:attn_metadata.
-                                                         num_contexts].fill_(1)
-                        attn_metadata.num_contexts = 0
-                    if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            runtime_draft_len -
-                            num_accepted_tokens[num_contexts:])
-                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
+                        if has_kv_cache:
+                            self._prepare_flash_mla_generation_layout(
+                                attn_metadata, num_contexts, batch_size)
+                        if hasattr(attn_metadata, 'kv_lens_cuda'):
+                            attn_metadata.update_for_spec_dec()
 
-                    if has_kv_cache:
-                        self._prepare_flash_mla_generation_layout(
-                            attn_metadata, num_contexts, batch_size)
-                    if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.update_for_spec_dec()
+                        # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
+                        # tokens in the first draft step (attention runs in spec-dec
+                        # mode), then 1 token per step in subsequent iterations.
+                        # Disable spec_decoding here so the masks/positions stay
+                        # correct on subsequent iters.
+                        attn_metadata.use_spec_decoding = False
+                    else:
+                        if hasattr(attn_metadata, 'kv_lens_cuda'):
+                            attn_metadata.kv_lens_cuda[:batch_size] += 1
+                            attn_metadata.update_for_spec_dec()
 
-                    # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
-                    # tokens in the first draft step (attention runs in spec-dec
-                    # mode), then 1 token per step in subsequent iterations.
-                    # Disable spec_decoding here so the masks/positions stay
-                    # correct on subsequent iters.
-                    attn_metadata.use_spec_decoding = False
-                else:
-                    if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.kv_lens_cuda[:batch_size] += 1
-                        attn_metadata.update_for_spec_dec()
-
-                inputs = {
-                    "input_ids": new_draft_token,
-                    "position_ids": position_ids,
-                    "hidden_states": hidden_states,
-                    "attn_metadata": attn_metadata,
-                    "spec_metadata": spec_metadata,
-                }
+                    inputs = {
+                        "input_ids": new_draft_token,
+                        "position_ids": position_ids,
+                        "hidden_states": hidden_states,
+                        "attn_metadata": attn_metadata,
+                        "spec_metadata": spec_metadata,
+                    }
+        finally:
+            if reuse_mtp_topk:
+                attn_metadata.set_skip_topk(False)
+                attn_metadata.set_in_mtp_draft_loop(False)
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # Override with SA draft tokens after all draft layers have run,

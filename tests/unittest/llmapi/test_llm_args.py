@@ -105,8 +105,9 @@ def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
 class TestDeepSeekSparseAttentionConfig:
 
     @staticmethod
-    def _params(pretrained_config=None, layer_idx=None):
-        return DeepSeekSparseAttentionConfig(index_topk=2048).to_sparse_params(
+    def _params(config=None, pretrained_config=None, layer_idx=None):
+        config = config or DeepSeekSparseAttentionConfig(index_topk=2048)
+        return config.to_sparse_params(
             pretrained_config=pretrained_config,
             layer_idx=layer_idx,
         )
@@ -115,28 +116,64 @@ class TestDeepSeekSparseAttentionConfig:
         pretrained_config = SimpleNamespace(num_hidden_layers=4,
                                             index_topk_pattern="NSSN")
 
-        assert self._params(pretrained_config, 0).is_full_indexer_layer is True
-        assert self._params(pretrained_config, 1).is_full_indexer_layer is False
-        assert self._params(pretrained_config, 2).is_full_indexer_layer is False
-        assert self._params(pretrained_config, 3).is_full_indexer_layer is True
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=0).is_full_indexer_layer is True
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=1).is_full_indexer_layer is False
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=2).is_full_indexer_layer is False
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=3).is_full_indexer_layer is True
+
+    def test_indexer_types_resolve_shared_indexer_layers(self):
+        config = DeepSeekSparseAttentionConfig(
+            index_topk=2048,
+            indexer_types=["full", "shared", "s", "f"],
+        )
+
+        assert self._params(config, layer_idx=0).is_full_indexer_layer is True
+        assert self._params(config, layer_idx=1).is_full_indexer_layer is False
+        assert self._params(config, layer_idx=2).is_full_indexer_layer is False
+        assert self._params(config, layer_idx=3).is_full_indexer_layer is True
+
+    def test_num_hidden_layers_falls_back_to_pretrained_config(self):
+        pretrained_config = SimpleNamespace(num_hidden_layers=1,
+                                            index_topk_pattern="N")
+
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=1).is_full_indexer_layer is True
+
+    def test_num_hidden_layers_fallback_works_with_local_indexer_config(self):
+        config = DeepSeekSparseAttentionConfig(indexer_types=["full"])
+        pretrained_config = SimpleNamespace(num_hidden_layers=1)
+
+        assert self._params(config, pretrained_config,
+                            1).is_full_indexer_layer is True
 
     def test_frequency_resolves_shared_indexer_layers(self):
         pretrained_config = SimpleNamespace(num_hidden_layers=4,
                                             index_topk_freq=2,
                                             index_skip_topk_offset=2)
 
-        assert self._params(pretrained_config, 0).is_full_indexer_layer is True
-        assert self._params(pretrained_config, 1).is_full_indexer_layer is True
-        assert self._params(pretrained_config, 2).is_full_indexer_layer is False
-        assert self._params(pretrained_config, 3).is_full_indexer_layer is True
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=0).is_full_indexer_layer is True
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=1).is_full_indexer_layer is True
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=2).is_full_indexer_layer is False
+        assert self._params(pretrained_config=pretrained_config,
+                            layer_idx=3).is_full_indexer_layer is True
 
     def test_first_and_mtp_layers_are_always_full_indexer_layers(self):
         first_shared = SimpleNamespace(num_hidden_layers=4,
                                        index_topk_pattern="SNNN")
 
-        assert self._params(first_shared, 0).is_full_indexer_layer is True
-        assert self._params(first_shared, 4).is_full_indexer_layer is True
-        assert self._params(None, None).is_full_indexer_layer is True
+        assert self._params(pretrained_config=first_shared,
+                            layer_idx=0).is_full_indexer_layer is True
+        assert self._params(pretrained_config=first_shared,
+                            layer_idx=4).is_full_indexer_layer is True
+        assert self._params(pretrained_config=None,
+                            layer_idx=None).is_full_indexer_layer is True
 
     def test_mtp_iteration_index_sharing_lowers_to_runtime_params(self):
         config = DeepSeekSparseAttentionConfig(
@@ -149,6 +186,53 @@ class TestDeepSeekSparseAttentionConfig:
 
         assert sparse_params.index_share_for_mtp_iteration is True
         assert sparse_metadata_params.index_share_for_mtp_iteration is True
+
+    def test_accepts_index_sharing_options(self):
+        config = DeepSeekSparseAttentionConfig(
+            indexer_types=["full", "shared", "shared", "full"],
+            index_topk_freq=2,
+            index_topk_pattern="NSS",
+            index_skip_topk_offset=1,
+            index_share_for_mtp_iteration=True,
+        )
+
+        assert config.indexer_types == ["full", "shared", "shared", "full"]
+        assert config.index_topk_freq == 2
+        assert config.index_topk_pattern == "NSS"
+        assert config.index_skip_topk_offset == 1
+        assert config.index_share_for_mtp_iteration is True
+        config_dump = config.model_dump(exclude_none=True)
+        assert config_dump["indexer_types"] == ["full", "shared", "shared", "full"]
+        assert config_dump["index_topk_freq"] == 2
+        assert config_dump["index_topk_pattern"] == "NSS"
+        assert config_dump["index_skip_topk_offset"] == 1
+        assert config_dump["index_share_for_mtp_iteration"] is True
+
+    def test_target_layer_index_sharing_lowers_to_metadata_params(self):
+        config = DeepSeekSparseAttentionConfig(
+            index_topk=2048,
+            indexer_types=["full", "shared"],
+        )
+
+        sparse_metadata_params = config.to_sparse_metadata_params()
+
+        assert sparse_metadata_params.index_share_for_target_layer is True
+
+
+@pytest.mark.parametrize("index_topk_pattern", ["", "SNN", "NsS", "NXN"])
+def test_deepseek_sparse_attention_config_rejects_invalid_topk_pattern(
+        index_topk_pattern):
+    with pytest.raises(ValidationError):
+        DeepSeekSparseAttentionConfig(index_topk_pattern=index_topk_pattern)
+
+
+@pytest.mark.parametrize("indexer_types",
+                         [[], ["shared", "full"], ["full", "unknown"]])
+def test_deepseek_sparse_attention_config_rejects_invalid_indexer_types(
+        indexer_types):
+    with pytest.raises(ValidationError):
+        DeepSeekSparseAttentionConfig(indexer_types=indexer_types)
+
 
 
 class TestYaml:

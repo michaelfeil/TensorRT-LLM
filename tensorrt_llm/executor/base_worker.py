@@ -900,18 +900,14 @@ class BaseWorker(GenerationExecutor):
             stats_dict["schedulerMode"] = scheduler_mode
 
         if extra_stats is not None:
-            if hasattr(extra_stats, "to_dict"):
-                stats_dict["hbmStats"] = extra_stats.to_dict()
-            elif isinstance(extra_stats, dict):
-                spec_decode_extra_stats = extra_stats.get("specDecodingStats")
-                if spec_decode_extra_stats is not None:
-                    stats_dict["specDecodingStats"] = (
-                        stats_dict.get("specDecodingStats") or {})
-                    stats_dict["specDecodingStats"].update(
-                        spec_decode_extra_stats)
-                for key, value in extra_stats.items():
-                    if key != "specDecodingStats":
-                        stats_dict[key] = value
+            spec_decode_extra_stats = extra_stats.get("specDecodingStats")
+            if spec_decode_extra_stats is not None:
+                stats_dict["specDecodingStats"] = (
+                    stats_dict.get("specDecodingStats") or {})
+                stats_dict["specDecodingStats"].update(spec_decode_extra_stats)
+            for key, value in extra_stats.items():
+                if key != "specDecodingStats":
+                    stats_dict[key] = value
 
         # Convert back to JSON string
         return orjson.dumps(stats_dict).decode("utf-8")

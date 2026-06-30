@@ -44,6 +44,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -53,7 +54,10 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
+from ..modules.attention import (MLA, DsaTopkSharingPolicy,
+                                 _apply_dsa_topk_sharing_policy,
+                                 _clear_shared_dsa_topk_indices,
+                                 maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -132,6 +136,126 @@ def weight_dequant(x: torch.Tensor,
                          triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
+
+# DSA top-k index sharing
+#
+# GLM/DeepSeek DSA checkpoints can mark layers as "full" (compute top-k
+# indices) or "shared" (reuse the nearest cached top-k indices). Runtime reuse
+# still uses the metadata flags/buffer from the attention backend, but the
+# construction-time full/shared decision also controls whether a layer allocates
+# indexer weights.
+def _get_dsa_config_value(model_config: ModelConfig[PretrainedConfig],
+                          name: str,
+                          default=None):
+    sparse_attention_config = model_config.sparse_attention_config
+    if sparse_attention_config is not None:
+        value = getattr(sparse_attention_config, name, None)
+        if value is not None:
+            return value
+    return getattr(model_config.pretrained_config, name, default)
+
+
+def _is_shared_dsa_indexer_type(indexer_types: Optional[List[str]],
+                                layer_idx: int) -> bool:
+    if indexer_types is None or layer_idx < 0 or layer_idx >= len(
+            indexer_types):
+        return False
+    return str(indexer_types[layer_idx]).lower() not in ("full", "f")
+
+
+def _has_next_dsa_target_layer(model_config: ModelConfig[PretrainedConfig],
+                               layer_idx: int) -> bool:
+    num_hidden_layers = getattr(model_config.pretrained_config,
+                                "num_hidden_layers", None)
+    return num_hidden_layers is None or layer_idx + 1 < num_hidden_layers
+
+
+def _get_dsa_topk_sharing_flags(model_config: ModelConfig[PretrainedConfig],
+                                layer_idx: Optional[int],
+                                is_nextn: bool = False) -> Tuple[bool, bool]:
+    if is_nextn or layer_idx is None:
+        return False, False
+
+    indexer_types = _get_dsa_config_value(model_config, "indexer_types")
+    if indexer_types is not None:
+        skip_topk = _is_shared_dsa_indexer_type(indexer_types, layer_idx)
+        next_skip_topk = _is_shared_dsa_indexer_type(indexer_types,
+                                                     layer_idx + 1)
+        next_skip_topk = next_skip_topk and _has_next_dsa_target_layer(
+            model_config, layer_idx)
+        return skip_topk, next_skip_topk
+
+    index_topk_freq = _get_dsa_config_value(model_config, "index_topk_freq",
+                                            1) or 1
+    index_topk_pattern = _get_dsa_config_value(model_config,
+                                               "index_topk_pattern")
+    index_skip_topk_offset = _get_dsa_config_value(model_config,
+                                                   "index_skip_topk_offset")
+
+    if index_topk_pattern is None and index_skip_topk_offset is not None:
+        if index_skip_topk_offset <= 0:
+            raise ValueError(
+                "index_skip_topk_offset must be positive; offset <= 0 marks "
+                "layer 0 as skip_topk with no prior top-k indices to reuse.")
+        skip_topk = (max(layer_idx - index_skip_topk_offset + 1, 0) %
+                     index_topk_freq != 0)
+        next_skip_topk = (max(layer_idx - index_skip_topk_offset + 2, 0) %
+                          index_topk_freq != 0)
+        next_skip_topk = next_skip_topk and _has_next_dsa_target_layer(
+            model_config, layer_idx)
+        return skip_topk, next_skip_topk
+
+    if index_topk_pattern is None:
+        skip_topk = max(layer_idx - 1, 0) % index_topk_freq != 0
+        next_skip_topk = layer_idx % index_topk_freq != 0
+        next_skip_topk = next_skip_topk and _has_next_dsa_target_layer(
+            model_config, layer_idx)
+        return skip_topk, next_skip_topk
+
+    skip_topk = (layer_idx < len(index_topk_pattern)
+                 and str(index_topk_pattern[layer_idx]).upper() == "S")
+    next_skip_topk = (layer_idx < len(index_topk_pattern) - 1
+                      and str(index_topk_pattern[layer_idx + 1]).upper() == "S")
+    next_skip_topk = next_skip_topk and _has_next_dsa_target_layer(
+        model_config, layer_idx)
+    return skip_topk, next_skip_topk
+
+
+def _warn_if_shared_dsa_layer_has_indexer_weights(
+        model_config: ModelConfig[PretrainedConfig], weights: Dict) -> None:
+    num_hidden_layers = getattr(model_config.pretrained_config,
+                                "num_hidden_layers", 0) or 0
+    if num_hidden_layers <= 0:
+        return
+
+    weight_keys = list(weights.keys())
+    for layer_idx in range(num_hidden_layers):
+        skip_topk, _ = _get_dsa_topk_sharing_flags(model_config, layer_idx)
+        if not skip_topk:
+            continue
+        prefixes = (
+            f"model.layers.{layer_idx}.self_attn.indexer.",
+            f"model.layers.{layer_idx}.self_attn.mqa.indexer.",
+        )
+        indexer_weight = next((key for key in weight_keys if any(
+            key.startswith(prefix) for prefix in prefixes)), None)
+        if indexer_weight is not None:
+            logger.warning(
+                f"DSA top-k sharing marks layer {layer_idx} as shared, but "
+                f"checkpoint contains indexer weight {indexer_weight}. Shared "
+                "layers do not allocate indexer weights, so this checkpoint "
+                "weight will not be loaded.")
+
+
+def _set_dsa_layer_topk_sharing(attn_metadata: AttentionMetadata,
+                                *,
+                                reuse: bool,
+                                cache: bool,
+                                require: bool = False) -> None:
+    _apply_dsa_topk_sharing_policy(
+        attn_metadata,
+        DsaTopkSharingPolicy(reuse=reuse, cache=cache, require=require))
 
 
 @torch.compile(dynamic=True)
@@ -333,6 +457,9 @@ class DeepseekV3WeightLoader:
 
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, 'mark_consumed')
+        if not self.is_draft_model:
+            _warn_if_shared_dsa_layer_has_indexer_weights(
+                self.model_config, weights)
 
         # The pretrained_config's num_nextn_predict_layers may have been expanded
         # by ModelLoader._load_and_validate_config to match user max_draft_len.
@@ -804,9 +931,12 @@ class DeepseekV32Attention(MLA):
         aux_stream: Optional[torch.cuda.Stream] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
+        is_nextn: bool = False,
     ):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.tokens_per_gen_step if model_config.spec_config is not None else 1
+        skip_topk, next_skip_topk = _get_dsa_topk_sharing_flags(
+            model_config, layer_idx, is_nextn=is_nextn)
 
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -829,9 +959,12 @@ class DeepseekV32Attention(MLA):
                          config=model_config,
                          aux_stream=aux_stream,
                          mapping_with_cp=mapping_with_cp,
-                         reduce_output=reduce_output)
+                         reduce_output=reduce_output,
+                         owns_indexer=not skip_topk)
 
         self.indexer = self.mqa.indexer
+        self.skip_topk = skip_topk
+        self.next_skip_topk = next_skip_topk
 
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
@@ -1238,6 +1371,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.mapping_with_cp = mapping_with_cp
         self.config = model_config.pretrained_config
         config = self.config
+        self.is_nextn = (is_separate_draft_engine
+                         or layer_idx >= config.num_hidden_layers)
 
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -1269,7 +1404,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
                 mapping_with_cp=mapping_with_cp,
-                reduce_output=needs_tp_reduce or needs_cp_reduce)
+                reduce_output=needs_tp_reduce or needs_cp_reduce,
+                is_nextn=self.is_nextn)
         else:
             self.self_attn = DeepseekV3Attention(
                 model_config,
@@ -1427,6 +1563,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
+        skip_topk = getattr(self.self_attn, "skip_topk", False)
+        next_skip_topk = getattr(self.self_attn, "next_skip_topk", False)
+        _set_dsa_layer_topk_sharing(attn_metadata,
+                                    reuse=skip_topk,
+                                    cache=next_skip_topk,
+                                    require=skip_topk)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1806,20 +1948,21 @@ class DeepseekV3Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
-        for idx, decoder_layer in enumerate(
-                self.layers[:self.num_hidden_layers]):
-            hidden_states, residual = decoder_layer(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                residual=residual,
-                spec_metadata=spec_metadata,
-            )
+        try:
+            for decoder_layer in self.layers[:self.num_hidden_layers]:
+                hidden_states, residual = decoder_layer(
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                    spec_metadata=spec_metadata,
+                )
 
-        hidden_states = maybe_allgather_for_helix_cp(hidden_states,
-                                                     attn_metadata,
-                                                     self.mapping_with_cp)
-        return hidden_states
+            hidden_states = maybe_allgather_for_helix_cp(
+                hidden_states, attn_metadata, self.mapping_with_cp)
+            return hidden_states
+        finally:
+            _clear_shared_dsa_topk_indices(attn_metadata)
 
 
 @register_auto_model("GlmMoeDsaForCausalLM")

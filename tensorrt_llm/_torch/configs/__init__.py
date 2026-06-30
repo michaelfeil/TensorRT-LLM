@@ -6,7 +6,10 @@ def _register_custom_configs_with_transformers() -> None:
     # Make AutoConfig.from_pretrained / AutoTokenizer.from_pretrained accept
     # model_types that TRT-LLM understands but upstream transformers does not
     # (DeepSeek-V3.2, Kimi K2, and Laguna ship config.json with these
-    # model_types and rely on TRT-LLM's local config workarounds).
+    # model_types and rely on TRT-LLM's local config workarounds). GLM MoE
+    # DSA is registered even when Transformers has a built-in mapping because
+    # some strict versions reject checkpoint layer_types such as
+    # ``deepseek_sparse_attention`` before TRT-LLM can normalize the config.
     #
     # Without this, transformers 5.5.x falls back to a bare PreTrainedConfig
     # that lacks attributes like `max_position_embeddings`, and
@@ -19,10 +22,12 @@ def _register_custom_configs_with_transformers() -> None:
     custom_configs = {
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
+        "glm_moe_dsa": DeepseekV3Config,
         "laguna": LagunaConfig,
     }
+    force_override = {"glm_moe_dsa"}
     for model_type, config_class in custom_configs.items():
-        if model_type in CONFIG_MAPPING:
+        if model_type in CONFIG_MAPPING and model_type not in force_override:
             continue
         CONFIG_MAPPING.register(model_type, config_class, exist_ok=True)
 

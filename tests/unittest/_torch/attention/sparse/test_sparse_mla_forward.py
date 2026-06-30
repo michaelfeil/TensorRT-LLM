@@ -10,14 +10,18 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.attention_backend.sparse.dsa as dsa_module
+import tensorrt_llm._torch.models.modeling_deepseekv3 as deepseekv3_module
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.attention import MLA
+from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+    _get_dsa_topk_sharing_flags
+from tensorrt_llm._torch.modules.attention import (
+    MLA, _get_shared_dsa_topk_indices, _maybe_cache_shared_dsa_topk_indices)
 from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
                                  torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -87,6 +91,325 @@ BATCH_SPECS = {
         seq_lens=[32, 33, 49, 65, 129],  # 1 prefill, 4 decode
         query_lens=[32, 1, 1, 1, 1]),
 }
+
+
+def _make_dsa_forward_stub(indexer, recorded_topk_indices):
+    layer = MLA.__new__(MLA)
+    layer.mqa = object()
+    layer.q_lora_rank = 2
+    layer.kv_lora_rank = 3
+    layer.qk_rope_head_dim = 1
+    layer.aux_stream = None
+    layer.ln_events = [None, None]
+    layer.apply_rotary_emb = False
+    layer.indexer = indexer
+    layer.q_a_layernorm = lambda x: x
+    layer.kv_a_layernorm = lambda x: x
+    layer.q_b_proj = lambda x: x
+    layer.kv_a_proj_with_mqa = lambda hidden_states: torch.arange(
+        hidden_states.shape[0] * 6, dtype=hidden_states.dtype).reshape(
+            hidden_states.shape[0], 6)
+
+    def forward_context_dsa(*args, **kwargs):
+        raise AssertionError("context path should not run in this test")
+
+    def forward_generation_dsa(q,
+                               compressed_kv,
+                               k_pe,
+                               attn_metadata,
+                               output,
+                               latent_cache=None,
+                               topk_indices=None):
+        recorded_topk_indices.append(topk_indices.clone())
+        output.copy_(q)
+
+    layer.forward_context_dsa = forward_context_dsa
+    layer.forward_generation_dsa = forward_generation_dsa
+    return layer
+
+
+def test_get_shared_dsa_topk_indices_returns_cached_prefix():
+    topk_indices_buffer = torch.arange(12, dtype=torch.int32).reshape(3, 4)
+    attn_metadata = SimpleNamespace(
+        reuse_dsa_topk_indices=True,
+        has_shared_dsa_topk_indices=True,
+        topk_indices_buffer=topk_indices_buffer,
+    )
+
+    topk_indices = _get_shared_dsa_topk_indices(attn_metadata, num_tokens=2)
+
+    assert topk_indices is not None
+    torch.testing.assert_close(topk_indices, topk_indices_buffer[:2, :])
+
+
+def test_get_shared_dsa_topk_indices_requires_cached_indices():
+    attn_metadata = SimpleNamespace(
+        reuse_dsa_topk_indices=True,
+        has_shared_dsa_topk_indices=False,
+        require_dsa_topk_indices=True,
+    )
+
+    with pytest.raises(RuntimeError, match="before any top-k indices"):
+        _get_shared_dsa_topk_indices(attn_metadata, num_tokens=2)
+
+
+def test_maybe_cache_shared_dsa_topk_indices_updates_buffer_when_enabled():
+    topk_indices_buffer = torch.full((3, 4), -1, dtype=torch.int32)
+    topk_indices = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+    attn_metadata = SimpleNamespace(
+        cache_dsa_topk_indices=True,
+        has_shared_dsa_topk_indices=False,
+        topk_indices_buffer=topk_indices_buffer,
+    )
+
+    _maybe_cache_shared_dsa_topk_indices(attn_metadata,
+                                         topk_indices,
+                                         num_tokens=2)
+
+    assert attn_metadata.has_shared_dsa_topk_indices is True
+    torch.testing.assert_close(topk_indices_buffer[:2, :], topk_indices)
+    torch.testing.assert_close(topk_indices_buffer[2:, :],
+                               torch.full((1, 4), -1, dtype=torch.int32))
+
+
+def test_maybe_cache_shared_dsa_topk_indices_rejects_width_mismatch():
+    attn_metadata = SimpleNamespace(
+        cache_dsa_topk_indices=True,
+        topk_indices_buffer=torch.empty((2, 4), dtype=torch.int32),
+    )
+    topk_indices = torch.empty((2, 3), dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="matching top-k widths"):
+        _maybe_cache_shared_dsa_topk_indices(attn_metadata,
+                                             topk_indices,
+                                             num_tokens=2)
+
+
+def test_dsa_forward_reuses_cached_topk_indices_across_layers():
+    expected_topk = torch.tensor([[3, 1, 0], [2, 0, 1]], dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        num_contexts=0,
+        num_generations=2,
+        num_ctx_tokens=0,
+        num_tokens=2,
+        reuse_dsa_topk_indices=False,
+        cache_dsa_topk_indices=True,
+        require_dsa_topk_indices=False,
+        has_shared_dsa_topk_indices=False,
+        topk_indices_buffer=torch.full((2, 3), -1, dtype=torch.int32),
+    )
+    hidden_states = torch.zeros((2, 4), dtype=torch.float32)
+
+    class RecordingIndexer:
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, *args, **kwargs):
+            self.calls += 1
+            return expected_topk
+
+    class RaisingIndexer:
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("shared layer should not call its indexer")
+
+    full_records = []
+    full_indexer = RecordingIndexer()
+    full_layer = _make_dsa_forward_stub(full_indexer, full_records)
+    MLA.forward_impl_with_dsa(full_layer, None, hidden_states, attn_metadata,
+                              torch.empty((2, 2), dtype=torch.float32))
+
+    assert full_indexer.calls == 1
+    assert attn_metadata.has_shared_dsa_topk_indices is True
+    torch.testing.assert_close(attn_metadata.topk_indices_buffer, expected_topk)
+    torch.testing.assert_close(full_records[0], expected_topk)
+
+    attn_metadata.reuse_dsa_topk_indices = True
+    attn_metadata.cache_dsa_topk_indices = False
+    attn_metadata.require_dsa_topk_indices = True
+    shared_records = []
+    shared_layer = _make_dsa_forward_stub(RaisingIndexer(), shared_records)
+
+    MLA.forward_impl_with_dsa(shared_layer, None, hidden_states, attn_metadata,
+                              torch.empty((2, 2), dtype=torch.float32))
+
+    torch.testing.assert_close(shared_records[0], expected_topk)
+
+
+def test_dsa_topk_sharing_flags_follow_target_frequency():
+    model_config = SimpleNamespace(
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_topk_freq=2),
+        pretrained_config=SimpleNamespace(),
+    )
+
+    assert _get_dsa_topk_sharing_flags(model_config, 1) == (False, True)
+    assert _get_dsa_topk_sharing_flags(model_config, 2) == (True, False)
+    assert _get_dsa_topk_sharing_flags(model_config, 2,
+                                       is_nextn=True) == (False, False)
+
+
+def test_dsa_topk_sharing_flags_follow_target_pattern():
+    model_config = SimpleNamespace(
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_topk_pattern="NSSN"),
+        pretrained_config=SimpleNamespace(),
+    )
+
+    assert _get_dsa_topk_sharing_flags(model_config, 0) == (False, True)
+    assert _get_dsa_topk_sharing_flags(model_config, 1) == (True, True)
+    assert _get_dsa_topk_sharing_flags(model_config, 2) == (True, False)
+
+
+def test_dsa_topk_sharing_flags_follow_target_frequency_offset():
+    model_config = SimpleNamespace(
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_topk_freq=2, index_skip_topk_offset=2),
+        pretrained_config=SimpleNamespace(),
+    )
+
+    assert _get_dsa_topk_sharing_flags(model_config, 0) == (False, False)
+    assert _get_dsa_topk_sharing_flags(model_config, 1) == (False, True)
+    assert _get_dsa_topk_sharing_flags(model_config, 2) == (True, False)
+
+
+def test_dsa_topk_sharing_flags_do_not_cache_after_final_target_layer():
+    model_config = SimpleNamespace(
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_topk_freq=2),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    assert _get_dsa_topk_sharing_flags(model_config, 1) == (False, False)
+
+    model_config = SimpleNamespace(
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_topk_freq=2, index_skip_topk_offset=2),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    assert _get_dsa_topk_sharing_flags(model_config, 1) == (False, False)
+
+
+def test_dsa_topk_sharing_flags_prefer_indexer_types():
+    model_config = SimpleNamespace(
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            indexer_types=["full", "shared", "shared", "full"],
+            index_topk_freq=1,
+            index_topk_pattern="NNNN"),
+        pretrained_config=SimpleNamespace(),
+    )
+
+    assert _get_dsa_topk_sharing_flags(model_config, 0) == (False, True)
+    assert _get_dsa_topk_sharing_flags(model_config, 1) == (True, True)
+    assert _get_dsa_topk_sharing_flags(model_config, 2) == (True, False)
+
+
+def test_warns_when_shared_dsa_layer_has_indexer_weights(monkeypatch):
+    warnings_seen = []
+
+    def capture_warning(msg, *args, **kwargs):
+        warnings_seen.append(str(msg))
+
+    monkeypatch.setattr(deepseekv3_module.logger, "warning", capture_warning)
+    model_config = SimpleNamespace(
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            indexer_types=["full", "shared", "full"]),
+        pretrained_config=SimpleNamespace(num_hidden_layers=3),
+    )
+
+    deepseekv3_module._warn_if_shared_dsa_layer_has_indexer_weights(
+        model_config, {
+            "model.layers.0.self_attn.mqa.indexer.wq_b.weight": torch.empty(0),
+            "model.layers.1.self_attn.mqa.indexer.wq_b.weight": torch.empty(0),
+        })
+
+    assert len(warnings_seen) == 1
+    assert "layer 1" in warnings_seen[0]
+    assert "model.layers.1.self_attn.mqa.indexer.wq_b.weight" in warnings_seen[
+        0]
+
+    warnings_seen.clear()
+    deepseekv3_module._warn_if_shared_dsa_layer_has_indexer_weights(
+        model_config, {
+            "model.layers.0.self_attn.mqa.indexer.wq_b.weight": torch.empty(0),
+        })
+
+    assert warnings_seen == []
+
+
+def test_dsa_trtllm_attention_skips_indexer_on_shared_layers(monkeypatch):
+    created_indexers = []
+
+    def fake_trtllm_attention_init(self, *args, **kwargs):
+        return None
+
+    class FakeIndexer:
+
+        def __init__(self, *args, **kwargs):
+            created_indexers.append((args, kwargs))
+
+    monkeypatch.setattr(dsa_module.TrtllmAttention, "__init__",
+                        fake_trtllm_attention_init)
+    monkeypatch.setattr(dsa_module, "Indexer", FakeIndexer)
+
+    sparse_config = SimpleNamespace(algorithm="dsa")
+    full_layer = dsa_module.DSATrtllmAttention(
+        0, 1, 1, sparse_attention_config=sparse_config, owns_indexer=True)
+    shared_layer = dsa_module.DSATrtllmAttention(
+        1, 1, 1, sparse_attention_config=sparse_config, owns_indexer=False)
+
+    assert isinstance(full_layer.indexer, FakeIndexer)
+    assert shared_layer.indexer is None
+    assert len(created_indexers) == 1
+
+
+def test_indexer_defers_heuristic_topk_warmup_until_post_load(monkeypatch):
+    warmups = []
+
+    class FakeLinear:
+
+        def __init__(self,
+                     in_features,
+                     out_features,
+                     *args,
+                     dtype=torch.float32,
+                     **kwargs):
+            self.weight = torch.empty((out_features, in_features),
+                                      dtype=dtype)
+
+    monkeypatch.setattr(dsa_module, "Linear", FakeLinear)
+    monkeypatch.setattr(dsa_module, "LayerNorm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(dsa_module, "RotaryEmbedding",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(dsa_module.torch.cuda, "Event",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(dsa_module, "get_sm_version", lambda: 100)
+    monkeypatch.setattr(dsa_module, "warmup_heuristic_topk_decode",
+                        lambda top_k: warmups.append(top_k))
+
+    sparse_params = dsa_module.DSAParams(index_n_heads=2,
+                                         index_head_dim=4,
+                                         index_topk=8,
+                                         enable_heuristic_topk=True)
+    mla_params = SimpleNamespace(hidden_size=16,
+                                 q_lora_rank=4,
+                                 qk_rope_head_dim=2)
+    pos_embd_params = SimpleNamespace(rope=SimpleNamespace())
+
+    indexer = dsa_module.Indexer(None,
+                                 pos_embd_params,
+                                 mla_params,
+                                 skip_create_weights_in_init=True,
+                                 sparse_params=sparse_params,
+                                 dtype=torch.float32,
+                                 layer_idx=0)
+
+    assert warmups == []
+
+    indexer.post_load_weights()
+    indexer.post_load_weights()
+
+    assert warmups == [8]
 
 
 def apply_rotary_embedding(
@@ -494,7 +817,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
     cached_lens = [seq_lens[i] - query_lens[i] for i in range(len(seq_lens))]
 
     # Create KV cache manager
-    kv_cache_manager = DSACacheManager(
+    kv_cache_manager = dsa_module.DSACacheManager(
         KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=num_layers,

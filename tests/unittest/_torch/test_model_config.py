@@ -1,3 +1,4 @@
+import json
 import types
 
 import pytest
@@ -8,6 +9,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
 )
+from tensorrt_llm.llmapi import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -38,6 +40,87 @@ def make_pretrained_config(
         torch_dtype=torch.float16,
         is_encoder_decoder=is_encoder_decoder,
     )
+
+
+def _write_glm_dsa_config(tmp_path, **extra_fields):
+    config = {
+        "architectures": ["GlmMoeDsaForCausalLM"],
+        "model_type": "glm_moe_dsa",
+        "index_n_heads": 8,
+        "index_head_dim": 16,
+        "index_topk": 32,
+    }
+    config.update(extra_fields)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+
+def test_from_pretrained_preserves_glm_dsa_index_sharing_fields(tmp_path):
+    _write_glm_dsa_config(
+        tmp_path,
+        index_topk_freq=2,
+        indexer_types=["full", "shared", "full"],
+        index_topk_pattern="NSS",
+        index_skip_topk_offset=1,
+        index_share_for_mtp_iteration=True,
+    )
+
+    model_config = ModelConfig.from_pretrained(str(tmp_path))
+
+    sparse_config = model_config.sparse_attention_config
+    assert sparse_config.index_n_heads == 8
+    assert sparse_config.index_head_dim == 16
+    assert sparse_config.index_topk == 32
+    assert sparse_config.indexer_types == ["full", "shared", "full"]
+    assert sparse_config.index_topk_freq == 2
+    assert sparse_config.index_topk_pattern == "NSS"
+    assert sparse_config.index_skip_topk_offset == 1
+    assert sparse_config.index_share_for_mtp_iteration is True
+
+
+def test_from_pretrained_keeps_checkpoint_mtp_share_when_user_omits_field(tmp_path):
+    _write_glm_dsa_config(tmp_path, index_share_for_mtp_iteration=True)
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_topk=64),
+    )
+
+    assert model_config.sparse_attention_config.index_topk == 64
+    assert model_config.sparse_attention_config.index_share_for_mtp_iteration
+
+
+def test_from_pretrained_preserves_checkpoint_indexer_types_when_user_omits_field(tmp_path):
+    _write_glm_dsa_config(
+        tmp_path,
+        indexer_types=["full", "shared", "shared", "full"],
+    )
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_topk=64),
+    )
+
+    assert model_config.sparse_attention_config.index_topk == 64
+    assert model_config.sparse_attention_config.indexer_types == [
+        "full",
+        "shared",
+        "shared",
+        "full",
+    ]
+
+
+def test_from_pretrained_uses_explicit_user_mtp_share_override(tmp_path):
+    _write_glm_dsa_config(tmp_path, index_share_for_mtp_iteration=True)
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_topk=64, index_share_for_mtp_iteration=False
+        ),
+    )
+
+    assert model_config.sparse_attention_config.index_topk == 64
+    assert not model_config.sparse_attention_config.index_share_for_mtp_iteration
 
 
 @pytest.mark.parametrize(

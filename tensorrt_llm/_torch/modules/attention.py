@@ -2,6 +2,7 @@ import functools
 import math
 import os
 import weakref
+from dataclasses import dataclass
 from typing import List, Optional, Union, cast
 
 import torch
@@ -70,6 +71,78 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
         ), "Attention layer must be a subclass of Attention or an instance of Attention"
 
     return metadata, attn_layer
+
+
+@dataclass(frozen=True)
+class DsaTopkSharingPolicy:
+    """Runtime policy for DSA top-k index sharing.
+
+    Full layers cache freshly computed indices for following shared layers.
+    Shared layers reuse cached indices and may require them to exist instead of
+    falling back to a local indexer. MTP iterations use the same storage but do
+    allow recompute when iteration 0 did not populate the cache.
+    """
+
+    reuse: bool = False
+    cache: bool = False
+    require: bool = False
+
+
+def _apply_dsa_topk_sharing_policy(attn_metadata,
+                                   policy: DsaTopkSharingPolicy) -> bool:
+    if attn_metadata is None:
+        return False
+    if not hasattr(attn_metadata, "reuse_dsa_topk_indices"):
+        return False
+
+    attn_metadata.reuse_dsa_topk_indices = policy.reuse
+    if hasattr(attn_metadata, "cache_dsa_topk_indices"):
+        attn_metadata.cache_dsa_topk_indices = policy.cache
+    if hasattr(attn_metadata, "require_dsa_topk_indices"):
+        attn_metadata.require_dsa_topk_indices = policy.require
+    return True
+
+
+def _get_shared_dsa_topk_indices(attn_metadata,
+                                 num_tokens: int) -> Optional[torch.Tensor]:
+    if not getattr(attn_metadata, "reuse_dsa_topk_indices", False):
+        return None
+    if not getattr(attn_metadata, "has_shared_dsa_topk_indices", False):
+        if getattr(attn_metadata, "require_dsa_topk_indices", False):
+            raise RuntimeError(
+                "DSA top-k index sharing was requested before any top-k "
+                "indices were cached.")
+        return None
+    topk_indices_buffer = getattr(attn_metadata, "topk_indices_buffer", None)
+    if topk_indices_buffer is None:
+        return None
+    return topk_indices_buffer[:num_tokens, :]
+
+
+def _maybe_cache_shared_dsa_topk_indices(attn_metadata,
+                                         topk_indices: Optional[torch.Tensor],
+                                         num_tokens: int) -> None:
+    if topk_indices is None:
+        return
+    if not getattr(attn_metadata, "cache_dsa_topk_indices", False):
+        return
+    topk_indices_buffer = getattr(attn_metadata, "topk_indices_buffer", None)
+    if topk_indices_buffer is None:
+        return
+
+    if topk_indices.shape[1] != topk_indices_buffer.shape[1]:
+        raise RuntimeError("DSA top-k index sharing requires matching top-k "
+                           "widths between computed indices and buffer.")
+    topk_indices_buffer[:num_tokens, :].copy_(topk_indices[:num_tokens, :])
+    attn_metadata.has_shared_dsa_topk_indices = True
+
+
+def _clear_shared_dsa_topk_indices(attn_metadata) -> None:
+    if not _apply_dsa_topk_sharing_policy(attn_metadata,
+                                          DsaTopkSharingPolicy()):
+        return
+    if hasattr(attn_metadata, "has_shared_dsa_topk_indices"):
+        attn_metadata.has_shared_dsa_topk_indices = False
 
 
 def create_attn_outputs_impl(q: torch.Tensor, attention_mask: str,
@@ -1237,6 +1310,7 @@ class MLA(nn.Module):
         config: Optional[ModelConfig] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
+        owns_indexer: bool = True,
     ):
         """
         Initialize the MLA module.
@@ -1309,6 +1383,7 @@ class MLA(nn.Module):
             self.is_dsa = True
         else:
             self.is_dsa = False
+        self.owns_indexer = owns_indexer if self.is_dsa else True
 
         # tensor parallel
         if mapping_with_cp is not None:
@@ -1502,6 +1577,7 @@ class MLA(nn.Module):
             sparse_params=sparse_params,
             dtype=dtype,
             aux_stream=aux_stream,
+            owns_indexer=self.owns_indexer,
         )
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
@@ -1968,6 +2044,8 @@ class MLA(nn.Module):
                                  and self._should_use_short_mha(
                                      attn_metadata, position_ids))
 
+        # Skip shared-index lookup and the indexer entirely when the short MHA
+        # path handles all context tokens and there are no generation tokens.
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
         elif self.mqa.indexer is None:
@@ -1976,19 +2054,8 @@ class MLA(nn.Module):
                 "DSA shared layer has no top-k from a preceding full indexer "
                 "layer; check the index_topk_pattern/freq schedule.")
         else:
-            topk_indices = None
-            if getattr(attn_metadata, "reuse_dsa_topk_indices", False):
-                if getattr(attn_metadata, "has_shared_dsa_topk_indices",
-                           False):
-                    topk_indices_buffer = getattr(attn_metadata,
-                                                  "topk_indices_buffer", None)
-                    if topk_indices_buffer is not None:
-                        topk_indices = topk_indices_buffer[:num_tokens, :]
-                elif getattr(attn_metadata, "require_dsa_topk_indices",
-                             False):
-                    raise RuntimeError(
-                        "DSA TopK index sharing was requested before any "
-                        "TopK indices were cached.")
+            topk_indices = _get_shared_dsa_topk_indices(attn_metadata,
+                                                        num_tokens)
 
             if topk_indices is None:
                 q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
@@ -2008,19 +2075,12 @@ class MLA(nn.Module):
                     weights,
                     q_scale=q_scale,
                 )
-                if getattr(attn_metadata, "cache_dsa_topk_indices", False):
-                    topk_indices_buffer = getattr(attn_metadata,
-                                                  "topk_indices_buffer", None)
-                    if topk_indices_buffer is not None:
-                        if topk_indices.shape[1] != topk_indices_buffer.shape[
-                                1]:
-                            raise RuntimeError(
-                                "DSA TopK index sharing requires matching "
-                                "TopK widths between computed indices and "
-                                "cache buffer.")
-                        topk_indices_buffer[:num_tokens, :].copy_(
-                            topk_indices[:num_tokens, :])
-                        attn_metadata.has_shared_dsa_topk_indices = True
+                _maybe_cache_shared_dsa_topk_indices(attn_metadata,
+                                                     topk_indices, num_tokens)
+            mtp_index_share_active = (
+                getattr(attn_metadata, "index_share_for_mtp_iteration", False)
+                and getattr(attn_metadata, "in_mtp_draft_loop", False))
+            if not mtp_index_share_active:
                 attn_metadata.shared_topk_indices = topk_indices
 
         assert output is not None, "output must be provided"

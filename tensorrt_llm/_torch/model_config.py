@@ -610,6 +610,20 @@ class ModelConfig(Generic[TConfig]):
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
+                        index_topk_freq = (
+                            sparse_attention_config.index_topk_freq or getattr(
+                                pretrained_config, 'index_topk_freq', None))
+                        indexer_types = (sparse_attention_config.indexer_types
+                                         or getattr(pretrained_config,
+                                                    'indexer_types', None))
+                        index_topk_pattern = (
+                            sparse_attention_config.index_topk_pattern
+                            or getattr(pretrained_config, 'index_topk_pattern',
+                                       None))
+                        index_skip_topk_offset = (
+                            sparse_attention_config.index_skip_topk_offset
+                            or getattr(pretrained_config,
+                                       'index_skip_topk_offset', None))
                         if ("index_share_for_mtp_iteration"
                                 in sparse_attention_config.model_fields_set):
                             index_share_for_mtp_iteration = (
@@ -630,6 +644,14 @@ class ModelConfig(Generic[TConfig]):
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
                         indexer_k_dtype = "fp8"
+                        indexer_types = getattr(pretrained_config,
+                                                'indexer_types', None)
+                        index_topk_freq = getattr(pretrained_config,
+                                                  'index_topk_freq', None)
+                        index_topk_pattern = getattr(pretrained_config,
+                                                     'index_topk_pattern', None)
+                        index_skip_topk_offset = getattr(
+                            pretrained_config, 'index_skip_topk_offset', None)
                         index_share_for_mtp_iteration = getattr(
                             pretrained_config, 'index_share_for_mtp_iteration',
                             False)
@@ -648,6 +670,10 @@ class ModelConfig(Generic[TConfig]):
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
                             indexer_k_dtype=indexer_k_dtype,
+                            indexer_types=indexer_types,
+                            index_topk_freq=index_topk_freq,
+                            index_topk_pattern=index_topk_pattern,
+                            index_skip_topk_offset=index_skip_topk_offset,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration)
             else:

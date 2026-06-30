@@ -10,6 +10,8 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
+from ..modules.attention import (DsaTopkSharingPolicy,
+                                 _apply_dsa_topk_sharing_policy)
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -29,6 +31,31 @@ else:
     from typing_extensions import override
 
 SampleStateMTP = SampleStateSpec
+
+
+def _set_mtp_index_reuse(attn_metadata, reuse: bool) -> bool:
+    if attn_metadata is None:
+        return False
+    sparse_metadata_params = getattr(attn_metadata, "sparse_metadata_params",
+                                     None)
+    if not getattr(sparse_metadata_params, "index_share_for_mtp_iteration",
+                   False):
+        return False
+    # MTP/NextN layers keep indexer weights, so later iterations may recompute
+    # if iteration 0 did not populate shared TopK indices.
+    return _apply_dsa_topk_sharing_policy(
+        attn_metadata,
+        DsaTopkSharingPolicy(reuse=reuse, cache=True, require=False))
+
+
+def _clear_mtp_index_reuse(attn_metadata) -> None:
+    if attn_metadata is None:
+        return
+    _apply_dsa_topk_sharing_policy(attn_metadata, DsaTopkSharingPolicy())
+    if hasattr(attn_metadata, "has_shared_dsa_topk_indices"):
+        attn_metadata.has_shared_dsa_topk_indices = False
+    if hasattr(attn_metadata, "shared_topk_indices"):
+        attn_metadata.shared_topk_indices = None
 
 
 def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
@@ -337,36 +364,33 @@ class MTPWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def _set_mtp_index_reuse(self, attn_metadata, reuse: bool) -> bool:
-        if attn_metadata is None:
-            return False
-        sparse_metadata_params = getattr(attn_metadata,
-                                         "sparse_metadata_params", None)
-        if not getattr(sparse_metadata_params,
-                       "index_share_for_mtp_iteration", False):
-            return False
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
+        # Save kv_lens_cuda separately instead of routing it through
+        # prepare_for_spec_dec, which would clone the tensor and break the
+        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
+        batch_size = attn_metadata.num_seqs
+        if hasattr(attn_metadata, 'kv_lens_cuda'):
+            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
+                                                                  batch_size].clone(
+                                                                  )
+        else:
+            self._saved_kv_lens_cuda = None
 
-        attn_metadata.reuse_dsa_topk_indices = reuse
-        attn_metadata.cache_dsa_topk_indices = True
-        # MTP layers keep indexer weights, so later iterations can recompute if
-        # iteration 0 did not populate the cache.
-        attn_metadata.require_dsa_topk_indices = False
-        return True
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if self._saved_kv_lens_cuda is not None:
+            batch_size = self._saved_kv_lens_cuda.shape[0]
+            attn_metadata.kv_lens_cuda[:batch_size].copy_(
+                self._saved_kv_lens_cuda)
+            self._saved_kv_lens_cuda = None
+
+    def _set_mtp_index_reuse(self, attn_metadata, reuse: bool) -> bool:
+        return _set_mtp_index_reuse(attn_metadata, reuse)
 
     @staticmethod
     def _clear_mtp_index_reuse(attn_metadata) -> None:
-        if attn_metadata is None:
-            return
-        if hasattr(attn_metadata, "reuse_dsa_topk_indices"):
-            attn_metadata.reuse_dsa_topk_indices = False
-        if hasattr(attn_metadata, "cache_dsa_topk_indices"):
-            attn_metadata.cache_dsa_topk_indices = False
-        if hasattr(attn_metadata, "require_dsa_topk_indices"):
-            attn_metadata.require_dsa_topk_indices = False
-        if hasattr(attn_metadata, "has_shared_dsa_topk_indices"):
-            attn_metadata.has_shared_dsa_topk_indices = False
-        if hasattr(attn_metadata, "shared_topk_indices"):
-            attn_metadata.shared_topk_indices = None
+        _clear_mtp_index_reuse(attn_metadata)
 
     def forward(
         self,
@@ -521,8 +545,8 @@ class MTPWorker(SpecWorkerBase):
             mtp_index_share_enabled = self._set_mtp_index_reuse(
                 attn_metadata, False)
             if mtp_index_share_enabled:
-                attn_metadata.has_shared_dsa_topk_indices = False
-                attn_metadata.shared_topk_indices = None
+                self._clear_mtp_index_reuse(attn_metadata)
+                self._set_mtp_index_reuse(attn_metadata, False)
             try:
                 for i, mtp_layer in enumerate(draft_model.mtp_layers):
                     self._set_mtp_index_reuse(attn_metadata, i > 0)

@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -7,6 +8,7 @@ from parameterized import parameterized
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
@@ -51,6 +53,218 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
 
         assert worker._set_mtp_index_reuse(attn_metadata, True) is False
         assert attn_metadata.reuse_dsa_topk_indices is False
+
+    def test_restore_attn_metadata_restores_live_kv_lens_cuda(self):
+        class FakeAttentionMetadata:
+            def __init__(self):
+                self.num_seqs = 2
+                self.kv_lens_cuda = torch.tensor([32, 64, 96],
+                                                 dtype=torch.int32)
+                self.prepare_args = None
+                self.restore_called = False
+                self.on_update_called = False
+
+            def prepare_for_spec_dec(self, *args):
+                self.prepare_args = args
+
+            def restore_from_spec_dec(self):
+                self.restore_called = True
+
+            def on_update(self):
+                self.on_update_called = True
+
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2))
+        attn_metadata = FakeAttentionMetadata()
+        original_kv_lens = attn_metadata.kv_lens_cuda.clone()
+
+        worker._prepare_attn_metadata_for_spec_dec(attn_metadata)
+        attn_metadata.kv_lens_cuda[:attn_metadata.num_seqs] -= 3
+        worker._restore_attn_metadata_from_spec_dec(attn_metadata)
+
+        torch.testing.assert_close(attn_metadata.kv_lens_cuda,
+                                   original_kv_lens)
+        assert attn_metadata.prepare_args == ("_seq_lens", "_seq_lens_cuda")
+        assert attn_metadata.restore_called is True
+        assert attn_metadata.on_update_called is True
+
+    def test_mtp_eagle_draft_loop_uses_dsa_metadata_skip_flags(self):
+        skip_topk_states = []
+        mtp_loop_states = []
+
+        class FakeMtpLayer:
+
+            def shared_head(self, hidden_states, lm_head, attn_metadata,
+                            is_draft=False):
+                skip_topk_states.append(attn_metadata.indexer_skip_topk)
+                return torch.tensor([[0.0, 1.0]], dtype=torch.float32)
+
+        worker = Eagle3OneModelWorker.__new__(Eagle3OneModelWorker)
+        worker.is_mtp_eagle = True
+        worker.model_config = None
+        worker.guided_decoder = None
+        worker.sa_enhancer = None
+        worker.draft_kv_cache_context = lambda *args: nullcontext()
+
+        def run_draft_forward(draft_model, inputs, spec_metadata, i):
+            return inputs["hidden_states"], inputs["hidden_states"]
+
+        worker._run_draft_forward = run_draft_forward
+        worker.draft_decoder = (
+            lambda logits, draft_model, spec_metadata, batch_size, draft_step:
+            torch.tensor([draft_step + 10, draft_step + 20],
+                         dtype=torch.long))
+
+        def set_skip_topk(skip):
+            attn_metadata.indexer_skip_topk = skip
+
+        def set_in_mtp_draft_loop(active):
+            mtp_loop_states.append(active)
+            attn_metadata.in_mtp_draft_loop = active
+
+        attn_metadata = SimpleNamespace(
+            num_seqs=2,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            seq_lens_cuda=torch.tensor([3, 3], dtype=torch.int32),
+            _seq_lens=torch.tensor([3, 3], dtype=torch.int32),
+            _seq_lens_cuda=torch.tensor([3, 3], dtype=torch.int32),
+            kv_lens_cuda=torch.tensor([8, 8], dtype=torch.int32),
+            kv_cache_manager=None,
+            indexer_skip_topk=False,
+            in_mtp_draft_loop=False,
+            sparse_metadata_params=SimpleNamespace(
+                index_share_for_mtp_iteration=True),
+            set_skip_topk=set_skip_topk,
+            set_in_mtp_draft_loop=set_in_mtp_draft_loop,
+            on_update=lambda: None,
+            update_for_spec_dec=lambda: None,
+        )
+        spec_metadata = SimpleNamespace(
+            runtime_draft_len=2,
+            batch_indices_cuda=torch.tensor([0, 1], dtype=torch.int64),
+        )
+        draft_model = SimpleNamespace(
+            mtp_layers=[FakeMtpLayer()],
+            lm_head=object(),
+        )
+        inputs = {
+            "input_ids": torch.arange(6, dtype=torch.long),
+            "position_ids": torch.arange(6, dtype=torch.long),
+            "hidden_states": torch.arange(12,
+                                          dtype=torch.float32).reshape(6, 2),
+            "attn_metadata": attn_metadata,
+            "spec_metadata": spec_metadata,
+        }
+
+        next_draft_tokens = worker._forward_linear_draft_loop(
+            inputs,
+            attn_metadata,
+            spec_metadata,
+            draft_model,
+            draft_kv_cache_manager=None,
+            num_contexts=0,
+            batch_size=2,
+            num_accepted_tokens=torch.tensor([1, 1], dtype=torch.int32),
+            original_all_rank_num_tokens=None,
+        )
+
+        torch.testing.assert_close(next_draft_tokens,
+                                   torch.tensor([[10, 11], [20, 21]],
+                                                dtype=torch.long))
+        assert skip_topk_states == [False, True]
+        assert mtp_loop_states == [True, False]
+        assert attn_metadata.indexer_skip_topk is False
+        assert attn_metadata.in_mtp_draft_loop is False
+
+    def test_mtp_eagle_lm_head_tp_adp_uses_global_draft_sampler(self):
+        sampler_calls = []
+        mapping_lm_head_tp = object()
+
+        class FakeSharedHead:
+
+            def __init__(self):
+                self.mapping_lm_head_tp = mapping_lm_head_tp
+
+            def __call__(self, hidden_states, lm_head, attn_metadata,
+                         is_draft=False):
+                assert hidden_states.shape[0] == 4
+                return torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        class FakeMtpLayer:
+
+            def __init__(self):
+                self.shared_head = FakeSharedHead()
+
+        worker = Eagle3OneModelWorker.__new__(Eagle3OneModelWorker)
+        worker.is_mtp_eagle = True
+        worker.model_config = SimpleNamespace(mapping=SimpleNamespace(
+            enable_attention_dp=True,
+            enable_lm_head_tp_in_adp=True,
+            tp_size=8,
+        ))
+        worker.guided_decoder = None
+        worker.sa_enhancer = None
+        worker.draft_kv_cache_context = lambda *args: nullcontext()
+        worker._run_draft_forward = (
+            lambda draft_model, inputs, spec_metadata, i:
+            (inputs["hidden_states"], None))
+        worker._draft_sampler_greedy = (
+            lambda *args, **kwargs:
+            self.fail("ADP LM-head TP must use the global draft sampler"))
+
+        def draft_sampler(logits, mapping_lm_head_tp_arg=None):
+            sampler_calls.append((logits.shape, mapping_lm_head_tp_arg))
+            return torch.tensor([101, 102, 999, 998], dtype=torch.long)
+
+        worker.draft_sampler = draft_sampler
+
+        attn_metadata = SimpleNamespace(
+            num_seqs=2,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            seq_lens_cuda=torch.tensor([2, 2], dtype=torch.int32),
+            _seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+            _seq_lens_cuda=torch.tensor([2, 2], dtype=torch.int32),
+            kv_lens_cuda=torch.tensor([8, 8], dtype=torch.int32),
+            kv_cache_manager=None,
+            on_update=lambda: None,
+            update_for_spec_dec=lambda: None,
+        )
+        spec_metadata = SimpleNamespace(
+            runtime_draft_len=1,
+            batch_indices_cuda=torch.tensor([0, 1], dtype=torch.int64),
+            max_num_requests=4,
+            is_all_greedy_sample=True,
+        )
+        draft_model = SimpleNamespace(
+            mtp_layers=[FakeMtpLayer()],
+            lm_head=object(),
+        )
+        inputs = {
+            "input_ids": torch.arange(4, dtype=torch.long),
+            "position_ids": torch.arange(4, dtype=torch.long),
+            "hidden_states": torch.arange(8,
+                                          dtype=torch.float32).reshape(4, 2),
+            "attn_metadata": attn_metadata,
+            "spec_metadata": spec_metadata,
+        }
+
+        next_draft_tokens = worker._forward_linear_draft_loop(
+            inputs,
+            attn_metadata,
+            spec_metadata,
+            draft_model,
+            draft_kv_cache_manager=None,
+            num_contexts=0,
+            batch_size=2,
+            num_accepted_tokens=torch.tensor([1, 1], dtype=torch.int32),
+            original_all_rank_num_tokens=None,
+        )
+
+        assert sampler_calls == [((4, 4), mapping_lm_head_tp)]
+        torch.testing.assert_close(next_draft_tokens,
+                                   torch.tensor([[101], [102]],
+                                                dtype=torch.long))
 
     def load_sample_and_accept_draft_tokens_test_cases():
         test_cases = []

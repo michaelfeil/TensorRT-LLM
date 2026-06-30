@@ -701,6 +701,26 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
         "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
         "per-token footprint from 132 B to 68 B.")
+    indexer_types: Optional[List[str]] = Field(
+        default=None,
+        description=
+        "Optional per-layer DSA indexer roles. 'full'/'f' layers compute TopK "
+        "indices; 'shared'/'s' layers reuse cached indices.")
+    index_topk_freq: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Frequency for target-model DSA layers that compute fresh TopK indices; "
+        "skipped layers reuse the most recent indices.")
+    index_topk_pattern: Optional[str] = Field(
+        default=None,
+        description=
+        "Optional per-layer DSA TopK sharing pattern. Layers marked 'S' reuse "
+        "TopK indices from a previous layer.")
+    index_skip_topk_offset: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Optional positive layer offset for frequency-based target-model DSA "
+        "TopK sharing.")
     index_share_for_mtp_iteration: bool = Field(
         default=False,
         description=
@@ -736,6 +756,44 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                         f"for non-Blackwell GPUs.")
         return self
 
+    @field_validator("index_topk_pattern")
+    @classmethod
+    def validate_index_topk_pattern(cls, pattern: Optional[str]):
+        if pattern is None:
+            return pattern
+        if len(pattern) == 0:
+            raise ValueError("index_topk_pattern cannot be empty.")
+        if any(layer_type not in ("N", "S") for layer_type in pattern):
+            raise ValueError(
+                "index_topk_pattern must contain only 'N' and 'S'.")
+        if pattern[0] == "S":
+            raise ValueError(
+                "index_topk_pattern cannot start with 'S' because layer 0 "
+                "has no previous TopK indices to reuse.")
+        return pattern
+
+    @field_validator("indexer_types")
+    @classmethod
+    def validate_indexer_types(cls, indexer_types: Optional[List[str]]):
+        if indexer_types is None:
+            return indexer_types
+        if len(indexer_types) == 0:
+            raise ValueError("indexer_types cannot be empty.")
+        valid_roles = {"full", "f", "shared", "s"}
+        invalid_roles = [
+            role for role in indexer_types
+            if str(role).lower() not in valid_roles
+        ]
+        if invalid_roles:
+            raise ValueError("indexer_types must contain only 'full'/'f' and "
+                             "'shared'/'s' roles.")
+        if str(indexer_types[0]).lower() in ("shared", "s"):
+            raise ValueError(
+                "indexer_types cannot start with a shared layer because "
+                "layer 0 has no previous TopK indices to reuse.")
+        return indexer_types
+
+
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
@@ -746,37 +804,49 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
 
-    @staticmethod
-    def _is_full_indexer_layer(pretrained_config, layer_idx) -> bool:
+    def _config_value(self, pretrained_config, name: str, default=None):
+        value = getattr(self, name, None)
+        if value is not None:
+            return value
+        if pretrained_config is not None:
+            return getattr(pretrained_config, name, default)
+        return default
+
+    def _is_full_indexer_layer(self, pretrained_config, layer_idx) -> bool:
         """Return whether a DSA layer computes its own TopK indices."""
-        if pretrained_config is None or layer_idx is None:
+        if layer_idx is None:
             return True
 
-        num_hidden_layers = getattr(pretrained_config, "num_hidden_layers",
-                                    None)
+        num_hidden_layers = self._config_value(pretrained_config,
+                                               "num_hidden_layers")
         if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
             return True
 
-        index_topk_pattern = getattr(pretrained_config, "index_topk_pattern",
-                                     None)
-        if index_topk_pattern is not None:
-            is_full = not (layer_idx < len(index_topk_pattern)
-                           and str(index_topk_pattern[layer_idx]).upper()
-                           == "S")
+        indexer_types = self._config_value(pretrained_config, "indexer_types")
+        if indexer_types is not None and layer_idx < len(indexer_types):
+            is_full = str(indexer_types[layer_idx]).lower() in ("full", "f")
         else:
-            index_topk_freq = max(
-                getattr(pretrained_config, "index_topk_freq", 1) or 1, 1)
-            index_skip_topk_offset = getattr(pretrained_config,
-                                             "index_skip_topk_offset", 2)
-            is_full = (
-                max(layer_idx - index_skip_topk_offset + 1, 0) %
-                index_topk_freq) == 0
+            index_topk_pattern = self._config_value(pretrained_config,
+                                                    "index_topk_pattern")
+            if index_topk_pattern is not None:
+                is_full = not (layer_idx < len(index_topk_pattern)
+                               and str(index_topk_pattern[layer_idx]).upper()
+                               == "S")
+            else:
+                index_topk_freq = max(
+                    self._config_value(pretrained_config, "index_topk_freq", 1)
+                    or 1, 1)
+                index_skip_topk_offset = self._config_value(
+                    pretrained_config, "index_skip_topk_offset", 2)
+                is_full = (
+                    max(layer_idx - index_skip_topk_offset + 1, 0) %
+                    index_topk_freq) == 0
 
         if layer_idx == 0 and not is_full:
             logger.warning(
                 "DSA layer 0 resolved to 'shared' but has no prior full "
-                "layer's top-k to reuse; forcing it to 'full'. Check "
-                "index_topk_pattern.")
+                "layer's TopK to reuse; forcing it to 'full'. Check "
+                "index_topk_pattern or indexer_types.")
             return True
         return is_full
 
@@ -807,6 +877,14 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
+            indexer_types=self._config_value(pretrained_config,
+                                             "indexer_types"),
+            index_topk_freq=self._config_value(pretrained_config,
+                                               "index_topk_freq"),
+            index_topk_pattern=self._config_value(pretrained_config,
+                                                  "index_topk_pattern"),
+            index_skip_topk_offset=self._config_value(
+                pretrained_config, "index_skip_topk_offset"),
             index_share_for_mtp_iteration=(
                 self.index_share_for_mtp_iteration),
         )
@@ -825,6 +903,15 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 return getattr(pretrained_config, name, default)
             return default
 
+        indexer_types = self._config_value(pretrained_config, "indexer_types")
+        index_topk_freq = self._config_value(pretrained_config,
+                                             "index_topk_freq", 1) or 1
+        index_topk_pattern = self._config_value(pretrained_config,
+                                                "index_topk_pattern")
+        index_share_for_target_layer = (bool(indexer_types)
+                                        or index_topk_freq > 1
+                                        or index_topk_pattern is not None)
+
         return DSAMetadataParams(
             indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
             max_sparse_topk=_value("index_topk"),
@@ -834,6 +921,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             index_share_for_mtp_iteration=(
                 self.index_share_for_mtp_iteration),
+            index_share_for_target_layer=index_share_for_target_layer,
         )
 
 
