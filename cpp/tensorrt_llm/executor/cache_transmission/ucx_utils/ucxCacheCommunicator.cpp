@@ -306,7 +306,7 @@ std::optional<std::pair<std::string, int>> parse_zmq_endpoint(std::string const&
     return std::nullopt;
 }
 
-static constexpr int kDefaultZmqConnectionTimeoutMs = 10000;
+static constexpr int kDefaultZmqConnectionTimeoutMs = 5000;
 static constexpr char const* kUcxConnectionTimeoutMsEnv = "TRTLLM_UCX_CONNECTION_TIMEOUT_MS";
 
 static int getZmqConnectionTimeoutMs(int rank)
@@ -817,7 +817,7 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
         // that idle-but-valid state into a false transfer failure. Higher-level request timeout/cancellation is still
         // propagated through DataContext::transferTerminate, so this wait remains cancellable without a local timeout.
         waitForUcxRequestCompletion(req, future, ctx, mRank, "recvConnect", true, callbackData, buffer->size(),
-            /* timeoutMs = */ 0);
+            /* timeoutMs = */ 0, /* endpoint = */ nullptr, /* worker = */ mWorkersPool.front().get());
     }
     if (ctx.getTransferTerminate().load() && req->getStatus() == UCS_ERR_CANCELED)
     {

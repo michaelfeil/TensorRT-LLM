@@ -38,7 +38,7 @@ namespace tensorrt_llm::executor::kv_cache
 
 namespace
 {
-constexpr int kDefaultConnectionHandshakeTimeoutMs = 10000;
+constexpr int kDefaultConnectionHandshakeTimeoutMs = 5000;
 constexpr char const* kUcxConnectionHandshakeTimeoutMsEnv = "TRTLLM_UCX_CONNECTION_HANDSHAKE_TIMEOUT_MS";
 constexpr int32_t kTagTypeBits = 8;
 constexpr int32_t kTagTypeMask = (1 << kTagTypeBits) - 1;

@@ -27,7 +27,7 @@ Enable payload host staging by default for UCX transfers, controlled by
 `TRTLLM_UCX_ENABLE_PAYLOAD_STAGING`. The default is enabled. Setting the variable to `0`, `false`, or `off` restores the
 current direct payload pointer behavior.
 
-Add `TRTLLM_UCX_PAYLOAD_TIMEOUT_MS`, defaulting to `30000`. A value of `0` disables payload timeout handling and leaves
+Add `TRTLLM_UCX_PAYLOAD_TIMEOUT_MS`, defaulting to `10000`. A value of `0` disables payload timeout handling and leaves
 the operation blocking until UCX completes or the existing termination path fires.
 
 For payload sends, copy the source pointer into a pinned host buffer before posting the UCX send. UCX only receives the

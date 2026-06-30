@@ -18,11 +18,13 @@
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/payloadStaging.h"
 #if ENABLE_UCX
 
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/cache_transmission/kvTransferMetrics.h"
+#include "tensorrt_llm/executor/cache_transmission/ucx_utils/ucxCancelLogPolicy.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -51,8 +53,9 @@ namespace
 {
 constexpr int kRequestPollMs = 1;
 constexpr int kRequestCancelGraceMs = 1000;
-constexpr int kDefaultPayloadRequestTimeoutMs = 30000;
-constexpr int kDefaultHostControlRequestTimeoutMs = 30000;
+constexpr uint64_t kRequestCancelScheduleTimeoutNs = 100ULL * 1000ULL * 1000ULL;
+constexpr int kDefaultPayloadRequestTimeoutMs = 10000;
+constexpr int kDefaultHostControlRequestTimeoutMs = 10000;
 constexpr int kDefaultUnsafeReclaimQuarantinedStagingMs = 0;
 constexpr size_t kPayloadChunkBytes = 512ULL * 1024 * 1024;
 constexpr size_t kDefaultPayloadStagingChunkBytes = kPayloadChunkBytes;
@@ -580,8 +583,8 @@ void quarantineStagedRequest(std::shared_ptr<ucxx::Request> const& req,
     metrics::recordQuarantineEnqueue(static_cast<int64_t>(stagedBytes));
     size_t const retainedBytes = getQuarantinedBytes(requests);
     TLLM_LOG_WARNING(rank,
-        "Retaining canceled UCX %s for tag %d in staged request quarantine; retained requests: %zu, retained bytes: "
-        "%zu",
+        "Retaining incomplete UCX %s for tag %d in staged request quarantine; retained requests: %zu, retained "
+        "bytes: %zu",
         operation, tag, requests.size(), retainedBytes);
     if (requests.size() > kMaxQuarantinedStagedRequests)
     {
@@ -614,12 +617,53 @@ UcxCancelReason classifyCancelReason(char const* reason) noexcept
     return UcxCancelReason::kOther;
 }
 
-void cancelRequestWithLog(std::shared_ptr<ucxx::Request> const& req, DataContext const& ctx, int rank,
-    char const* operation, char const* reason)
+bool cancelRequest(std::shared_ptr<ucxx::Request> const& req, int rank, char const* operation, int tag,
+    ucxx::Worker& worker)
 {
-    TLLM_LOG_WARNING(rank, "Canceling UCX %s for tag %d: %s", operation, ctx.getTag(), reason);
-    metrics::recordUcxCancel(classifyCancelReason(reason));
-    req->cancel();
+    try
+    {
+        // UCXX Request::cancel() takes the request mutex before entering UCX. Run it on the progress thread to avoid
+        // inverting that order with UCX callbacks. The timeout bounds scheduling/waiting for the callback; it does not
+        // make a progress thread that is already wedged recoverable.
+        bool const canceled = worker.registerGenericPre([req]() { req->cancel(); }, kRequestCancelScheduleTimeoutNs);
+        if (!canceled)
+        {
+            TLLM_LOG_ERROR(rank,
+                "Failed to schedule UCX %s cancel for tag %d on the progress thread within %llu ns; leaving request "
+                "uncanceled to avoid UCXX cancel/progress lock inversion",
+                operation, tag, static_cast<unsigned long long>(kRequestCancelScheduleTimeoutNs));
+        }
+        return canceled;
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_ERROR(rank,
+            "Failed to schedule UCX %s cancel for tag %d on the progress thread; leaving request uncanceled to avoid "
+            "UCXX cancel/progress lock inversion: %s",
+            operation, tag, e.what());
+        return false;
+    }
+}
+
+bool cancelRequestWithLog(std::shared_ptr<ucxx::Request> const& req, DataContext const& ctx, int rank,
+    char const* operation, char const* reason, ucxx::Worker& worker)
+{
+    if (detail::isExpectedRequestInfoRecvConnectCleanupCancel(
+            ctx.getTag(), operation, reason, tensorrt_llm::batch_manager::TransceiverTag::kID_TAG,
+            ctx.isExpectedTransferTerminate()))
+    {
+        TLLM_LOG_DEBUG(rank, "Scheduling expected UCX %s cancel for tag %d: %s", operation, ctx.getTag(), reason);
+    }
+    else
+    {
+        TLLM_LOG_WARNING(rank, "Scheduling UCX %s cancel for tag %d: %s", operation, ctx.getTag(), reason);
+    }
+    bool const cancelScheduled = cancelRequest(req, rank, operation, ctx.getTag(), worker);
+    if (cancelScheduled)
+    {
+        metrics::recordUcxCancel(classifyCancelReason(reason));
+    }
+    return cancelScheduled;
 }
 
 std::string captureUcpEndpointInfo(ucxx::Endpoint& endpoint)
@@ -755,8 +799,11 @@ void waitForPayloadChunk(PayloadChunkRequest& chunk, DataContext const& ctx, int
 }
 
 void quarantineActivePayloadChunks(
-    std::deque<PayloadChunkRequest>& chunks, DataContext const& ctx, int rank, char const* operation) noexcept
+    std::deque<PayloadChunkRequest>& chunks, DataContext const& ctx, int rank, char const* operation,
+    ucxx::Endpoint& endpoint) noexcept
 {
+    auto endpointWorker = endpoint.getWorker();
+    TLLM_CHECK_WITH_INFO(endpointWorker != nullptr, "UCX endpoint worker must be available for request cancellation");
     while (!chunks.empty())
     {
         auto& chunk = chunks.front();
@@ -764,7 +811,8 @@ void quarantineActivePayloadChunks(
         {
             if (!chunk.request->isCompleted())
             {
-                cancelRequestWithLog(chunk.request, ctx, rank, operation, "pipelined payload transfer aborted");
+                cancelRequestWithLog(
+                    chunk.request, ctx, rank, operation, "pipelined payload transfer aborted", *endpointWorker);
                 if (chunk.stagedBuffer)
                 {
                     quarantineStagedRequest(
@@ -899,7 +947,7 @@ void sendPayloadChunks(
         }
         pendingCopyBuffer.reset();
         pendingCopies.clear();
-        quarantineActivePayloadChunks(activeChunks, ctx, rank, "send");
+        quarantineActivePayloadChunks(activeChunks, ctx, rank, "send", endpoint);
         if (stream != nullptr)
         {
             (void) cudaStreamDestroy(stream);
@@ -1031,7 +1079,7 @@ void recvPayloadChunks(
         }
         pendingCopyBuffer.reset();
         pendingDeviceCopies.clear();
-        quarantineActivePayloadChunks(activeChunks, ctx, rank, "recv");
+        quarantineActivePayloadChunks(activeChunks, ctx, rank, "recv", endpoint);
         if (stream != nullptr)
         {
             (void) cudaStreamDestroy(stream);
@@ -1084,7 +1132,8 @@ void preallocatePayloadStagingBufferPool(int rank)
 
 void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std::future<void>& future,
     DataContext const& ctx, int rank, char const* operation, bool stagedBuffer,
-    ucxx::RequestCallbackUserData const& callbackData, size_t stagedBytes, int timeoutMs, ucxx::Endpoint* endpoint)
+    ucxx::RequestCallbackUserData const& callbackData, size_t stagedBytes, int timeoutMs, ucxx::Endpoint* endpoint,
+    ucxx::Worker* worker)
 {
     bool cancelRequested = false;
     bool operationTimedOut = false;
@@ -1096,6 +1145,36 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
                                                  : std::chrono::steady_clock::time_point::max();
     std::chrono::steady_clock::time_point cancelStart{};
     std::chrono::steady_clock::time_point cancelDeadline{};
+    std::shared_ptr<ucxx::Worker> endpointWorker;
+    if (worker == nullptr && endpoint != nullptr)
+    {
+        endpointWorker = endpoint->getWorker();
+        worker = endpointWorker.get();
+    }
+    TLLM_CHECK_WITH_INFO(worker != nullptr, "UCX worker must be available for request cancellation");
+    auto failCancelSchedule = [&](char const* reason, std::chrono::steady_clock::time_point now) {
+        auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - operationStart).count();
+        char const* const ucsStatus = ucs_status_string(req->getStatus());
+        TLLM_LOG_ERROR(rank,
+            "Failed to schedule UCX %s cancel for tag %d; request may still be active. "
+            "ucsStatus=%s isCompleted=%d stagedBytes=%zu cancelReason=\"%s\" elapsedMs=%lld",
+            operation, ctx.getTag(), ucsStatus, static_cast<int>(req->isCompleted()), stagedBytes, reason,
+            static_cast<long long>(elapsedMs));
+        dumpUcxConnectionDiagnostics(rank, endpoint, operation, ctx.getTag(), reason, ucsStatus);
+        if (operationTimedOut && timeoutMs > 0)
+        {
+            metrics::recordUcxOperationTimeout();
+            metrics::recordUcxTagTimeout(op);
+        }
+        if (stagedBuffer)
+        {
+            quarantineStagedRequest(req, callbackData, stagedBytes, rank, operation, ctx.getTag());
+        }
+        TLLM_THROW(
+            "Failed to schedule UCX %s cancel for tag %d; request may still be active "
+            "(ucsStatus=%s cancelReason=\"%s\" stagedBytes=%zu elapsedMs=%lld)",
+            operation, ctx.getTag(), ucsStatus, reason, stagedBytes, static_cast<long long>(elapsedMs));
+    };
     while (!req->isCompleted())
     {
         auto const now = std::chrono::steady_clock::now();
@@ -1105,7 +1184,10 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
             if (!cancelRequested)
             {
                 cancelReason = "operation timeout";
-                cancelRequestWithLog(req, ctx, rank, operation, cancelReason);
+                if (!cancelRequestWithLog(req, ctx, rank, operation, cancelReason, *worker))
+                {
+                    failCancelSchedule(cancelReason, now);
+                }
                 cancelRequested = true;
                 cancelStart = now;
                 cancelDeadline = now + std::chrono::milliseconds(kRequestCancelGraceMs);
@@ -1114,7 +1196,10 @@ void waitForUcxRequestCompletion(std::shared_ptr<ucxx::Request> const& req, std:
         else if (ctx.getTransferTerminate().load() && !cancelRequested)
         {
             cancelReason = "transfer terminated";
-            cancelRequestWithLog(req, ctx, rank, operation, cancelReason);
+            if (!cancelRequestWithLog(req, ctx, rank, operation, cancelReason, *worker))
+            {
+                failCancelSchedule(cancelReason, now);
+            }
             cancelRequested = true;
             cancelStart = now;
             cancelDeadline = now + std::chrono::milliseconds(kRequestCancelGraceMs);
