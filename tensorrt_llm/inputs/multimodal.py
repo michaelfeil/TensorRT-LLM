@@ -3,7 +3,7 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -21,6 +21,61 @@ _INT32_MAX = 2**31 - 1
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
 _HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
+
+
+class MultimodalSpanTokenCounts(NamedTuple):
+    num_cached_mm_tokens: int
+    num_mm_tokens_in_chunk: int
+    total_embeds_in_request: int
+
+
+def _overlap_size(start: int, end: int, window_start: int,
+                  window_end: int) -> int:
+    return max(0, min(end, window_end) - max(start, window_start))
+
+
+def count_multimodal_span_tokens(
+    multimodal_positions: Sequence[int],
+    multimodal_lengths: Sequence[int],
+    begin: int,
+    end: int,
+) -> MultimodalSpanTokenCounts:
+    """Count multimodal rows before and inside a compute window."""
+    if len(multimodal_positions) != len(multimodal_lengths):
+        raise ValueError(
+            "multimodal_positions and multimodal_lengths must have the same length"
+        )
+    if begin < 0:
+        raise ValueError("begin must be non-negative")
+    if end < begin:
+        raise ValueError("end must be greater than or equal to begin")
+
+    cached = 0
+    in_chunk = 0
+    total = 0
+    for position, length in zip(multimodal_positions, multimodal_lengths):
+        span_end = position + length
+        total += length
+        cached += _overlap_size(position, span_end, 0, begin)
+        in_chunk += _overlap_size(position, span_end, begin, end)
+    return MultimodalSpanTokenCounts(cached, in_chunk, total)
+
+
+def find_multimodal_span_containing_boundary(
+    multimodal_positions: Sequence[int],
+    multimodal_lengths: Sequence[int],
+    boundary: int,
+) -> Optional[tuple[int, int]]:
+    """Return the span split by `boundary`, or None if the boundary is safe."""
+    if len(multimodal_positions) != len(multimodal_lengths):
+        raise ValueError(
+            "multimodal_positions and multimodal_lengths must have the same length"
+        )
+    for position, length in zip(multimodal_positions, multimodal_lengths):
+        span_end = position + length
+        if position < boundary < span_end:
+            return position, span_end
+    return None
 
 
 def _validate_int_list(values: Any, field_name: str) -> None:
@@ -391,15 +446,19 @@ class DisaggPrefillMultimodalInputs:
 class MultimodalRuntimeData:
     """Runtime data for tracking multimodal embedding caching and reuse per request sequence.
 
-    Constructed from `py_multimodal_data["multimodal_embed_mask_cumsum"]`
-    (int64 CPU cumsum populated by the producer); counts are derived via
-    three O(1) cumsum lookups. Handles non-contiguous embedding positions
-    (inline specials, interleaved text) natively.
+    Constructed from either `py_multimodal_data["multimodal_embed_mask_cumsum"]`
+    (int64 CPU cumsum populated by the producer) or request-side
+    `multimodal_positions` / `multimodal_lengths` spans. Cumsum handles
+    non-contiguous embedding positions (inline specials, interleaved text);
+    spans avoid prompt-length work when the producer already has exact embed
+    spans.
 
     Attributes:
         past_seen_token_num: Total tokens already processed in previous iterations (cached)
         chunk_end_pos: End position of the current chunk for chunked prefill
-        embed_mask_cumsum: int64 prefix sum of the flat embedding-slot mask
+        embed_mask_cumsum: Optional int64 prefix sum of the flat embedding-slot mask
+        multimodal_positions: Optional start positions for multimodal spans
+        multimodal_lengths: Optional token lengths for multimodal spans
 
         num_cached_mm_tokens: Number of embeddings already cached (computed)
         num_mm_tokens_in_chunk: Number of embeddings in the current chunk (computed)
@@ -407,7 +466,9 @@ class MultimodalRuntimeData:
     """
     past_seen_token_num: int
     chunk_end_pos: int
-    embed_mask_cumsum: torch.Tensor
+    embed_mask_cumsum: Optional[torch.Tensor] = None
+    multimodal_positions: Optional[List[int]] = None
+    multimodal_lengths: Optional[List[int]] = None
 
     num_cached_mm_tokens: Optional[int] = None
     num_mm_tokens_in_chunk: Optional[int] = None
@@ -419,8 +480,20 @@ class MultimodalRuntimeData:
                 f"past_seen_token_num must be non-negative, got {self.past_seen_token_num}"
             )
         if self.embed_mask_cumsum is None:
-            raise ValueError(
-                "MultimodalRuntimeData requires embed_mask_cumsum.")
+            if self.multimodal_positions is None or self.multimodal_lengths is None:
+                raise ValueError(
+                    "MultimodalRuntimeData requires either embed_mask_cumsum "
+                    "or multimodal span metadata.")
+            counts = count_multimodal_span_tokens(
+                self.multimodal_positions,
+                self.multimodal_lengths,
+                self.past_seen_token_num,
+                self.chunk_end_pos,
+            )
+            self.num_cached_mm_tokens = counts.num_cached_mm_tokens
+            self.num_mm_tokens_in_chunk = counts.num_mm_tokens_in_chunk
+            self.total_embeds_in_request = counts.total_embeds_in_request
+            return
 
         cs = self.embed_mask_cumsum
         # int(cs[idx]) below would D2H-sync if cs lived on CUDA.
@@ -1070,8 +1143,9 @@ def check_mm_embed_cumsum_if_needed(
     begin_compute: int,
     end_compute: int,
     prompt_len: int,
+    has_span_metadata: bool = False,
 ) -> None:
-    """Raise iff chunked prefill or KV-cache reuse is in effect AND MM data is present without embed cumsum.
+    """Raise iff partial compute needs MM metadata but none is available.
 
     Triggers on the two cases where the scheduler advances less than the
     whole prompt in one step:
@@ -1079,19 +1153,21 @@ def check_mm_embed_cumsum_if_needed(
       * `end_compute < prompt_len` — chunked prefill: the scheduler split the
         remaining tokens across iterations.
 
-    Both cases require `multimodal_embed_mask_cumsum` to derive per-chunk
-    embedding counts in `MultimodalRuntimeData`. Full-prefill, no-reuse
-    iterations don't: `MultimodalRuntimeData` stays `None` and
-    `find_input_mm_embeds` handles the full payload.
+    Both cases require either `multimodal_embed_mask_cumsum` or request-side
+    span metadata to derive per-chunk embedding counts in
+    `MultimodalRuntimeData`. Full-prefill, no-reuse iterations don't:
+    `MultimodalRuntimeData` stays `None` and `find_input_mm_embeds` handles
+    the full payload.
 
-    When the cumsum is missing outside the chunked-prefill / KV-reuse cases,
+    When both forms are missing outside the chunked-prefill / KV-reuse cases,
     log a one-shot warning via `logger.warning_once` and proceed.
     """
     assert 0 <= begin_compute <= end_compute <= prompt_len, (
         f"invalid window: {begin_compute}..{end_compute}/{prompt_len}")
     if not _has_mm_payload_keys(py_multimodal_data):
         return
-    if py_multimodal_data.get("multimodal_embed_mask_cumsum") is not None:
+    if (py_multimodal_data.get("multimodal_embed_mask_cumsum") is not None
+            or has_span_metadata):
         return
 
     is_chunked_or_reused = (begin_compute > 0) or (end_compute < prompt_len)

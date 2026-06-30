@@ -3028,18 +3028,30 @@ class PyTorchModelEngine(ModelEngine):
 
             # Embed mask is required only for partial iterations (chunked
             # prefill or KV-cache reuse); full-prefill degrades gracefully.
+            has_span_metadata = (request.multimodal_positions is not None
+                                 and request.multimodal_lengths is not None)
             check_mm_embed_cumsum_if_needed(
                 request.py_multimodal_data,
                 begin_compute=past_seen_token_num,
                 end_compute=end_compute,
                 prompt_len=len(all_prompt_tokens),
+                has_span_metadata=has_span_metadata,
             )
             mm_data = request.py_multimodal_data or {}
             cumsum = mm_data.get('multimodal_embed_mask_cumsum')
+            needs_mm_runtime = (past_seen_token_num > 0
+                                or end_compute < len(all_prompt_tokens))
             py_multimodal_runtime = None
-            if cumsum is not None:
+            if needs_mm_runtime and cumsum is not None:
                 py_multimodal_runtime = MultimodalRuntimeData(
                     embed_mask_cumsum=cumsum,
+                    past_seen_token_num=past_seen_token_num,
+                    chunk_end_pos=end_compute,
+                )
+            elif needs_mm_runtime and has_span_metadata:
+                py_multimodal_runtime = MultimodalRuntimeData(
+                    multimodal_positions=request.multimodal_positions,
+                    multimodal_lengths=request.multimodal_lengths,
                     past_seen_token_num=past_seen_token_num,
                     chunk_end_pos=end_compute,
                 )
