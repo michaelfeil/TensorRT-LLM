@@ -41,6 +41,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -625,6 +626,7 @@ public:
                 }
                 if (discardReason == nullptr && !duplicatePeerConnection)
                 {
+                    mCurrentRequest = requestId;
                     it->second.setConnection(peerOffset, connection);
                     recordContextKvTransferEventReportUnlocked(requestId, it->second);
                 }
@@ -701,16 +703,41 @@ public:
         PerRequestActivityLog::instance().record(
             llmRequest.mRequestId, "cancel_requested", "CacheSender::cancelRequest");
         bool isCancelled = false;
+        std::optional<CancelledResponse> cancelledResponse;
         {
-            std::scoped_lock lkResp(mSenderMutex);
+            std::scoped_lock lkResp(mSenderMutex, mMtxForMap);
             auto it = mReadyResponses.find(llmRequest.mRequestId);
             // If the request is not the current request and already in the ready queue, we can cancel it.
             if (it != mReadyResponses.end()
                 && (!mCurrentRequest.has_value() || getCurrentRequestId() != llmRequest.mRequestId))
             {
-                mCancelledRequests.insert(llmRequest.mRequestId);
+                if (isAgentConnectionManager())
+                {
+                    mCancelledRequests.insert(llmRequest.mRequestId);
+                    mAnyReady = true;
+                }
+                else
+                {
+                    std::vector<Connection const*> connectedConnections;
+                    if (auto sessionIt = mRequestToSession.find(llmRequest.mRequestId);
+                        sessionIt != mRequestToSession.end())
+                    {
+                        recordContextKvTransferEventReportUnlocked(llmRequest.mRequestId, sessionIt->second);
+                        connectedConnections = getConnectedConnections(sessionIt->second);
+                        mRequestToSession.erase(sessionIt);
+                    }
+                    // A late request-info envelope will be rejected as missing_ready_response. Do not leave a
+                    // cancellation tombstone that can make the response thread wait on anonymous tag 19.
+                    mCancelledRequests.erase(llmRequest.mRequestId);
+                    mPendingRequestInfoRejectCounts.erase(llmRequest.mRequestId);
+                    cancelledResponse.emplace(CancelledResponse{
+                        llmRequest.mRequestId, std::move(it->second), std::move(connectedConnections)});
+                    mReadyResponses.erase(it);
+                    mRemainSendCount.erase(llmRequest.mRequestId);
+                    mRequestCancelFlags.erase(llmRequest.mRequestId);
+                    mAnyReady = hasReceiveWorkUnlocked();
+                }
                 isCancelled = true;
-                mAnyReady = true;
             }
         }
 
@@ -719,7 +746,7 @@ public:
             std::scoped_lock lkResp(mSenderMutex);
             mCancelledRequests.insert(llmRequest.mRequestId);
             isCancelled = true;
-            mAnyReady = true;
+            mAnyReady = hasReceiveWorkUnlocked();
         }
 
         if (isCancelled)
@@ -734,6 +761,10 @@ public:
         if (isCancelled)
         {
             mSenderCv.notify_all();
+        }
+        if (cancelledResponse.has_value())
+        {
+            completeCancelledResponse(*cancelledResponse);
         }
         if (!isCancelled)
         {
@@ -806,7 +837,7 @@ private:
 
     [[nodiscard]] bool hasReceiveWorkUnlocked() const
     {
-        return !mReadyResponses.empty() || !mCancelledRequests.empty();
+        return !mReadyResponses.empty();
     }
 
     [[nodiscard]] bool hasReceiveWork()
@@ -903,6 +934,46 @@ private:
         PerRequestActivityLog::instance().record(requestId, "request_info_failed", "CacheSender::recvRequestInfo");
         static_cast<void>(reason);
         setResponsePromiseException(requestId, *response, std::move(responseException));
+    }
+
+    void failAndRemoveAllReadyResponses(char const* reason, std::exception_ptr responseException) noexcept
+    {
+        std::vector<std::pair<RequestIdType, Response>> responses;
+        {
+            std::scoped_lock lk(mSenderMutex, mMtxForMap);
+            try
+            {
+                recordReadyResponseContextFailureReportsUnlocked();
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_WARNING("Failed to record CacheSender response failure events: %s", e.what());
+            }
+            catch (...)
+            {
+                TLLM_LOG_WARNING("Failed to record CacheSender response failure events");
+            }
+            for (auto it = mReadyResponses.begin(); it != mReadyResponses.end();)
+            {
+                auto const requestId = it->first;
+                responses.emplace_back(requestId, std::move(it->second));
+                it = mReadyResponses.erase(it);
+                mCancelledRequests.erase(requestId);
+                mPendingRequestInfoRejectCounts.erase(requestId);
+                mRemainSendCount.erase(requestId);
+                mRequestToSession.erase(requestId);
+                mRequestCancelFlags.erase(requestId);
+                mReportableContextKvTransferRequestIds.insert(requestId);
+            }
+            mCurrentRequest = std::nullopt;
+            mAnyReady = hasReceiveWorkUnlocked();
+        }
+
+        for (auto& [requestId, response] : responses)
+        {
+            PerRequestActivityLog::instance().record(requestId, reason, "CacheSender::response");
+            setResponsePromiseException(requestId, response, responseException);
+        }
     }
 
     void sendRequestInfoRejectReadySignal(
@@ -1058,6 +1129,15 @@ private:
             count = --mRemainSendCount[reqId];
         }
         TLLM_CHECK(count >= 0);
+        if (count > 0 && hasCancelledRequest(reqId))
+        {
+            auto cancelledResponse = std::move(it->second);
+            removeResponse(it);
+            rejectCancelledCurrentRequest(reqId);
+            setResponsePromiseValue(reqId, cancelledResponse);
+            mCurrentRequest = std::nullopt;
+            return;
+        }
         if (count == 0)
         {
             {
@@ -1175,10 +1255,15 @@ private:
                 }
                 catch (std::exception const& e)
                 {
+                    auto const responseException = std::current_exception();
                     TLLM_LOG_ERROR("Exception while receiving CacheSender request info: %s", e.what());
                     if (mTerminate || !mManager->isRunning())
                     {
                         return;
+                    }
+                    if (!isAgent)
+                    {
+                        failAndRemoveAllReadyResponses("request_info_receive_failed", responseException);
                     }
                     if (isAgent)
                     {
@@ -1188,10 +1273,15 @@ private:
                 }
                 catch (...)
                 {
+                    auto const responseException = std::current_exception();
                     TLLM_LOG_ERROR("Exception while receiving CacheSender request info");
                     if (mTerminate || !mManager->isRunning())
                     {
                         return;
+                    }
+                    if (!isAgent)
+                    {
+                        failAndRemoveAllReadyResponses("request_info_receive_failed", responseException);
                     }
                     if (isAgent)
                     {
@@ -1234,10 +1324,11 @@ private:
                     mRemainSendCount.emplace(reqId, counterpartsCount);
                 }
 
-                while (!hasReadyResponse(reqId))
+                while (!hasReadyResponse(reqId) && !hasCancelledRequest(reqId))
                 {
                     std::unique_lock lk(mCondMutex);
-                    mSenderCv.wait(lk, [this, reqId]() { return mTerminate || hasReadyResponse(reqId); });
+                    mSenderCv.wait(lk,
+                        [this, reqId]() { return mTerminate || hasReadyResponse(reqId) || hasCancelledRequest(reqId); });
                     if (mTerminate)
                     {
                         break;
@@ -1246,6 +1337,11 @@ private:
                 if (mTerminate)
                 {
                     break;
+                }
+                if (!hasReadyResponse(reqId) && hasCancelledRequest(reqId))
+                {
+                    rejectCancelledCurrentRequest(reqId);
+                    continue;
                 }
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
@@ -1338,6 +1434,12 @@ private:
         return mReadyResponses.find(requestId) != mReadyResponses.end();
     }
 
+    [[nodiscard]] bool hasCancelledRequest(RequestIdType requestId)
+    {
+        std::scoped_lock lk(mSenderMutex);
+        return mCancelledRequests.find(requestId) != mCancelledRequests.end();
+    }
+
     [[nodiscard]] static std::vector<Connection const*> getConnectedConnections(TransferSession const& session)
     {
         std::vector<Connection const*> connectedConnections;
@@ -1367,6 +1469,39 @@ private:
                     "Failed to send cancellation ready signal request_id=%zu error=%s", requestId, e.what());
             }
         }
+    }
+
+    void completeCancelledResponse(CancelledResponse& cancelledResponse) noexcept
+    {
+        bool const isReady = false;
+        sendReadySignalToConnectedNonAgentPeers(
+            cancelledResponse.mRequestId, cancelledResponse.mConnectedConnections, isReady);
+        setResponsePromiseValue(cancelledResponse.mRequestId, cancelledResponse.mResponse);
+    }
+
+    void rejectCancelledCurrentRequest(RequestIdType requestId) noexcept
+    {
+        std::vector<Connection const*> connectedConnections;
+        {
+            std::scoped_lock lk(mSenderMutex, mMtxForMap);
+            if (auto sessionIt = mRequestToSession.find(requestId); sessionIt != mRequestToSession.end())
+            {
+                recordContextKvTransferEventReportUnlocked(requestId, sessionIt->second);
+                connectedConnections = getConnectedConnections(sessionIt->second);
+                mRequestToSession.erase(sessionIt);
+            }
+            mCancelledRequests.erase(requestId);
+            mPendingRequestInfoRejectCounts.erase(requestId);
+            mRemainSendCount.erase(requestId);
+            mRequestCancelFlags.erase(requestId);
+            if (mCurrentRequest.has_value() && getCurrentRequestId() == requestId)
+            {
+                mCurrentRequest = std::nullopt;
+            }
+            mAnyReady = hasReceiveWorkUnlocked();
+        }
+        bool const isReady = false;
+        sendReadySignalToConnectedNonAgentPeers(requestId, connectedConnections, isReady);
     }
 
     void completeCancelledReadyResponses()
@@ -1405,17 +1540,7 @@ private:
 
         for (auto& cancelledResponse : cancelledResponses)
         {
-            bool const isReady = false;
-            sendReadySignalToConnectedNonAgentPeers(
-                cancelledResponse.mRequestId, cancelledResponse.mConnectedConnections, isReady);
-            try
-            {
-                cancelledResponse.mResponse.mPromise.set_value();
-            }
-            catch (...)
-            {
-                cancelledResponse.mResponse.mPromise.set_exception(std::current_exception());
-            }
+            completeCancelledResponse(cancelledResponse);
         }
     }
 
