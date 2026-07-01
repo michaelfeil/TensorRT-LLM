@@ -100,31 +100,14 @@ LayerDomainInfo getLayerDomainInfo(int layerId, executor::kv_cache::TargetRanksI
     TLLM_THROW("MLA CPU cache formatter could not map layer %d into PP domain", layerId);
 }
 
-BlockDomainInfo getBlockDomainInfo(int blockId, int domainCPSize, int inputBlockNum)
+BlockDomainInfo getBlockDomainInfo(int blockId, int domainCPSize)
 {
     if (domainCPSize == 1)
     {
         return BlockDomainInfo{blockId, 0};
     }
 
-    if (common::getEnvUseRoundRobinBlockDistForCP())
-    {
-        return BlockDomainInfo{blockId / domainCPSize, blockId % domainCPSize};
-    }
-
-    int prefixBlockNum = 0;
-    for (int cpRank = 0; cpRank < domainCPSize; cpRank++)
-    {
-        auto const blockNumInDomainCP
-            = executor::kv_cache::getBlockNumAccountingForCP(cpRank, domainCPSize, inputBlockNum);
-        auto const nextPrefixBlockNum = prefixBlockNum + blockNumInDomainCP;
-        if (blockId >= prefixBlockNum && blockId < nextPrefixBlockNum)
-        {
-            return BlockDomainInfo{blockId - prefixBlockNum, cpRank};
-        }
-        prefixBlockNum = nextPrefixBlockNum;
-    }
-    TLLM_THROW("MLA CPU cache formatter could not map block %d into CP domain", blockId);
+    return BlockDomainInfo{blockId / domainCPSize, blockId % domainCPSize};
 }
 
 MlaCpuTransferLayout makeMlaCpuTransferLayout(
@@ -155,7 +138,7 @@ MlaCpuTransferLayout makeMlaCpuTransferLayout(
     blockInfos.reserve(blockNum);
     for (int blockId = 0; blockId < blockNum; blockId++)
     {
-        blockInfos.push_back(getBlockDomainInfo(blockId, targetInfo.mDomainCPSize, blockNum));
+        blockInfos.push_back(getBlockDomainInfo(blockId, targetInfo.mDomainCPSize));
     }
 
     return MlaCpuTransferLayout{std::move(targetInfo), numLayers, headNum, kvFactor, layerStride, headStride, kvOffset,
