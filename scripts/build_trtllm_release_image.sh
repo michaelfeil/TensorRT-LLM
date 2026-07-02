@@ -2,33 +2,24 @@
 
 set -eu
 
-case "$(uname -m)" in
-    x86_64 | amd64)
-        arch="amd64"
-        ;;
-    aarch64 | arm64)
-        arch="arm64"
-        ;;
-    *)
-        echo "ERROR: unsupported host architecture: $(uname -m)" >&2
-        exit 1
-        ;;
-esac
+export BUILDX_NO_DEFAULT_ATTESTATIONS=1
 
 commit_sha="$(git rev-parse HEAD)"
-IMAGE_TAG="baseten/tensorrt_llm-release:${commit_sha:0:10}"
-CUDA_ARCHS="${CUDA_ARCHS:-80-real;86-real;90-real;100-real}"
-PLATFORM="${PLATFORM:-${arch}}"
-BUILD_WHEEL_OPTS=${BUILD_WHEEL_OPTS:-"--clean --use_ccache"}
-DOCKER_BUILD_OPTS=${DOCKER_BUILD_OPTS:-"--pull --push"}
+image_tag="baseten/tensorrt_llm-release:${commit_sha:0:10}"
+CUDA_ARCHS_AMD64="${CUDA_ARCHS_AMD64:-80-real;86-real;90-real;100-real;103-real}"
+CUDA_ARCHS_ARM64="${CUDA_ARCHS_ARM64:-100-real;103-real}"
+build_wheel_opts="-D CMAKE_CXX_COMPILER_LAUNCHER=sccache -D CMAKE_CUDA_COMPILER_LAUNCHER=sccache"
+docker_build_opts="--pull --push --platform linux/amd64,linux/arm64"
+docker_build_args="--secret id=SCCACHE_WEBDAV_TOKEN,env=SCCACHE_WEBDAV_TOKEN"
+docker_build_args="${docker_build_args} --build-arg CUDA_ARCHS_AMD64=\"${CUDA_ARCHS_AMD64}\""
+docker_build_args="${docker_build_args} --build-arg CUDA_ARCHS_ARM64=\"${CUDA_ARCHS_ARM64}\""
 
-env -u CUDA_VERSION -u CUDNN_VERSION -u NCCL_VERSION -u CUBLAS_VERSION make \
+env -u CUDA_ARCHS -u CUDA_VERSION -u CUDNN_VERSION -u NCCL_VERSION -u CUBLAS_VERSION make \
     -C docker \
     release_build \
-    "IMAGE_WITH_TAG=${IMAGE_TAG}-${arch}" \
-    "PLATFORM=${PLATFORM}" \
-    "CUDA_ARCHS=${CUDA_ARCHS}" \
-    "BUILD_WHEEL_OPTS=${BUILD_WHEEL_OPTS}" \
-    "DOCKER_BUILD_OPTS=${DOCKER_BUILD_OPTS}" \
-    "DOCKER_BUILD_ARGS=${DOCKER_BUILD_ARGS:-}" \
+    "IMAGE_WITH_TAG=${image_tag}" \
+    "PLATFORM=multi" \
+    "BUILD_WHEEL_OPTS=${build_wheel_opts}" \
+    "DOCKER_BUILD_OPTS=${docker_build_opts}" \
+    "DOCKER_BUILD_ARGS=${docker_build_args}" \
     "DOCKER_PROGRESS=plain"

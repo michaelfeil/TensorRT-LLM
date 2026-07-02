@@ -139,6 +139,9 @@ ENV SCCACHE_DIR=/root/.cache/sccache
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
+ARG TARGETARCH
+ARG CUDA_ARCHS_AMD64=""
+ARG CUDA_ARCHS_ARM64=""
 ARG SCCACHE_WEBDAV_ENDPOINT=https://cache.depot.dev
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     --mount=type=cache,target=${SCCACHE_DIR} --mount=type=secret,id=SCCACHE_WEBDAV_TOKEN,env=SCCACHE_WEBDAV_TOKEN,required=false \
@@ -147,8 +150,14 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
         export SCCACHE_WEBDAV_ENDPOINT="${SCCACHE_WEBDAV_ENDPOINT}"; \
         sccache --start-server && sccache --zero-stats && sccache_enabled=1; \
     fi; \
+    cuda_archs=""; \
+    case "${TARGETARCH}" in \
+        amd64) cuda_archs="${CUDA_ARCHS_AMD64}" ;; \
+        arm64) cuda_archs="${CUDA_ARCHS_ARM64}" ;; \
+    esac; \
     build_status=0; \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS} || build_status=$?; \
+    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS} \
+        ${cuda_archs:+--cuda_architectures ${cuda_archs}} || build_status=$?; \
     if [ "${sccache_enabled}" = 1 ]; then \
         echo "SCCACHE_STATS_BEGIN"; \
         sccache --show-stats || true; \

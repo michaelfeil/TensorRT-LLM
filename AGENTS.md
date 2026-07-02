@@ -172,11 +172,12 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 ### Post-Merge Release Image Build
 
 `.github/workflows/post-merge-build.yml` builds and pushes `baseten/tensorrt_llm-release` images for amd64
-(`80-real;86-real;90-real;100-real`) and arm64 (`100-real;103-real`) using
-`scripts/build_trtllm_release_image.sh`. The workflow uses Depot 192-core runners and the Depot
-runner-provided `SCCACHE_WEBDAV_TOKEN` build secret for persistent `sccache`. Manual script runs default to
-`ccache`; CI passes `BUILD_WHEEL_OPTS` for `sccache`. Manual workflow dispatch exposes per-arch CUDA
-architecture overrides.
+(`80-real;86-real;90-real;100-real;103-real`) and arm64 (`100-real;103-real`) using
+`scripts/build_trtllm_release_image.sh`. The workflow uses `depot/use-action` to submit one native
+multi-platform build to the Depot project configured by `DEPOT_TRTLLM_CI_PROJECT_ID` and
+`DEPOT_TRTLLM_CI_PROJECT_TOKEN`. The script is scoped to this CI path and passes the Depot-provided
+`SCCACHE_WEBDAV_TOKEN` build secret for persistent `sccache`. Manual workflow dispatch exposes per-arch
+CUDA architecture overrides.
 
 ### Trouble Shooting
 
