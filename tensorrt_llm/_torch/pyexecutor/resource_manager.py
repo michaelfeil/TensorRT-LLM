@@ -1336,24 +1336,33 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.store_blocks_for_reuse(request.py_request_id, request,
                                                 pin_blocks)
 
-    def estimate_reusable_prompt_len(self, request: LlmRequest) -> int:
+    def estimate_reusable_prompt_len_with_summary(
+            self, request: LlmRequest) -> Tuple[int, Optional[object]]:
         if (not self.enable_block_reuse or self.enable_partial_reuse
                 or self.is_vswa or not request.is_first_context_chunk):
-            return 0
+            return 0, None
 
-        unique_tokens = request.get_unique_tokens(DEFAULT_BEAM_INDEX)[:-1]
-        reusable_tokens_cap = (len(unique_tokens) //
+        unique_tokens = request.get_unique_tokens(DEFAULT_BEAM_INDEX)
+        recoverable_unique_tokens = unique_tokens[:-1]
+        reusable_tokens_cap = (len(recoverable_unique_tokens) //
                                self.tokens_per_block) * self.tokens_per_block
         if reusable_tokens_cap == 0:
-            return 0
+            return 0, None
 
         analyze_prefix_reuse = getattr(self.impl, "analyze_prefix_reuse", None)
         if analyze_prefix_reuse is None:
-            return 0
+            return 0, None
 
         summary = analyze_prefix_reuse(unique_tokens, request)
-        return min(summary.reusable_blocks_all * self.tokens_per_block,
-                   reusable_tokens_cap)
+        reusable_prompt_len = min(
+            summary.reusable_blocks_all * self.tokens_per_block,
+            reusable_tokens_cap)
+        return reusable_prompt_len, summary
+
+    def estimate_reusable_prompt_len(self, request: LlmRequest) -> int:
+        reusable_prompt_len, _ = self.estimate_reusable_prompt_len_with_summary(
+            request)
+        return reusable_prompt_len
 
     @staticmethod
     def calculate_scaling_factor_size_bytes(

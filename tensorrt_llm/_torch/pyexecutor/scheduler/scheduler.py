@@ -1,5 +1,4 @@
 import dataclasses
-import inspect
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
@@ -26,27 +25,20 @@ def _call_with_optional_summary(
     *args: Any,
     cached_summary: Optional[PrefixReuseSummary] = None,
 ) -> T:
-    """Call ``fn(*args)`` and, if supported, pass ``cached_summary`` as a kwarg.
+    """Call ``fn(*args)`` and pass ``cached_summary`` when present.
 
     The nanobind binding for ``get_remaining_blocks_to_completion`` and
     ``get_needed_blocks_one_step`` accepts ``cached_summary: PrefixReuseSummary | None = None``
-    so the C++ side can skip a redundant radix-tree walk. Test mocks may not
-    accept this kwarg yet; inspect the callable before passing it so real
-    ``TypeError`` exceptions from inside ``fn`` are not hidden.
+    so the C++ side can skip a redundant radix-tree walk.
     """
     if cached_summary is None:
         return fn(*args)
-
-    try:
-        signature = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return fn(*args, cached_summary=cached_summary)
-    if not any(
-        param.name == "cached_summary" or param.kind == inspect.Parameter.VAR_KEYWORD
-        for param in signature.parameters.values()
-    ):
-        return fn(*args)
     return fn(*args, cached_summary=cached_summary)
+
+
+def _get_preview_prefix_summary(req: LlmRequest) -> Optional[PrefixReuseSummary]:
+    """Return the prefix summary produced by PyExecutor's reuse preview, if any."""
+    return getattr(req, "py_schedulable_reuse_summary", None)
 
 
 SchedulerOutput = namedtuple(
@@ -1817,6 +1809,10 @@ class PyCapacityScheduler:
             # reuse it. This mirrors C++ capacityScheduler.cpp:295-302.
             summary = summary_by_req.get(req_id) if summary_by_req is not None else None
             if summary is None:
+                summary = _get_preview_prefix_summary(req)
+                if summary is not None and summary_by_req is not None:
+                    summary_by_req[req_id] = summary
+            if summary is None:
                 unique_tokens = req.get_unique_tokens(0)
                 summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
                 if summary_by_req is not None:
@@ -1888,11 +1884,17 @@ class PyCapacityScheduler:
 
     def _get_request_remaining_blocks_sort_key(self, req: LlmRequest) -> tuple[int, ...]:
         key: list[int] = []
+        cached_summary = _get_preview_prefix_summary(req)
 
         if self.kv_cache_manager is not None:
             for window_size in get_kv_cache_window_sizes(self.kv_cache_manager):
                 key.append(
-                    self.kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
+                    _call_with_optional_summary(
+                        self.kv_cache_manager.get_remaining_blocks_to_completion,
+                        req,
+                        window_size,
+                        cached_summary=cached_summary,
+                    )
                 )
 
         if self.cross_kv_cache_manager is not None:

@@ -872,6 +872,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
         self.py_should_report_kv_transfer_failure_event = False
+        self.py_schedulable_reuse_summary = None
 
         # Encoder-decoder runtime state. ``py_encoder_output`` holds the
         # packed encoder hidden states produced by the encoder iteration as

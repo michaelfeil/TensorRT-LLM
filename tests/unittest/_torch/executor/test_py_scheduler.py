@@ -39,7 +39,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     SimpleUnifiedScheduler,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          PythonCapacitySchedulerPolicy)
 
 
 @dataclass
@@ -160,18 +161,25 @@ class MockKVCacheManager:
         self.enable_block_reuse = enable_block_reuse
         self.max_attention_window_vec = self._window_sizes
         self._scheduling_started = False
+        self.remaining_cached_summaries = []
+        self.needed_one_step_cached_summaries = []
+        self.analyze_prefix_reuse_calls = 0
 
     def get_kv_cache_stats(self) -> MockKVCacheStats:
         return MockKVCacheStats(
             num_free_blocks_per_window_size={ws: self._num_free_blocks for ws in self._window_sizes}
         )
 
-    def get_remaining_blocks_to_completion(self, req, window_size: int) -> int:
+    def get_remaining_blocks_to_completion(self, req, window_size: int, cached_summary=None) -> int:
+        self.remaining_cached_summaries.append(cached_summary)
         if req.is_encoder_init_state:
             return 0
         return self._blocks_per_request
 
-    def get_needed_blocks_one_step(self, req, two_step_lookahead: bool, window_size: int) -> int:
+    def get_needed_blocks_one_step(
+        self, req, two_step_lookahead: bool, window_size: int, cached_summary=None
+    ) -> int:
+        self.needed_one_step_cached_summaries.append(cached_summary)
         if req.is_encoder_init_state:
             return 0
         return self._blocks_per_request
@@ -186,6 +194,7 @@ class MockKVCacheManager:
         pass
 
     def analyze_prefix_reuse(self, unique_tokens, req):
+        self.analyze_prefix_reuse_calls += 1
         if self.enable_block_reuse and unique_tokens:
             # Derive a deterministic, hashable block key from the tokens so that
             # duplicate requests produce equal first_new_block values and trigger
@@ -2829,6 +2838,56 @@ class TestPyCapacitySchedulerKVCacheReuse:
     C++ ref: DelayDuplicate*, ReuseAware*, MaxUtilizationReuse*, NoReuse* tests
     in capacitySchedulerTest.cpp.
     """
+
+    def test_shortest_missed_sort_uses_preview_summary(self):
+        """A previewed prefix summary is forwarded into the sort-key resource query."""
+        kv = MockKVCacheManager(num_free_blocks=100,
+                                blocks_per_request=3,
+                                enable_block_reuse=True)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            python_capacity_scheduler_policy=(
+                PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST),
+        )
+        r0 = _make_request(0, prompt_len=21, input_tokens=list(range(21)))
+        r1 = _make_request(1, prompt_len=22, input_tokens=list(range(22)))
+        summary0 = MockPrefixReuseSummary(reusable_blocks_allocated=1,
+                                          reusable_blocks_all=2)
+        summary1 = MockPrefixReuseSummary(reusable_blocks_allocated=2,
+                                          reusable_blocks_all=3)
+        r0.py_schedulable_reuse_summary = summary0
+        r1.py_schedulable_reuse_summary = summary1
+
+        scheduler._sort_context_requests_by_remaining_blocks([r0, r1])
+
+        assert kv.remaining_cached_summaries == [summary0, summary1]
+
+    def test_duplicate_skip_uses_preview_summary_without_reanalysis(self):
+        """Duplicate-skip can consume preview summaries without another tree walk."""
+        kv = MockKVCacheManager(num_free_blocks=100,
+                                blocks_per_request=3,
+                                enable_block_reuse=True)
+        kv.analyze_prefix_reuse = Mock(
+            side_effect=AssertionError("unexpected prefix reuse re-analysis"))
+        scheduler = PyCapacityScheduler(
+            max_num_requests=3,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        )
+        tokens = list(range(21))
+        r0 = _make_request(0, prompt_len=21, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=21, input_tokens=tokens)
+        shared_summary = MockPrefixReuseSummary(first_new_block=("shared",))
+        r0.py_schedulable_reuse_summary = shared_summary
+        r1.py_schedulable_reuse_summary = shared_summary
+
+        fitting, _disagg, paused = scheduler.schedule_request([r0, r1])
+
+        assert [req.request_id for req in fitting] == [0]
+        assert paused == []
+        kv.analyze_prefix_reuse.assert_not_called()
 
     def test_delay_duplicate_request(self):
         """C++ ref: DelayDuplicateRequest - identical requests delayed for reuse"""

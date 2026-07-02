@@ -2306,8 +2306,17 @@ class PyExecutor:
             if not request.is_context_init_state or not request.is_first_context_chunk:
                 continue
 
-            reusable_prompt_len = self.kv_cache_manager.estimate_reusable_prompt_len(
-                request)
+            estimate_with_summary = getattr(
+                self.kv_cache_manager,
+                "estimate_reusable_prompt_len_with_summary", None)
+            if estimate_with_summary is not None:
+                reusable_prompt_len, reuse_summary = estimate_with_summary(
+                    request)
+            else:
+                reusable_prompt_len = (
+                    self.kv_cache_manager.estimate_reusable_prompt_len(request))
+                reuse_summary = None
+            request.py_schedulable_reuse_summary = reuse_summary
             if reusable_prompt_len <= request.prepopulated_prompt_len:
                 continue
 
@@ -2317,6 +2326,11 @@ class PyExecutor:
                 reusable_prompt_len, self.kv_cache_manager.tokens_per_block)
 
         return previewed_states
+
+    def _clear_schedulable_reuse_summaries(
+            self, requests: List[LlmRequest]) -> None:
+        for request in requests:
+            request.py_schedulable_reuse_summary = None
 
     def _pp_retry_until_can_schedule(self, scheduled_batch):
         """
@@ -4460,11 +4474,12 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
-        previewed_states = self._apply_schedulable_reuse_preview(
-            self.active_requests)
+        previewed_states: Dict[int, Tuple[int, int, int]] = {}
         scheduled_context_requests: List[LlmRequest] = []
         scheduled_context_states: Dict[int, Tuple[int, int, int]] = {}
         try:
+            previewed_states = self._apply_schedulable_reuse_preview(
+                self.active_requests)
             scheduler_output = self.scheduler.schedule_request(
                 self.active_requests, self.inflight_req_ids)
 
@@ -4491,6 +4506,7 @@ class PyExecutor:
                                                    previewed_states)
             self._restore_schedulable_reuse_states(scheduled_context_requests,
                                                    scheduled_context_states)
+            self._clear_schedulable_reuse_summaries(self.active_requests)
 
         num_fitting = scheduler_output.num_fitting_requests
         #TODO(TRTLLM-12359): remove the WAR when PythonMambaCacheManager is deprecated.
