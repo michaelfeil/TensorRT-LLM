@@ -473,11 +473,8 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
 
     copyBlock(block, offloadBlock, pools, true /* isOffload */, numTokensToCopy, mode, directory);
 
-    {
-        std::lock_guard<std::mutex> lock(mStatsMutex);
-        ++mOffloadBlockCount;
-        mOffloadByteCount += computeBlockTransferBytes(pools, numTokensToCopy);
-    }
+    mOffloadBlockCount.fetch_add(1, std::memory_order_relaxed);
+    mOffloadByteCount.fetch_add(computeBlockTransferBytes(pools, numTokensToCopy), std::memory_order_relaxed);
 
     recordPendingRead(sourceKey, mOffloadManager.getStream());
     recordPendingWrite(destinationKey, mOffloadManager.getStream());
@@ -505,19 +502,16 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
 
             copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
 
+            auto const bytes = computeBlockTransferBytes(pools, numTokensToCopy);
+            if (offloadedBlock->isPrimary())
             {
-                std::lock_guard<std::mutex> lock(mStatsMutex);
-                auto const bytes = computeBlockTransferBytes(pools, numTokensToCopy);
-                if (offloadedBlock->isPrimary())
-                {
-                    ++mIntraDeviceCopyBlockCount;
-                    mIntraDeviceCopyByteCount += bytes;
-                }
-                else
-                {
-                    ++mOnboardBlockCount;
-                    mOnboardByteCount += bytes;
-                }
+                mIntraDeviceCopyBlockCount.fetch_add(1, std::memory_order_relaxed);
+                mIntraDeviceCopyByteCount.fetch_add(bytes, std::memory_order_relaxed);
+            }
+            else
+            {
+                mOnboardBlockCount.fetch_add(1, std::memory_order_relaxed);
+                mOnboardByteCount.fetch_add(bytes, std::memory_order_relaxed);
             }
 
             // The owner rank copies host KV to its primary GPU block first; the TP broadcast stream waits on that
@@ -548,19 +542,16 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
 
     copyBlock(offloadedBlock, block, pools, false /* isOffload */, numTokensToCopy, mode, directory);
 
+    auto const bytes = computeBlockTransferBytes(pools, numTokensToCopy);
+    if (offloadedBlock->isPrimary())
     {
-        std::lock_guard<std::mutex> lock(mStatsMutex);
-        auto const bytes = computeBlockTransferBytes(pools, numTokensToCopy);
-        if (offloadedBlock->isPrimary())
-        {
-            ++mIntraDeviceCopyBlockCount;
-            mIntraDeviceCopyByteCount += bytes;
-        }
-        else
-        {
-            ++mOnboardBlockCount;
-            mOnboardByteCount += bytes;
-        }
+        mIntraDeviceCopyBlockCount.fetch_add(1, std::memory_order_relaxed);
+        mIntraDeviceCopyByteCount.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    else
+    {
+        mOnboardBlockCount.fetch_add(1, std::memory_order_relaxed);
+        mOnboardByteCount.fetch_add(bytes, std::memory_order_relaxed);
     }
 
     recordPendingRead(sourceKey, mOnboardManager.getStream());
@@ -607,20 +598,13 @@ void KVCacheTransferManager::syncTransfers()
 
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()
 {
-    std::lock_guard<std::mutex> lock(mStatsMutex);
     KvCacheTransferStats stats;
-    stats.onboardBlocks = mOnboardBlockCount;
-    stats.onboardBytes = mOnboardByteCount;
-    stats.offloadBlocks = mOffloadBlockCount;
-    stats.offloadBytes = mOffloadByteCount;
-    stats.intraDeviceCopyBlocks = mIntraDeviceCopyBlockCount;
-    stats.intraDeviceCopyBytes = mIntraDeviceCopyByteCount;
-    mOnboardBlockCount = 0;
-    mOnboardByteCount = 0;
-    mOffloadBlockCount = 0;
-    mOffloadByteCount = 0;
-    mIntraDeviceCopyBlockCount = 0;
-    mIntraDeviceCopyByteCount = 0;
+    stats.onboardBlocks = mOnboardBlockCount.exchange(0, std::memory_order_relaxed);
+    stats.onboardBytes = mOnboardByteCount.exchange(0, std::memory_order_relaxed);
+    stats.offloadBlocks = mOffloadBlockCount.exchange(0, std::memory_order_relaxed);
+    stats.offloadBytes = mOffloadByteCount.exchange(0, std::memory_order_relaxed);
+    stats.intraDeviceCopyBlocks = mIntraDeviceCopyBlockCount.exchange(0, std::memory_order_relaxed);
+    stats.intraDeviceCopyBytes = mIntraDeviceCopyByteCount.exchange(0, std::memory_order_relaxed);
     return stats;
 }
 

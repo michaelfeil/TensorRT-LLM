@@ -19,8 +19,8 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <atomic>
 #include <functional>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -184,14 +184,13 @@ private:
     int mDeviceId;
 
     // Cumulative transfer statistics, reset on each call to getAndResetTransferStats().
-    // Protected by mStatsMutex for thread-safe access.
-    mutable std::mutex mStatsMutex;
-    SizeType32 mOnboardBlockCount{0};
-    std::size_t mOnboardByteCount{0};
-    SizeType32 mOffloadBlockCount{0};
-    std::size_t mOffloadByteCount{0};
-    SizeType32 mIntraDeviceCopyBlockCount{0};
-    std::size_t mIntraDeviceCopyByteCount{0};
+    // Relaxed atomics are enough because these counters are observational only.
+    std::atomic<SizeType32> mOnboardBlockCount{0};
+    std::atomic<std::size_t> mOnboardByteCount{0};
+    std::atomic<SizeType32> mOffloadBlockCount{0};
+    std::atomic<std::size_t> mOffloadByteCount{0};
+    std::atomic<SizeType32> mIntraDeviceCopyBlockCount{0};
+    std::atomic<std::size_t> mIntraDeviceCopyByteCount{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
