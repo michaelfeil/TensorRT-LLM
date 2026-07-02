@@ -222,6 +222,45 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
     return result
 
 
+def _get_cuda_graph_warmup_seq_lens(
+        sparse_config: Optional[object],
+        effective_max_seq_len: int,
+        max_draft_len: int,
+        kv_reserve_draft_tokens: int,
+        num_extra_decoding_steps: int) -> list[int]:
+    """Return generation warmup sequence lengths needed for CUDA graph capture.
+
+    Seq-length-aware sparse attention only keys CUDA graphs on the short/long
+    mode bit, not on the absolute max sequence length. Use the smallest
+    sequence that lands in long mode so DSA indexer warmup does not synthesize
+    a model-max-length request.
+    """
+    if not (isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
+            and sparse_config.needs_separate_short_long_cuda_graphs()):
+        return [effective_max_seq_len]
+
+    seq_len_threshold = sparse_config.seq_len_threshold
+    if seq_len_threshold is None:
+        return [effective_max_seq_len]
+
+    short_max_seq_len = seq_len_threshold - (max_draft_len + 1)
+
+    # _create_cuda_graph_warmup_request subtracts extra KV tokens, reserved
+    # draft slots, and fused-loop extra decoding steps from max_seq_len before
+    # building the dummy request, while the graph key adds max_draft_len back
+    # when deciding the short/long mode. Extra KV tokens cancel out, so this is
+    # the smallest caller-visible max_seq_len that guarantees a long-mode graph
+    # key.
+    min_long_max_seq_len = seq_len_threshold + 2 + max(
+        0,
+        kv_reserve_draft_tokens + num_extra_decoding_steps - max_draft_len)
+
+    if min_long_max_seq_len <= effective_max_seq_len:
+        return [min_long_max_seq_len, short_max_seq_len]
+
+    return [effective_max_seq_len]
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -1336,20 +1375,13 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping is not None and self.mapping.has_cp_helix():
             effective_max_seq_len = self.max_seq_len // self.mapping.cp_size
 
-        sparse_config = self.sparse_attention_config
-        if (isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
-                and sparse_config.needs_separate_short_long_cuda_graphs()):
-            # For short sequences, use the (seq_len_threshold - max_draft_len - 1) as the maximum sequence length
-            # to make sure all of the past and current input tokens are within the sequence length threshold.
-            # For long sequences, use the default maximum sequence length.
-            max_seq_len = sparse_config.seq_len_threshold - (
-                self.max_draft_len + 1)
-            if max_seq_len < effective_max_seq_len:
-                max_seq_len_list = [effective_max_seq_len, max_seq_len]
-            else:
-                max_seq_len_list = [effective_max_seq_len]
-        else:
-            max_seq_len_list = [effective_max_seq_len]
+        max_seq_len_list = _get_cuda_graph_warmup_seq_lens(
+            self.sparse_attention_config,
+            effective_max_seq_len,
+            self.max_draft_len,
+            self.max_draft_loop_tokens,
+            self._get_num_extra_decoding_steps(),
+        )
 
         def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
             spec_metadata = self.spec_metadata
