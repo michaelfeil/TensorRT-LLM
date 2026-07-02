@@ -1060,6 +1060,31 @@ class TestPyMicroBatchSchedulerReusableTokens:
         # req2 compute = max(1, 30-20) = 10; req3 compute = 20; total = 30 → both fit.
         assert len(ctx3) == 2
 
+    def test_prepopulated_prefix_does_not_get_reusable_credit_twice(self):
+        """
+        A schedulable-reuse preview advances context_current_position to the
+        prepopulated prefix before microbatch scheduling runs. The reusable
+        estimate is absolute from position 0, so only the overlap beyond the
+        current position may reduce this iteration's compute budget.
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=1)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=4, max_num_tokens=10, ctx_chunk_config=config
+        )
+        req0 = make_context_request(0, prompt_len=20)
+        req0.context_chunk_size = 20
+        req0.set_prepopulated_prompt_len(10, 1)
+        req0.estimated_reusable_tokens = 10
+        assert req0.is_first_context_chunk
+        assert req0.context_current_position == 10
+
+        req1 = make_context_request(1, prompt_len=10)
+
+        _enc, ctx, gen = scheduler.schedule([req0, req1], set())
+        assert len(ctx) == 1
+        assert ctx[0].request_id == 0
+        assert ctx[0].context_chunk_size == 10
+
     def test_reusable_tokens_no_chunking_min_cost_is_one(self):
         """
         The no-chunking path floors compute cost at 1 even if reusable > prompt_len.

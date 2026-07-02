@@ -890,6 +890,46 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextFCFS)
     }
 }
 
+TEST_F(MicroBatchSchedulerTest, PrepopulatedPrefixDoesNotGetReusableCreditTwice)
+{
+    // PyExecutor's schedulable-reuse preview advances contextCurrentPosition to
+    // the prepopulated prefix before microbatch scheduling runs. The reusable
+    // estimate is absolute from position 0, so it should not reduce this
+    // iteration's budget after the current position already reached it.
+    constexpr SizeType32 maxNumTokens = 10;
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 chunkUnitSize = 1;
+    constexpr SizeType32 promptLen0 = 20;
+    constexpr SizeType32 promptLen1 = 10;
+    constexpr SizeType32 reusableTokens = 10;
+    constexpr SizeType32 maxNewTokens = 5;
+    constexpr SizeType32 tokensPerBlock = 1;
+    constexpr ContextChunkingPolicy ctxChunkPolicy{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED};
+
+    mNumContexts = 1;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler
+        = std::make_shared<MicroBatchScheduler>(ContextChunkingConfig{ctxChunkPolicy, chunkUnitSize}, std::nullopt);
+
+    auto req0 = createRequest(promptLen0, maxNewTokens, 0);
+    req0->setContextChunkSize(promptLen0);
+    req0->setPrepopulatedPromptLen(reusableTokens, tokensPerBlock);
+    req0->setEstimatedReusableTokens(reusableTokens);
+    ASSERT_TRUE(req0->isFirstContextChunk());
+    ASSERT_EQ(req0->getContextCurrentPosition(), reusableTokens);
+
+    auto req1 = createRequest(promptLen1, maxNewTokens, 1);
+
+    RequestVector activeRequests{req0, req1};
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    EXPECT_EQ(ctx.size(), 1u);
+    EXPECT_EQ(ctx.at(0)->mRequestId, 0);
+    EXPECT_EQ(ctx.at(0)->getContextChunkSize(), reusableTokens);
+    EXPECT_EQ(gen.size(), 0);
+}
+
 TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextFCFS_OverBudgetMultiRequest)
 {
     // Regression test for FCFS compute-aware scheduling with multiple requests and reusable tokens.
