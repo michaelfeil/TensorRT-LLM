@@ -58,6 +58,30 @@ def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
     return position_ids[..., :num_tokens]
 
 
+_DRAFT_ATTENTION_EXTRA_ATTR_KEYS = ('attn_layers', 'mla_layers')
+
+
+def _merge_draft_attention_extra_attrs(
+        model_extra_attrs: Dict, draft_extra_attrs: Dict,
+        use_separate_draft_kv_cache: bool) -> None:
+    for key in _DRAFT_ATTENTION_EXTRA_ATTR_KEYS:
+        value = draft_extra_attrs.get(key)
+        if value is None:
+            continue
+
+        if use_separate_draft_kv_cache:
+            model_extra_attrs.setdefault(key, {}).update(value)
+            continue
+
+        if key not in model_extra_attrs:
+            raise ValueError(
+                f"Draft extra_attrs key {key!r} not present on the target. "
+                f"Mixed attention families (e.g. MHA draft on MLA target) "
+                f"require allow_separate_draft_kv_cache=True since they "
+                f"cannot share a single KV cache layout.")
+        model_extra_attrs[key].update(value)
+
+
 class Eagle3Attention(Attention):
 
     def __init__(
@@ -1771,19 +1795,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                 and not is_dflash_one_model)
             if (self.draft_config is not None
                     and (is_eagle3_llama3 or is_dflash_mla)):
-                for key, value in self.draft_config.extra_attrs.items():
-                    assert key in ('attn_layers', 'mla_layers')
-                    if self.use_separate_draft_kv_cache:
-                        model_config.extra_attrs.setdefault(key,
-                                                            {}).update(value)
-                    else:
-                        if key not in model_config.extra_attrs:
-                            raise ValueError(
-                                f"Draft extra_attrs key {key!r} not present on the target. "
-                                f"Mixed attention families (e.g. MHA draft on MLA target) "
-                                 f"require allow_separate_draft_kv_cache=True since they "
-                                 f"cannot share a single KV cache layout.")
-                        model_config.extra_attrs[key].update(value)
+                _merge_draft_attention_extra_attrs(
+                    model_config.extra_attrs, self.draft_config.extra_attrs,
+                    self.use_separate_draft_kv_cache)
 
             # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(
