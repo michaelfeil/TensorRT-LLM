@@ -42,14 +42,21 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
+
+#include "cacheTransceiverTestAccessor.h"
+
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
+#include <map>
 #include <memory>
 #include <random>
+#include <tuple>
+#include <vector>
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
@@ -87,6 +94,64 @@ T serializeDeserialize(T const& val)
     return T::deserialize(iss);
 }
 
+bool hasSingleMpiRank()
+{
+    tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
+    return tensorrt_llm::mpi::MpiComm::world().getSize() == 1;
+}
+
+std::unique_ptr<KVCacheManager> makeTimeoutTestCacheManager()
+{
+    constexpr SizeType32 numLayers{1};
+    constexpr SizeType32 numHeads{1};
+    constexpr SizeType32 sizePerHead{16};
+    constexpr SizeType32 tokensPerBlock{4};
+    constexpr SizeType32 maxBlocksPerSeq{2};
+    constexpr SizeType32 maxBeamWidth{1};
+    constexpr SizeType32 sinkTokenLength{0};
+    constexpr SizeType32 maxNumSequences{1};
+    constexpr SizeType32 blocksInSecondaryPool{0};
+    constexpr bool enableBlockReuse{false};
+    constexpr bool onboardBlocks{true};
+    constexpr bool enablePartialReuse{true};
+    constexpr bool copyOnPartialReuse{true};
+    constexpr bool enableIndexerKCache{false};
+    constexpr nvinfer1::DataType dataType{nvinfer1::DataType::kFLOAT};
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto const maxNumTokens = tokensPerBlock * maxBlocksPerSeq;
+    using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+    auto const blocksPerWindow
+        = BlocksPerWindow{{maxNumTokens, {maxNumSequences * maxBlocksPerSeq, blocksInSecondaryPool}}};
+
+    auto manager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxNumTokens}, std::nullopt, dataType,
+        sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, CacheType::kSELF, std::nullopt, nullptr,
+        enablePartialReuse, copyOnPartialReuse, /*enableTpMlaReplicatedHostOffload=*/false, std::vector<SizeType32>{},
+        /*kvCacheConnectorManager=*/nullptr, enableIndexerKCache);
+    manager->allocatePools(/*useUvm=*/false);
+    return manager;
+}
+
+std::unique_ptr<CacheTransceiver> makeTimeoutTestTransceiver(KVCacheManager* manager, int timeoutMs)
+{
+    auto config = texec::CacheTransceiverConfig{
+        texec::CacheTransceiverConfig::BackendType::MPI, static_cast<size_t>(0), timeoutMs};
+    auto worldConfig = tr::WorldConfig{/*tensorParallelism=*/1, /*pipelineParallelism=*/1, /*contextParallelism=*/1};
+    auto attentionLayerNumPerPP = std::vector<SizeType32>{1};
+    return std::make_unique<CacheTransceiver>(manager, std::vector<SizeType32>{1}, /*sizePerHead=*/16,
+        /*tokensPerBlock=*/4, worldConfig, attentionLayerNumPerPP, nvinfer1::DataType::kFLOAT,
+        texec::kv_cache::CacheState::AttentionType::kDEFAULT, config);
+}
+
+std::shared_ptr<LlmRequest> makeTimeoutTestRequest(LlmRequest::RequestIdType requestId)
+{
+    constexpr SizeType32 promptLength{1};
+    constexpr SizeType32 maxNewTokens{1};
+    texec::Request request{VecTokens(promptLength, promptLength), maxNewTokens};
+    return std::make_shared<LlmRequest>(requestId, std::move(request));
+}
+
 } // namespace
 
 class RequestInfoTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -96,6 +161,47 @@ public:
 
     void TearDown() override {}
 };
+
+TEST(CacheTransceiverTimeoutTest, CheckGenTransferStatusIgnoresUnsetTransferStart)
+{
+    if (!hasSingleMpiRank())
+    {
+        GTEST_SKIP() << "Single-rank MPI is required for constructor-only CacheTransceiver assertions.";
+    }
+
+    auto manager = makeTimeoutTestCacheManager();
+    auto transceiver = makeTimeoutTestTransceiver(manager.get(), /*timeoutMs=*/1);
+    auto request = makeTimeoutTestRequest(/*requestId=*/11);
+    std::promise<void> promise;
+    auto future = promise.get_future();
+
+    CacheTransceiverTestAccessor::addRequesterFuture(*transceiver, request, std::move(future));
+
+    transceiver->checkGenTransferStatus(/*atLeastRequestNum=*/0);
+
+    EXPECT_FALSE(CacheTransceiverTestAccessor::hasTimedOutRequesterId(*transceiver, request->mRequestId));
+}
+
+TEST(CacheTransceiverTimeoutTest, CheckGenTransferStatusRecordsStartedTransferTimeout)
+{
+    if (!hasSingleMpiRank())
+    {
+        GTEST_SKIP() << "Single-rank MPI is required for constructor-only CacheTransceiver assertions.";
+    }
+
+    auto manager = makeTimeoutTestCacheManager();
+    auto transceiver = makeTimeoutTestTransceiver(manager.get(), /*timeoutMs=*/1);
+    auto request = makeTimeoutTestRequest(/*requestId=*/12);
+    request->setKvCacheTransferStart(std::chrono::steady_clock::now() - std::chrono::milliseconds(35));
+    std::promise<void> promise;
+    auto future = promise.get_future();
+
+    CacheTransceiverTestAccessor::addRequesterFuture(*transceiver, request, std::move(future));
+
+    transceiver->checkGenTransferStatus(/*atLeastRequestNum=*/0);
+
+    EXPECT_TRUE(CacheTransceiverTestAccessor::hasTimedOutRequesterId(*transceiver, request->mRequestId));
+}
 
 TEST_F(RequestInfoTest, Basic)
 {

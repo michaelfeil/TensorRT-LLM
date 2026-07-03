@@ -26,6 +26,8 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
+#include "cacheTransceiverTestAccessor.h"
+
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -46,23 +48,6 @@ using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
 using namespace tensorrt_llm::batch_manager;
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 namespace texec = tensorrt_llm::executor;
-
-namespace tensorrt_llm::batch_manager
-{
-class CacheTransceiverTestAccessor
-{
-public:
-    static size_t getKvTransferBufferManagerCount(CacheTransceiver const& transceiver)
-    {
-        return transceiver.mCacheTransBufferManagers.size();
-    }
-
-    static tr::MemoryType getKvTransferBufferManagerMemoryType(CacheTransceiver const& transceiver, size_t index)
-    {
-        return transceiver.mCacheTransBufferManagers.at(index)->getBufferMemoryType();
-    }
-};
-} // namespace tensorrt_llm::batch_manager
 
 namespace
 {

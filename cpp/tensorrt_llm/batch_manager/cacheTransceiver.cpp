@@ -270,6 +270,18 @@ bool drainReadyTransferFuture(std::vector<detail::TransferFuture>& futures, LlmR
     return drainTransferFuture(futures, requestId);
 }
 
+std::optional<long> getKvTransferElapsedMs(
+    LlmRequest::TimePoint const& transferStart, LlmRequest::TimePoint const& now)
+{
+    if (transferStart == LlmRequest::TimePoint{})
+    {
+        return std::nullopt;
+    }
+
+    auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - transferStart);
+    return static_cast<long>(elapsed.count());
+}
+
 size_t drainReadyFailedGenerationTransferFutures(
     std::vector<detail::TransferFuture>& futures, RequestStatuses& requestsStatus,
     std::unordered_set<RequestIdType>& completedRequestIds, std::unordered_set<RequestIdType>& failedRequestIds,
@@ -935,15 +947,15 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(std::optional<int> 
         bool const localReady = localReadyIdSet.find(requestId) != localReadyIdSet.end();
         if (request != nullptr && kvTransferTimeoutMs.has_value())
         {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
-            auto elapsedMs = static_cast<long>(elapsed.count());
-            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(requestId).second)
+            auto const elapsedMs
+                = getKvTransferElapsedMs(request->getKvCacheTransferStart(), LlmRequest::getSteadyClockNow());
+            if (elapsedMs.has_value() && elapsedMs.value() > kvTransferTimeoutMs.value()
+                && mTimedOutSenderIds.insert(requestId).second)
             {
                 TLLM_LOG_WARNING(
                     "Context KV cache transfer for request %ld exceeded configured timeout: "
                     "elapsed %ld ms > limit %d ms (observe-only).",
-                    requestId, elapsedMs, kvTransferTimeoutMs.value());
+                    requestId, elapsedMs.value(), kvTransferTimeoutMs.value());
             }
         }
         if (isSelected)
@@ -1216,15 +1228,15 @@ RequestStatuses CacheTransceiver::checkGenTransferStatus(
         auto request = it->request;
         if (request != nullptr && kvTransferTimeoutMs.has_value())
         {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
-            auto elapsedMs = static_cast<long>(elapsed.count());
-            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(requestId).second)
+            auto const elapsedMs
+                = getKvTransferElapsedMs(request->getKvCacheTransferStart(), LlmRequest::getSteadyClockNow());
+            if (elapsedMs.has_value() && elapsedMs.value() > kvTransferTimeoutMs.value()
+                && mTimedOutRequesterIds.insert(requestId).second)
             {
                 TLLM_LOG_WARNING(
                     "Generation KV cache transfer for request %ld exceeded configured timeout: "
                     "elapsed %ld ms > limit %d ms (observe-only).",
-                    requestId, elapsedMs, kvTransferTimeoutMs.value());
+                    requestId, elapsedMs.value(), kvTransferTimeoutMs.value());
             }
         }
         if (blockAll || toCompleteIdSet.find(requestId) != toCompleteIdSet.end())
