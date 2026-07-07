@@ -280,8 +280,9 @@ public:
         std::vector<LlmRequest::RequestIdType> const& timedOutContextRequestIds = {})
         = 0;
 
-    virtual RequestStatuses checkGenTransferStatus(
-        std::optional<int> const& atLeastRequestNum = std::nullopt, bool collectKvTransferEvents = false)
+    virtual RequestStatuses checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt,
+        bool collectKvTransferEvents = false,
+        std::vector<LlmRequest::RequestIdType> const& timedOutGenerationRequestIds = {})
         = 0;
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
@@ -342,8 +343,9 @@ public:
         bool markComplete = false, bool collectKvTransferEvents = false,
         std::vector<LlmRequest::RequestIdType> const& timedOutContextRequestIds = {}) override;
 
-    RequestStatuses checkGenTransferStatus(
-        std::optional<int> const& atLeastRequestNum = std::nullopt, bool collectKvTransferEvents = false) override;
+    RequestStatuses checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt,
+        bool collectKvTransferEvents = false,
+        std::vector<LlmRequest::RequestIdType> const& timedOutGenerationRequestIds = {}) override;
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
@@ -380,6 +382,10 @@ private:
     std::unordered_set<LlmRequest::RequestIdType> mCompletedRequesterRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedRequesterRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mRequesterRequestsAwaitingConsensus;
+    // Context requests whose timeout-cancel has been initiated; ensures cancel fires once.
+    std::unordered_set<LlmRequest::RequestIdType> mCancelInitiatedIds;
+    // Generation requests whose timeout-cancel has been initiated; ensures cancel fires once.
+    std::unordered_set<LlmRequest::RequestIdType> mGenCancelInitiatedIds;
     KvTransferEventObserver mKvTransferEventObserver;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 

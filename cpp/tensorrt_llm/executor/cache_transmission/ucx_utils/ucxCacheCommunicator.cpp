@@ -564,8 +564,8 @@ void UcxConnectionManager::processPassiveConnectionRequests()
         PassiveConnectionRequest request;
         {
             std::unique_lock lock(mPassiveConnectionRequestsMutex);
-            mPassiveConnectionRequestsCv.wait(lock,
-                [this]() { return mStopPassiveConnectionWorker || !mPassiveConnectionRequests.empty(); });
+            mPassiveConnectionRequestsCv.wait(
+                lock, [this]() { return mStopPassiveConnectionWorker || !mPassiveConnectionRequests.empty(); });
             if (mStopPassiveConnectionWorker)
             {
                 auto pendingRequests = std::move(mPassiveConnectionRequests);
@@ -593,11 +593,11 @@ void UcxConnectionManager::processPassiveConnectionRequests()
             std::shared_ptr<ucxx::Endpoint> newEp;
             {
                 std::scoped_lock lock(mEndpointCreationMutex);
-                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, true);
+                // endpointErrorHandling=false: avoids ucxx's error-path cancelAll double-freeing UCP state.
+                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, false);
             }
-            std::shared_ptr<UcxConnection> connection
-                = std::make_shared<UcxConnection>(
-                    request.connectionId, newEp, this, false, request.requesterConnectionId);
+            std::shared_ptr<UcxConnection> connection = std::make_shared<UcxConnection>(
+                request.connectionId, newEp, this, false, request.requesterConnectionId);
             {
                 std::scoped_lock lock(mConnectionsMutex);
                 mConnections.emplace(request.connectionId, connection);
@@ -641,8 +641,7 @@ void UcxConnectionManager::addConnection(
         {
             {
                 std::scoped_lock lock(mPassiveConnectionRequestsMutex);
-                TLLM_CHECK_WITH_INFO(
-                    !mStopPassiveConnectionWorker, "passive connection worker has already stopped");
+                TLLM_CHECK_WITH_INFO(!mStopPassiveConnectionWorker, "passive connection worker has already stopped");
                 mPassiveConnectionRequests.emplace_back(
                     PassiveConnectionRequest{connectionId, requesterConnectionId, workerAddress, connectionPromise});
             }
@@ -759,7 +758,8 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
                 // TODO: createEndpointFromWorkerAddress does not require this mutex but is blocking; explore
                 // multi-threaded or non-blocking endpoint creation.
                 std::scoped_lock lock(mEndpointCreationMutex);
-                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, true);
+                // endpointErrorHandling=false: see companion call site above (avoids ucxx cancelAll double-free).
+                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, false);
             }
             auto connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true, connectionId);
             TLLM_CHECK(connectionId != 0);

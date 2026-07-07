@@ -53,6 +53,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <numeric>
 #include <unordered_map>
@@ -280,6 +281,72 @@ std::optional<long> getKvTransferElapsedMs(
 
     auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - transferStart);
     return static_cast<long>(elapsed.count());
+}
+
+// Cancel each timed-out transfer once, then report it only after its future drains (KV blocks stay owned until then).
+template <typename CancelFn, typename ReportFn>
+void drainTimedOutTransfers(std::vector<detail::TransferFuture>& futures,
+    std::unordered_set<LlmRequest::RequestIdType> const& timedOut,
+    std::unordered_set<LlmRequest::RequestIdType>& cancelInitiated, CancelFn&& cancel, ReportFn&& report)
+{
+    for (auto it = futures.begin(); it != futures.end();)
+    {
+        auto const requestId = it->requestId;
+        auto request = it->request;
+        if (request == nullptr || timedOut.count(requestId) == 0)
+        {
+            ++it;
+            continue;
+        }
+        if (cancelInitiated.insert(requestId).second)
+        {
+            cancel(*it);
+        }
+        if (it->future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+        {
+            ++it; // cancel still draining; keep the future so its KV blocks stay owned
+            continue;
+        }
+        bool succeeded = true;
+        try
+        {
+            it->future.get();
+        }
+        catch (std::exception const&)
+        {
+            succeeded = false;
+        }
+        report(request, requestId, succeeded);
+        cancelInitiated.erase(requestId);
+        it = futures.erase(it);
+    }
+}
+
+// Drop cancel-tracking ids whose transfer is no longer in flight.
+void pruneCancelTracking(
+    std::unordered_set<LlmRequest::RequestIdType>& cancelInitiated, std::vector<detail::TransferFuture> const& futures)
+{
+    if (cancelInitiated.empty())
+    {
+        return;
+    }
+    std::unordered_set<LlmRequest::RequestIdType> inFlight;
+    inFlight.reserve(futures.size());
+    for (auto const& transferFuture : futures)
+    {
+        inFlight.insert(transferFuture.requestId);
+    }
+    for (auto it = cancelInitiated.begin(); it != cancelInitiated.end();)
+    {
+        if (inFlight.count(*it) > 0)
+        {
+            ++it;
+        }
+        else
+        {
+            it = cancelInitiated.erase(it);
+        }
+    }
 }
 
 size_t drainReadyFailedGenerationTransferFutures(
@@ -1026,6 +1093,40 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(std::optional<int> 
         }
     }
 
+    // Drain timed-out context transfers (cancel-once, report-after-drain; see drainTimedOutTransfers).
+    if (!timedOutContextRequestIds.empty())
+    {
+        std::unordered_set<LlmRequest::RequestIdType> const timedOut(
+            timedOutContextRequestIds.begin(), timedOutContextRequestIds.end());
+        drainTimedOutTransfers(
+            mSenderFutures, timedOut, mCancelInitiatedIds,
+            [this](auto const& tf)
+            {
+                bool const isCancelled = mCacheSender->cancelRequest(*tf.request);
+                if (isCancelled)
+                {
+                    mKvTransferEventObserver.recordContextCancellation(*mCacheSender, tf.requestId);
+                }
+                else
+                {
+                    TLLM_LOG_WARNING("Context transfer cancel_request returned false for timed out request %zu",
+                        tf.requestId);
+                }
+            },
+            [&](std::shared_ptr<LlmRequest> const& request, LlmRequest::RequestIdType requestId, bool succeeded)
+            {
+                bool const failed = !succeeded;
+                if (failed)
+                {
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                }
+                recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
+                    mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                mKvTransferEventObserver.consumeContextEventReport(requestsStatus, *mCacheSender, requestId,
+                    failed ? KvTransferResult::kFailure : KvTransferResult::kSuccess, collectKvTransferEvents);
+            });
+    }
+
     auto const consensusOutcome
         = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
     for (auto const requestId : consensusOutcome.failedRequestIds)
@@ -1058,46 +1159,18 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(std::optional<int> 
             requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
     }
 
-    if (!timedOutContextRequestIds.empty())
-    {
-        std::unordered_set<LlmRequest::RequestIdType> timedOutRequestIdSet(
-            timedOutContextRequestIds.begin(), timedOutContextRequestIds.end());
-        std::vector<std::shared_ptr<LlmRequest>> timedOutRequests;
-        timedOutRequests.reserve(timedOutRequestIdSet.size());
-        for (auto const& transferFuture : mSenderFutures)
-        {
-            if (transferFuture.request != nullptr && timedOutRequestIdSet.erase(transferFuture.requestId) > 0)
-            {
-                timedOutRequests.push_back(transferFuture.request);
-            }
-        }
-
-        for (auto const& request : timedOutRequests)
-        {
-            auto const requestId = request->mRequestId;
-            // Python records timeout KV failure events when it marks requests timed out. Cancel here before
-            // the existing event gather so cancel-time rank attribution can still be flushed this iteration.
-            bool const isCancelled = cancelRequest(request);
-            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-            requestsStatus.errorRequestIds.insert(requestId);
-            if (!isCancelled)
-            {
-                TLLM_LOG_WARNING("Context transfer cancel_request returned false for timed out request %zu", requestId);
-            }
-        }
-    }
-
     if (collectKvTransferEvents)
     {
         mKvTransferEventObserver.flushContextEvents(requestsStatus, *mCacheSender, mSenderFutures);
         mKvTransferEventObserver.gatherIfNeeded(
             requestsStatus, syncComm, mCacheState->getParallelConfig().mEnableAttentionDP);
     }
+    pruneCancelTracking(mCancelInitiatedIds, mSenderFutures);
     return requestsStatus;
 }
 
-RequestStatuses CacheTransceiver::checkGenTransferStatus(
-    std::optional<int> const& atLeastRequestNum, bool collectKvTransferEvents)
+RequestStatuses CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum,
+    bool collectKvTransferEvents, std::vector<LlmRequest::RequestIdType> const& timedOutGenerationRequestIds)
 {
     RequestStatuses requestsStatus{};
     auto const drainedFailedFutureCount = drainReadyFailedGenerationTransferFutures(
@@ -1216,6 +1289,9 @@ RequestStatuses CacheTransceiver::checkGenTransferStatus(
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             effectiveAtLeastRequestNum.value_or(0));
     }
+    std::unordered_set<LlmRequest::RequestIdType> const timedOutRequestIdSet(
+        timedOutGenerationRequestIds.begin(), timedOutGenerationRequestIds.end());
+
     // Observe-only: gen-side mirror of the context-side timeout WARN.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
@@ -1226,6 +1302,7 @@ RequestStatuses CacheTransceiver::checkGenTransferStatus(
     {
         auto const requestId = it->requestId;
         auto request = it->request;
+        bool const isTimedOut = timedOutRequestIdSet.count(requestId) > 0;
         if (request != nullptr && kvTransferTimeoutMs.has_value())
         {
             auto const elapsedMs
@@ -1239,7 +1316,7 @@ RequestStatuses CacheTransceiver::checkGenTransferStatus(
                     requestId, elapsedMs.value(), kvTransferTimeoutMs.value());
             }
         }
-        if (blockAll || toCompleteIdSet.find(requestId) != toCompleteIdSet.end())
+        if (!isTimedOut && (blockAll || toCompleteIdSet.find(requestId) != toCompleteIdSet.end()))
         {
             try
             {
@@ -1289,6 +1366,34 @@ RequestStatuses CacheTransceiver::checkGenTransferStatus(
         }
     }
 
+    // Timed-out generation futures are cancelled once, then reported after the receiver future drains.
+    if (!timedOutRequestIdSet.empty())
+    {
+        drainTimedOutTransfers(
+            mRequesterFutures, timedOutRequestIdSet, mGenCancelInitiatedIds,
+            [this](auto const& tf)
+            {
+                bool const isCancelled = mCacheReceiver->cancelRequest(*tf.request);
+                if (!isCancelled)
+                {
+                    TLLM_LOG_WARNING("Generation transfer cancel_request returned false for timed out request %zu",
+                        tf.requestId);
+                }
+            },
+            [&](std::shared_ptr<LlmRequest> const& request, LlmRequest::RequestIdType requestId, bool succeeded)
+            {
+                bool const failed = !succeeded;
+                if (failed)
+                {
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                }
+                recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
+                    mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+                mKvTransferEventObserver.recordGenerationEvent(requestsStatus, requestId,
+                    failed ? KvTransferResult::kFailure : KvTransferResult::kSuccess, collectKvTransferEvents);
+            });
+    }
+
     auto const consensusOutcome
         = reduceTransferStates(syncComm, mCompletedRequesterRequestIds, mFailedRequesterRequestIds);
     for (auto const requestId : consensusOutcome.failedRequestIds)
@@ -1330,6 +1435,7 @@ RequestStatuses CacheTransceiver::checkGenTransferStatus(
         mKvTransferEventObserver.gatherIfNeeded(
             requestsStatus, syncComm, mCacheState->getParallelConfig().mEnableAttentionDP);
     }
+    pruneCancelTracking(mGenCancelInitiatedIds, mRequesterFutures);
     return requestsStatus;
 }
 

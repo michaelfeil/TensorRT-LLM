@@ -115,6 +115,10 @@ PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
 DISAGG_TRANSFER_BACKPRESSURE_LOG_INTERVAL_SEC = 1.0
 
+# Delay before freeing an errored disagg request's resources so in-flight teardown drains first (env-overridable).
+DISAGG_ERROR_FREE_DELAY_S = float(
+    os.environ.get("TRTLLM_DISAGG_ERROR_FREE_DELAY_S", "1") or "1")
+
 
 def _format_cache_transfer_error(error_msg_prefix: str,
                                  executor_rank: int) -> str:
@@ -715,6 +719,9 @@ class PyExecutor:
             canceled_req_ids=lambda: self.canceled_req_ids,
         )
         self.gather_all_responses = False
+
+        # Errored disaggregated requests whose resource free is deferred until teardown drains.
+        self._deferred_error_frees: List[Tuple[float, LlmRequest]] = []
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -2972,6 +2979,8 @@ class PyExecutor:
             self.kv_cache_manager.prefetch_for_context_tokens(candidates)
 
     def _prepare_and_schedule_batch(self):
+        # Must run every iteration, else deferred requests strand their KV blocks (deadlock under KV exhaustion).
+        self._drain_deferred_error_frees()
         new_requests = self._fetch_and_activate_new_requests_after_transfer_cleanup(
         )
         if self.should_stop_processing:
@@ -4806,22 +4815,11 @@ class PyExecutor:
         if self._is_multi_rank_attention_dp():
             return
 
+        # Only flag/stop the clock here; check_gen_transfer_status owns cancel + drain-gated reporting.
         for request in self.active_requests:
-            if not request.py_kv_transfer_timed_out:
-                continue
-            if request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+            if (request.py_kv_transfer_timed_out and request.state
+                    == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
                 request.py_kv_transfer_start_time = None
-                if is_cancelled:
-                    self._mark_timed_out_gen_transfer_if_locally_drained(
-                        request)
-                if not is_cancelled:
-                    logger.warning(
-                        "Generation transfer cancel_request returned false "
-                        "request_id=%s state=%s",
-                        request.py_request_id,
-                        request.state,
-                    )
 
         return
 
@@ -5524,15 +5522,13 @@ class PyExecutor:
 
             self._end_transfer_and_maybe_terminate(request)
 
+        # Don't free here; check_context_transfer_status reports these back after their send future drains.
         unhandled_timed_out_context_request_ids = (
             timed_out_context_request_id_set - completed_req_ids)
-        for request_id in unhandled_timed_out_context_request_ids:
-            request = requests_in_transfer.get(request_id)
-            if request is None:
-                continue
-            request.py_kv_transfer_start_time = None
-            request.state = LlmRequestState.DISAGG_TRANS_ERROR
-            self._end_transfer_and_maybe_terminate(request)
+        if unhandled_timed_out_context_request_ids:
+            logger.debug(
+                "Waiting for %d timed-out context transfer(s) to drain (post-release) before freeing blocks",
+                len(unhandled_timed_out_context_request_ids))
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
@@ -5552,8 +5548,16 @@ class PyExecutor:
             for request in self.active_requests if request.state ==
             LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         }
+        # Hand timed-out ids to C++ so it cancels once and reports them back after their future drains.
+        timed_out_generation_request_ids = [
+            request.py_request_id for request in self.active_requests
+            if (request.py_kv_transfer_timed_out and request.state ==
+                LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+        ]
         transfer_status = self.kv_cache_transceiver.check_gen_transfer_status(
-            atLeastNum, collect_kv_transfer_events=self.enable_iter_perf_stats)
+            atLeastNum,
+            collect_kv_transfer_events=self.enable_iter_perf_stats,
+            timed_out_generation_request_ids=timed_out_generation_request_ids)
         self._py_executor_observer.record_generation_status_events(
             transfer_status, generation_transfer_request_ids,
             self.active_requests)
@@ -5872,6 +5876,7 @@ class PyExecutor:
             immediate_fatal: Whether to bypass the error budget and force a
                 fatal shutdown.
         """
+        self._drain_deferred_error_frees()
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
 
@@ -5949,7 +5954,8 @@ class PyExecutor:
             ]
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
-            self._terminate_request(request)
+            self._terminate_request(request,
+                                    free_delay_s=DISAGG_ERROR_FREE_DELAY_S)
 
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
@@ -5969,9 +5975,12 @@ class PyExecutor:
         self._enqueue_adp_generation_transfer_error_responses(
             error_response_payloads)
         for request in requests:
-            self._terminate_request(request)
+            self._terminate_request(request,
+                                    free_delay_s=DISAGG_ERROR_FREE_DELAY_S)
 
-    def _terminate_request(self, request: LlmRequest):
+    def _terminate_request(self,
+                           request: LlmRequest,
+                           free_delay_s: float = 0.0):
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
@@ -5980,14 +5989,35 @@ class PyExecutor:
                 and not request.is_dummy_request):
             self._disagg_pp_termination_handler.terminate(request)
         else:
-            self._do_terminate_request(request)
+            self._do_terminate_request(request, free_delay_s=free_delay_s)
 
-    def _do_terminate_request(self, request: LlmRequest):
+    def _do_terminate_request(self,
+                              request: LlmRequest,
+                              free_delay_s: float = 0.0):
+        # Defer the free so in-flight teardown drains first; released on the executor thread (KV state isn't thread-safe).
+        if free_delay_s > 0.0:
+            deadline = time.monotonic() + free_delay_s
+            self._deferred_error_frees.append((deadline, request))
+            return
+        self._release_request_resources(request)
+
+    def _release_request_resources(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
-
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
+
+    def _drain_deferred_error_frees(self):
+        if not self._deferred_error_frees:
+            return
+        now = time.monotonic()
+        still_pending = []
+        for deadline, request in self._deferred_error_frees:
+            if now >= deadline:
+                self._release_request_resources(request)
+            else:
+                still_pending.append((deadline, request))
+        self._deferred_error_frees = still_pending
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""

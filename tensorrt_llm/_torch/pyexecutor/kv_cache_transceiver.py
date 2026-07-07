@@ -134,9 +134,11 @@ class KvCacheTransceiver(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def check_gen_transfer_status(self,
-                                  at_least_request_num: int,
-                                  collect_kv_transfer_events: bool = False):
+    def check_gen_transfer_status(
+            self,
+            at_least_request_num: int,
+            collect_kv_transfer_events: bool = False,
+            timed_out_generation_request_ids: Optional[List[int]] = None):
         raise NotImplementedError
 
     @abstractmethod
@@ -269,12 +271,16 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def take_context_kv_transfer_event_report(self, req: LlmRequest):
         return self.impl.take_context_kv_transfer_event_report(req)
 
-    def check_gen_transfer_status(self,
-                                  at_least_request_num: int,
-                                  collect_kv_transfer_events: bool = False):
+    def check_gen_transfer_status(
+            self,
+            at_least_request_num: int,
+            collect_kv_transfer_events: bool = False,
+            timed_out_generation_request_ids: Optional[List[int]] = None):
         return self.impl.check_gen_transfer_status(
             at_least_request_num,
-            collect_kv_transfer_events=collect_kv_transfer_events)
+            collect_kv_transfer_events=collect_kv_transfer_events,
+            timed_out_generation_request_ids=timed_out_generation_request_ids
+            or [])
 
     def check_gen_transfer_complete(self):
         return self.impl.check_gen_transfer_complete()
