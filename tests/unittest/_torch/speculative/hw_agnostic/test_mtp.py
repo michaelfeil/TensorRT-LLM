@@ -176,7 +176,12 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         assert attn_metadata.indexer_skip_topk is False
         assert attn_metadata.in_mtp_draft_loop is False
 
-    def test_mtp_eagle_lm_head_tp_adp_uses_global_draft_sampler(self):
+    @parameterized.expand([
+        ("greedy", True),
+        ("non_greedy", False),
+    ], name_func=unittest_name_func)
+    def test_mtp_eagle_lm_head_tp_adp_uses_global_draft_sampler(
+            self, _, is_all_greedy_sample):
         sampler_calls = []
         mapping_lm_head_tp = object()
 
@@ -211,6 +216,9 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         worker._draft_sampler_greedy = (
             lambda *args, **kwargs:
             self.fail("ADP LM-head TP must use the global draft sampler"))
+        worker.draft_decoder = (
+            lambda *args, **kwargs:
+            self.fail("ADP LM-head TP must use greedy draft proposals"))
 
         def draft_sampler(logits, mapping_lm_head_tp_arg=None):
             sampler_calls.append((logits.shape, mapping_lm_head_tp_arg))
@@ -234,7 +242,9 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
             runtime_draft_len=1,
             batch_indices_cuda=torch.tensor([0, 1], dtype=torch.int64),
             max_num_requests=4,
-            is_all_greedy_sample=True,
+            is_all_greedy_sample=is_all_greedy_sample,
+            use_rejection_sampling=True,
+            draft_probs_valid=True,
         )
         draft_model = SimpleNamespace(
             mtp_layers=[FakeMtpLayer()],
@@ -265,6 +275,8 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         torch.testing.assert_close(next_draft_tokens,
                                    torch.tensor([[101], [102]],
                                                 dtype=torch.long))
+        assert spec_metadata.draft_probs_valid is False
+        assert worker._can_use_rejection_sampling(spec_metadata) is False
 
     def load_sample_and_accept_draft_tokens_test_cases():
         test_cases = []
