@@ -5327,6 +5327,12 @@ class PyExecutor:
             request.state = LlmRequestState.GENERATION_COMPLETE
             response = request.create_response(False, getattr(dist, "rank", 0))
             if response is not None:
+                # Canceled ADP transfer-error responses are gathered across TP
+                # ranks. Keep the serialized runtime result, which carries
+                # token ids and FinishReason.CANCELLED, but drop Python-only
+                # side payloads that may contain device tensors or
+                # shared-memory handles.
+                response.clear_python_payloads()
                 canceled_responses.append((request.py_request_id, response))
 
         self.active_requests = [

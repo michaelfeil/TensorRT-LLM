@@ -434,6 +434,19 @@ class PyResult:
     def reset_diff(self):
         self.diff = PyResult.Diff()
 
+    def clear_python_payloads(self):
+        self._context_logits = None
+        self._generation_logits = None
+        self._log_probs = None
+        self._first_gen_log_probs = None
+        self._mm_embeddings = None
+        self._mrope_position_ids = None
+        self._mrope_position_deltas = None
+        self._additional_context_outputs = None
+        self._additional_generation_outputs = None
+        self._encoder_output = None
+        self.reset_diff()
+
     def get_diff(self) -> Diff:
         for i, context_logits in enumerate(self.diff.context_logits_list):
             self.diff.context_logits_list[i] = context_logits.to("cpu")
@@ -758,6 +771,11 @@ class LlmResponse:
             py_result = self.result._py_result
             if hasattr(py_result, '_context_logits'):
                 py_result._context_logits = None
+
+    def clear_python_payloads(self):
+        """Clear Python-only result payloads from the response result."""
+        if self.result and hasattr(self.result, '_py_result'):
+            self.result._py_result.clear_python_payloads()
 
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
