@@ -587,6 +587,7 @@ class BaseLLM:
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        external_request_id: Optional[str] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -604,7 +605,7 @@ class BaseLLM:
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
-
+            external_request_id (str, optional): A client-facing request identifier (e.g. an OpenAI ``chatcmpl-*`` id assigned by a frontend). It is recorded on the per-request tracer so pod logs join this external id to the engine-internal trace_id and request_id. Defaults to None.
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
@@ -675,6 +676,7 @@ class BaseLLM:
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
+            external_request_id=external_request_id,
         )
 
         if sampling_params.return_perf_metrics:

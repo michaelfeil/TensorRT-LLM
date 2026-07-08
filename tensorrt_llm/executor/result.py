@@ -45,6 +45,21 @@ _EMIT_PHASE_SPANS = os.environ.get("TRTLLM_REQUEST_TRACE_SPANS",
                                    "0").strip().lower() in ("1", "true", "yes",
                                                             "on")
 
+# Cap on a client-supplied id stamped into trace logs, to bound log-line width.
+_MAX_EXTERNAL_REQUEST_ID_LEN = 128
+
+
+def _sanitize_trace_attr_value(value: str) -> str:
+    """Make a client-supplied string safe to stamp as a `key=value` trace attr.
+
+    The request tracer joins attributes with naive `f"{k}={v}"` separated by
+    spaces, so a value containing whitespace (notably newlines) could forge
+    extra tokens (e.g. a fake `event=`) into a log line. Collapse all
+    whitespace to a single `_` and cap the length.
+    """
+    return "_".join(str(value).split())[:_MAX_EXTERNAL_REQUEST_ID_LEN]
+
+
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
     from .postproc_worker import PostprocParams, PostprocWorker
@@ -210,6 +225,10 @@ class GenerationResultBase:
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
         self.trace_headers: Optional[dict[str, str]] = None
+        # Client-facing correlation id (e.g. an OpenAI ``chatcmpl-*`` id); set
+        # from the GenerationRequest and stamped on the request tracer so the
+        # external id joins the engine-internal trace_id/request_id in the logs.
+        self.external_request_id: Optional[str] = None
         # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
         self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
 
@@ -818,10 +837,16 @@ class GenerationResultBase:
             return tracer
         propagated_trace_id = tracing.trace_id_from_context(
             tracing.extract_trace_context(self.trace_headers))
-        return create_request_tracer(
-            self.id,
-            trace_id=propagated_trace_id,
-            attributes={"disagg_role": self._disagg_role()})
+        # Attributes are prefixed onto every trace log line (notably the
+        # always-INFO ``request_created`` line), so recording the client-facing
+        # external_request_id here joins it to trace_id + request_id in one line.
+        attributes = {"disagg_role": self._disagg_role()}
+        if self.external_request_id is not None:
+            attributes["external_request_id"] = _sanitize_trace_attr_value(
+                self.external_request_id)
+        return create_request_tracer(self.id,
+                                     trace_id=propagated_trace_id,
+                                     attributes=attributes)
 
     def _trace_request_error(self, error: Any) -> None:
         """Dump the per-request trace when a request fails.
@@ -1154,6 +1179,7 @@ class GenerationResult(GenerationResultBase):
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers
+        self.external_request_id = generation_request.external_request_id
 
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[

@@ -102,6 +102,21 @@ def test_request_created_always_logs_at_info(caplog):
     assert created_records[0].levelno == logging.INFO
 
 
+def test_request_created_line_bridges_external_id(caplog):
+    # The whole point of stamping a client-facing id (e.g. an OpenAI
+    # `chatcmpl-*`) as a tracer attribute: the always-INFO `request_created`
+    # line then carries external id + trace_id + request_id together, so a
+    # single grep on the external id recovers the engine-internal trace_id.
+    with caplog.at_level(logging.INFO, logger="tensorrt_llm"):
+        tracer = create_request_tracer(120937, attributes={"external_request_id": "chatcmpl-9db23"})
+    created = [r.getMessage() for r in caplog.records if "event=request_created" in r.getMessage()]
+    assert len(created) == 1, [r.getMessage() for r in caplog.records]
+    line = created[0]
+    assert "external_request_id=chatcmpl-9db23" in line
+    assert f"trace_id={tracer.trace_id}" in line
+    assert "request_id=120937" in line
+
+
 def test_non_created_events_default_to_debug(caplog):
     # Counterpart to the test above: subsequent transitions must remain at
     # DEBUG when TRTLLM_REQUEST_TRACE_LOG_LEVEL is unset, otherwise we flood

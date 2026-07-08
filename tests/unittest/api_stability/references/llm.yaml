@@ -342,6 +342,10 @@ methods:
         annotation: float
         default: 0.5
         status: prototype
+      external_request_id:
+        annotation: Optional[str]
+        default: null
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   encode:
     parameters:

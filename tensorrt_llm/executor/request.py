@@ -112,6 +112,7 @@ class GenerationRequest:
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        external_request_id: Optional[str] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -137,6 +138,11 @@ class GenerationRequest:
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
         self.trace_headers = trace_headers
+        # Client-facing correlation id (e.g. an OpenAI ``chatcmpl-*`` id from a
+        # frontend). Distinct from the engine-internal integer ``id``/client_id;
+        # surfaced on the request tracer so pod logs join the external id to the
+        # per-request trace_id. Optional; ``None`` when the caller supplies none.
+        self.external_request_id = external_request_id
         self.scheduling_params = scheduling_params
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
