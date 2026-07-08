@@ -1,0 +1,58 @@
+--- a/csrc/jit/handle.hpp
++++ b/csrc/jit/handle.hpp
+@@ -4,6 +4,8 @@
+ #include <cuda_runtime.h>
+ #include <dlfcn.h>
+ #include <filesystem>
++#include <mutex>
++#include <unordered_map>
+ 
+ #include "../utils/exception.hpp"
+ #include "../utils/compatibility.hpp"
+@@ -75,8 +77,17 @@
+ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
+                                                   const cudaStream_t& stream, const int& smem_size,
+                                                   const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl) {
+-    if (smem_size > 0)
+-        DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    if (smem_size > 0) {
++        // Set once per kernel; see the driver API twin below for rationale.
++        static std::unordered_map<const void*, int> applied_smem_sizes;
++        static std::mutex applied_smem_mutex;
++        const std::lock_guard<std::mutex> lock(applied_smem_mutex);
++        const auto& it = applied_smem_sizes.find(reinterpret_cast<const void*>(kernel));
++        if (it == applied_smem_sizes.end() or it->second != smem_size) {
++            DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++            applied_smem_sizes[reinterpret_cast<const void*>(kernel)] = smem_size;
++        }
++    }
+ 
+     LaunchConfigHandle config;
+     config.gridDim = grid_dim;
+@@ -174,8 +185,24 @@
+ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
+                                                  const cudaStream_t& stream, const int& smem_size,
+                                                  const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl) {
+-    if (smem_size > 0)
+-        DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
++    if (smem_size > 0) {
++        // The max dynamic smem attribute is constant per kernel handle, and
++        // every cuFuncSetAttribute takes the driver's function-state lock in
++        // write mode. Any long read hold (CUPTI collection, allocator VMM
++        // ops in flight) turns this hot-path writer into a whole-context
++        // stall, so set the attribute once per kernel instead of on every
++        // launch. Assumes kernel handles live for the process lifetime
++        // (they are cached by the kernel runtimes and only unloaded at
++        // shutdown).
++        static std::unordered_map<const void*, int> applied_smem_sizes;
++        static std::mutex applied_smem_mutex;
++        const std::lock_guard<std::mutex> lock(applied_smem_mutex);
++        const auto& it = applied_smem_sizes.find(reinterpret_cast<const void*>(kernel));
++        if (it == applied_smem_sizes.end() or it->second != smem_size) {
++            DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
++            applied_smem_sizes[reinterpret_cast<const void*>(kernel)] = smem_size;
++        }
++    }
+ 
+     LaunchConfigHandle config;
+     config.gridDimX = grid_dim.x;
