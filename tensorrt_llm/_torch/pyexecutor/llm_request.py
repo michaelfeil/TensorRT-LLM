@@ -250,12 +250,10 @@ class LogProbStorage:
         return self._log_probs_data
 
     @log_probs.setter
-    def log_probs(self, value: list[TokenLogprobs]
-                  | list[SimpleTokenLogprobs]):
+    def log_probs(self, value: list[TokenLogprobs] | list[SimpleTokenLogprobs]):
         if _is_simple_log_probs(value):
             self._simple_mode = True
-            self._simple_log_probs_data = cast(list[SimpleTokenLogprobs],
-                                               value)
+            self._simple_log_probs_data = cast(list[SimpleTokenLogprobs], value)
             self._log_probs_data = [[] for _ in range(len(value))]
         else:
             self._simple_mode = False
@@ -325,8 +323,7 @@ class LogProbStorage:
         assert not self._simple_mode, "Cannot mix top-k and simple logprob storage"
         assert len(new_probs) == self.beam_width, "Beam width mismatch"
         for beam_idx, probs in enumerate(new_probs):
-            self._log_probs_data[beam_idx].extend(
-                cast(TokenLogprobs, probs))
+            self._log_probs_data[beam_idx].extend(cast(TokenLogprobs, probs))
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             elif probs:
@@ -515,10 +512,9 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
             self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
-    def append_log_probs_simple(
-            self,
-            log_probs: list[SimpleTokenLogprobs],
-            cum_log_probs: Optional[list[float]] = None):
+    def append_log_probs_simple(self,
+                                log_probs: list[SimpleTokenLogprobs],
+                                cum_log_probs: Optional[list[float]] = None):
         """Append simple logprobs without populating the generic PP diff."""
         if self._log_probs:
             self._log_probs.append_simple(log_probs, cum_log_probs)
@@ -707,9 +703,8 @@ class PyResult:
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs',
-         'simple_log_probs', 'cum_log_probs', 'first_gen_log_probs',
-         'mm_embedding_handles',
+        ('context_logits', 'generation_logits', 'log_probs', 'simple_log_probs',
+         'cum_log_probs', 'first_gen_log_probs', 'mm_embedding_handles',
          'additional_context_outputs', 'additional_generation_outputs',
          'encoder_output', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
@@ -947,6 +942,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
+        # Deferred from scheduling while its guided-decoding grammar compiles
+        # (see GuidedDecodingCoordinator).
+        self.py_guided_compile_pending = False
 
         self.py_num_connector_matched_tokens = 0
         self._initialize_dynamic_temperature_state()
@@ -1093,8 +1091,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         spec_decode_stats = None
         if self.py_total_spec_decode_num_draft_tokens > 0:
             spec_decode_stats = {
-                "num_draft_tokens": self.py_total_spec_decode_num_draft_tokens,
-                "num_accepted_tokens": self.py_total_spec_decode_num_accepted_tokens,
+                "num_draft_tokens":
+                self.py_total_spec_decode_num_draft_tokens,
+                "num_accepted_tokens":
+                self.py_total_spec_decode_num_accepted_tokens,
             }
 
         return LlmResponse(

@@ -1,4 +1,6 @@
 import math
+import traceback
+from collections import deque
 from dataclasses import dataclass
 from queue import Queue
 from typing import Iterable, List, Optional, Tuple
@@ -12,6 +14,7 @@ from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
 from ..hostfunc import hostfunc
+from .grammar_compiler import AsyncGrammarCompiler, format_guided_error
 from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
                               XGrammarMatcherFactory)
 from .llm_request import LlmRequest
@@ -140,6 +143,9 @@ class GuidedRequests:
 class GuidedDecoder:
     bitmask_dtype = torch.int32
     token_mask_dtype = torch.int32
+    # Whether matcher attach may compile synchronously when no precompiled
+    # grammar exists; must be False when attach runs in CUDA host callbacks.
+    _allow_sync_compile = True
 
     def __init__(self,
                  guided_decoding_config: GuidedDecodingConfig,
@@ -200,9 +206,60 @@ class GuidedDecoder:
 
         self.requests: Optional[GuidedRequests] = None
 
+        # Compilation is kicked off at request activation so it overlaps
+        # prefill / KV transfer instead of blocking the forward path.
+        self.grammar_compiler = AsyncGrammarCompiler(
+            self.grammar_matcher_factory,
+            allow_sync_fallback=self._allow_sync_compile)
+        # request_id that installed the matcher at each slot; makes matcher
+        # attach idempotent under CUDA-graph warmup/replay re-execution.
+        self._matcher_owner: List[Optional[int]] = [None
+                                                    ] * self.max_num_sequences
+        # (request_id | None, error_msg) records produced on CUDA-callback
+        # threads and drained by the executor thread; request_id None means
+        # the failure could not be attributed to a single request.
+        self._async_failures: deque = deque()
+
         self.stream = torch.cuda.Stream()
         self.token_event = torch.cuda.Event()
         self.bitmask_event = torch.cuda.Event()
+
+    def drain_async_failures(
+        self,
+        allowed_req_ids: Optional[set] = None,
+        active_req_ids: Optional[set] = None
+    ) -> List[Tuple[Optional[int], str]]:
+        """Pop failure records produced on CUDA-callback threads.
+
+        Callback completion timing is rank-dependent, so callers restrict
+        draining to `allowed_req_ids` (the just-synchronized batch) to keep
+        the drained set rank-consistent: a record outside that batch is
+        requeued if its request is still in `active_req_ids` (its batch has
+        not synchronized yet) and dropped otherwise (request already gone).
+        None-keyed records are batch-wide and always returned.
+        """
+        failures = []
+        requeue = []
+        # The executor thread is the only consumer; callback threads only
+        # append, so this drains at least everything enqueued so far.
+        while self._async_failures:
+            record = self._async_failures.popleft()
+            req_id = record[0]
+            if allowed_req_ids is None or req_id is None or req_id in allowed_req_ids:
+                failures.append(record)
+            elif active_req_ids is not None and req_id in active_req_ids:
+                requeue.append(record)
+            # else: request already terminated; drop the record.
+        self._async_failures.extend(requeue)
+        return failures
+
+    def has_async_failures(self) -> bool:
+        return bool(self._async_failures)
+
+    def _record_async_failure(self, request_id: Optional[int],
+                              error_msg: str) -> None:
+        # Thread-safe and non-blocking; may run on a CUDA-callback thread.
+        self._async_failures.append((request_id, error_msg))
 
     @property
     def bitmask_size(self) -> int:
@@ -231,9 +288,18 @@ class GuidedDecoder:
                     continue
 
                 if matcher_init:
-                    matcher = self.grammar_matcher_factory.create(
-                        req.guided_decoding_params)
+                    matcher, error_msg = self.grammar_compiler.take(
+                        req.request_id, req.guided_decoding_params)
+                    # Claim the slot even on failure so a later matcher_advance
+                    # sees None, not a previous occupant's matcher.
                     self.grammar_matchers[slot] = matcher
+                    self._matcher_owner[slot] = req.request_id
+                    if matcher is None:
+                        failed_requests.append((req.request_id, error_msg))
+                        logger.error(
+                            f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}"
+                        )
+                        continue
 
                 if matcher_advance:
                     matcher = self.grammar_matchers[slot]
@@ -284,7 +350,7 @@ class GuidedDecoder:
                         slot] += self.num_advanced_tokens[slot]
 
             except Exception as e:
-                error_msg = f"Guided decoding error: {str(e)}"
+                error_msg = format_guided_error(e)
                 failed_requests.append((req.request_id, error_msg))
                 logger.error(
                     f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}"
@@ -394,16 +460,24 @@ class GuidedDecoder:
             slot = req.seq_slot
             if self.num_advanced_tokens[slot] <= 0:
                 continue
-            num_accepted_tokens = 1 + req.num_accepted_draft_tokens
-            # Rollback the grammar matcher to the last accepted token.
-            num_rollback_tokens = self.num_advanced_tokens[
-                slot] - num_accepted_tokens
-            # TODO: Make this an error response.
-            if num_rollback_tokens < 0:
-                raise ValueError(
-                    f"Failed to rollback: num_advanced_tokens={self.num_advanced_tokens[slot]}, num_accepted_tokens={num_accepted_tokens}, num_rollback_tokens={num_rollback_tokens}"
-                )
-            self.grammar_matchers[slot].rollback(num_rollback_tokens)
+            try:
+                matcher = self.grammar_matchers[slot]
+                if matcher is None:
+                    # Matcher creation failed; request is being terminated.
+                    continue
+                num_accepted_tokens = 1 + req.num_accepted_draft_tokens
+                # Rollback the grammar matcher to the last accepted token.
+                num_rollback_tokens = self.num_advanced_tokens[
+                    slot] - num_accepted_tokens
+                if num_rollback_tokens < 0:
+                    raise ValueError(
+                        f"Failed to rollback: num_advanced_tokens={self.num_advanced_tokens[slot]}, num_accepted_tokens={num_accepted_tokens}, num_rollback_tokens={num_rollback_tokens}"
+                    )
+                matcher.rollback(num_rollback_tokens)
+            except Exception as e:
+                # May run on a CUDA-callback thread: record, never raise.
+                self._record_async_failure(req.request_id,
+                                           format_guided_error(e))
 
     def _rollback_draft_tokens(self, requests: GuidedRequests) -> None:
         """Rollback the grammar matcher for draft tokens.
@@ -417,12 +491,19 @@ class GuidedDecoder:
 
         for req in requests.valid_requests():
             slot = req.seq_slot
-            if self.num_advanced_draft_tokens[slot] > 0:
-                self.grammar_matchers[slot].rollback(
-                    self.num_advanced_draft_tokens[slot])
-            # Reset the drafting states.
-            self.num_advanced_draft_tokens[slot] = 0
-            self.is_draft_terminated[slot] = False
+            try:
+                matcher = self.grammar_matchers[slot]
+                if self.num_advanced_draft_tokens[
+                        slot] > 0 and matcher is not None:
+                    matcher.rollback(self.num_advanced_draft_tokens[slot])
+            except Exception as e:
+                # May run on a CUDA-callback thread: record, never raise.
+                self._record_async_failure(req.request_id,
+                                           format_guided_error(e))
+            finally:
+                # Reset the drafting states.
+                self.num_advanced_draft_tokens[slot] = 0
+                self.is_draft_terminated[slot] = False
 
     @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
     def rollback_rejected_tokens(self) -> None:
@@ -433,20 +514,54 @@ class GuidedDecoder:
         self._rollback_draft_tokens(self.requests)
 
     def _init_disagg_gen_requests(self, requests: GuidedRequests) -> None:
-        """Initialize the grammar matchers for disagg gen requests.
+        """Attach precompiled grammar matchers for disagg gen requests.
+
+        Attach-only by design: this may run inside a CUDA host callback, so
+        it must never run an unbounded grammar compile nor raise.
         """
         for req in requests.valid_requests():
-            if req.is_generation_only_first_iteration:
-                self.grammar_matchers[
-                    req.seq_slot] = self.grammar_matcher_factory.create(
-                        req.guided_decoding_params)
+            if not req.is_generation_only_first_iteration:
+                continue
+            slot = req.seq_slot
+            if self._matcher_owner[slot] == req.request_id:
+                # CUDA-graph warmup/replay re-executes this callback for the
+                # same batch; the attach (or its failure) already happened.
+                continue
+            matcher, error_msg = self.grammar_compiler.take(
+                req.request_id, req.guided_decoding_params)
+            self.grammar_matchers[slot] = matcher
+            self._matcher_owner[slot] = req.request_id
+            if matcher is None:
+                self._record_async_failure(req.request_id, error_msg)
 
     @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
     def init_disagg_gen_requests(self) -> None:
         self._init_disagg_gen_requests(self.requests)
 
 
+def _on_hostfunc_error(e: BaseException, fn, args, kwargs) -> None:
+    """hostfunc on_error hook: record the failure on the decoder instance.
+
+    An unobserved exception in a CUDA host callback leaves the captured graph
+    node in an undefined state, which manifests as a silent engine hang (peer
+    ranks block in collectives)."""
+    args[0]._record_hostfunc_error(fn.__name__, e)
+
+
 class CapturableGuidedDecoder(GuidedDecoder):
+    # Matcher attach runs inside CUDA host callbacks here, where a synchronous
+    # compile could stall the rank; requests are gated on compile completion
+    # before being scheduled instead (see GuidedDecodingCoordinator).
+    _allow_sync_compile = False
+
+    def _record_hostfunc_error(self, fn_name: str, e: BaseException) -> None:
+        # request_id None fails every guided request of the batch. The message
+        # reaches client responses, so the traceback stays log-only.
+        logger.error(f"Guided decoding internal error in {fn_name}: {str(e)}\n"
+                     f"{''.join(traceback.format_exception(e))}")
+        self._record_async_failure(
+            None,
+            f"Guided decoding error: internal error in {fn_name}: {str(e)}")
 
     def __init__(self,
                  guided_decoding_config: GuidedDecodingConfig,
@@ -496,7 +611,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # self.token_event.record() should be called inside CUDA graph capturing;
         # currently, it is in PyTorchModelEngine._preprocess_inputs.
 
-    @hostfunc
+    @hostfunc(on_error=_on_hostfunc_error)
     def fetch_batch(self) -> None:
         # CUDA graph warmup calls model forward for multiple times for one prepared inputs
         if self.queue.empty():
@@ -512,35 +627,37 @@ class CapturableGuidedDecoder(GuidedDecoder):
                                                                seq_slot].tolist(
                                                                )
 
-    @hostfunc
-    def build(self) -> List[Tuple[int, str]]:
-        return self._build(self.requests_hostfunc)
+    @hostfunc(on_error=_on_hostfunc_error)
+    def build(self) -> None:
+        # A hostfunc cannot return results (its return value is a graph-node
+        # handle), so per-request failures surface via the async failure
+        # records instead.
+        for failure in self._build(self.requests_hostfunc):
+            self._record_async_failure(*failure)
 
     def execute(self,
                 logits: torch.Tensor,
-                d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
+                d2t: Optional[torch.Tensor] = None) -> None:
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_batch()
             self.init_disagg_gen_requests()
-            failed_requests = self.build()
+            self.build()
             self.copy_bitmask()
             self.bitmask_event.record()
 
         torch.cuda.current_stream().wait_event(self.bitmask_event)
         self.apply_bitmask(logits, d2t=d2t)
 
-        return failed_requests
-
-    @hostfunc
+    @hostfunc(on_error=_on_hostfunc_error)
     def rollback_rejected_tokens(self) -> None:
         self._rollback_rejected_tokens(self.requests_hostfunc)
 
-    @hostfunc
+    @hostfunc(on_error=_on_hostfunc_error)
     def rollback_draft_tokens(self) -> None:
         self._rollback_draft_tokens(self.requests_hostfunc)
 
-    @hostfunc
+    @hostfunc(on_error=_on_hostfunc_error)
     def init_disagg_gen_requests(self) -> None:
         self._init_disagg_gen_requests(self.requests_hostfunc)
 
@@ -558,7 +675,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
                                                         non_blocking=True)
         self.token_event.record()
 
-    @hostfunc
+    @hostfunc(on_error=_on_hostfunc_error)
     def fetch_draft_batch(self, draft_step: int = 0) -> None:
         batch_size = len(self.requests_hostfunc)
         new_tokens_list = self.new_tokens[0, :batch_size].tolist()
@@ -587,13 +704,13 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def execute_draft_batch(self,
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
-                            draft_step: int = 0) -> List[Tuple[int, str]]:
+                            draft_step: int = 0) -> None:
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_draft_batch(draft_step=draft_step)
             if draft_step == 0:
                 self.rollback_rejected_tokens()
-            failed_requests = self.build()
+            self.build()
             if draft_step == self.max_num_draft_tokens - 1:
                 self.rollback_draft_tokens()
             # Overwrite num_bitmask_tokens since the request might not be updated on CUDA stream yet.
@@ -605,5 +722,3 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self.apply_bitmask(logits,
                            d2t=d2t,
                            num_bitmask_tokens=len(self.requests))
-
-        return failed_requests

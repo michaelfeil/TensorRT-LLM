@@ -85,6 +85,8 @@ from .scheduler import ScheduledRequests
 
 
 class ModelEngine(ABC):
+    # Set via PyTorchModelEngine.set_guided_decoder for one-model spec decoding.
+    guided_decoder: Optional[CapturableGuidedDecoder] = None
 
     @abstractmethod
     def get_max_num_sequences(self) -> int:
@@ -222,12 +224,11 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
     return result
 
 
-def _get_cuda_graph_warmup_seq_lens(
-        sparse_config: Optional[object],
-        effective_max_seq_len: int,
-        max_draft_len: int,
-        kv_reserve_draft_tokens: int,
-        num_extra_decoding_steps: int) -> list[int]:
+def _get_cuda_graph_warmup_seq_lens(sparse_config: Optional[object],
+                                    effective_max_seq_len: int,
+                                    max_draft_len: int,
+                                    kv_reserve_draft_tokens: int,
+                                    num_extra_decoding_steps: int) -> list[int]:
     """Return generation warmup sequence lengths needed for CUDA graph capture.
 
     Seq-length-aware sparse attention only keys CUDA graphs on the short/long
@@ -252,8 +253,7 @@ def _get_cuda_graph_warmup_seq_lens(
     # the smallest caller-visible max_seq_len that guarantees a long-mode graph
     # key.
     min_long_max_seq_len = seq_len_threshold + 2 + max(
-        0,
-        kv_reserve_draft_tokens + num_extra_decoding_steps - max_draft_len)
+        0, kv_reserve_draft_tokens + num_extra_decoding_steps - max_draft_len)
 
     if min_long_max_seq_len <= effective_max_seq_len:
         return [min_long_max_seq_len, short_max_seq_len]

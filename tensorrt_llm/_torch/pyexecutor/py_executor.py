@@ -62,6 +62,7 @@ from .dwdp import DwdpManager
 from .error_classification import ErrorBudget, TokenBudgetExceededError
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
+from .guided_decoding_coordinator import GuidedDecodingCoordinator
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
@@ -70,8 +71,7 @@ from .kv_cache_transceiver import BindKvCacheTransceiver, KvCacheTransceiver
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length,
-                          get_spec_decode_token_counts)
+                          get_draft_token_length)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -412,6 +412,10 @@ class PyExecutor:
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
         self.guided_decoder = guided_decoder
+        # With one-model spec decoding the guided decoder lives on the engine.
+        self.guided_coordinator = GuidedDecodingCoordinator(
+            guided_decoder or model_engine.guided_decoder, dist,
+            self.enable_attention_dp)
         self.kv_cache_transceiver = kv_cache_transceiver
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
@@ -1079,6 +1083,7 @@ class PyExecutor:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
         self.worker_started = False
+        self.guided_coordinator.shutdown()
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
@@ -2334,8 +2339,8 @@ class PyExecutor:
 
         return previewed_states
 
-    def _clear_schedulable_reuse_summaries(
-            self, requests: List[LlmRequest]) -> None:
+    def _clear_schedulable_reuse_summaries(self,
+                                           requests: List[LlmRequest]) -> None:
         for request in requests:
             request.py_schedulable_reuse_summary = None
 
@@ -2801,7 +2806,9 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
-                self._update_requests(executed_batch.sample_state)
+                self._update_requests(
+                    executed_batch.sample_state,
+                    scheduled_batch=executed_batch.scheduled_requests)
 
                 scheduled_requests = executed_batch.scheduled_requests
                 sample_state_scheduled_requests = executed_batch.scheduled_requests
@@ -3467,7 +3474,8 @@ class PyExecutor:
                                 scheduled_batch, spec_metadata)
 
                     self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state, self.resource_manager)
+                    self._update_requests(sample_state, self.resource_manager,
+                                          scheduled_batch)
 
                     attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                             None)
@@ -3630,7 +3638,9 @@ class PyExecutor:
         """
         if self.previous_batch is None:
             return
-        self._update_requests(self.previous_batch.sample_state)
+        self._update_requests(
+            self.previous_batch.sample_state,
+            scheduled_batch=self.previous_batch.scheduled_requests)
         self._send_kv_async(
             self.previous_batch.scheduled_requests.all_requests())
         self._flush_pending_transfer_responses()
@@ -3858,7 +3868,9 @@ class PyExecutor:
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
-                    self._update_requests(self.previous_batch.sample_state)
+                    self._update_requests(
+                        self.previous_batch.sample_state,
+                        scheduled_batch=self.previous_batch.scheduled_requests)
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
@@ -4131,6 +4143,16 @@ class PyExecutor:
         # Calculate timeout
         idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
         if idle:
+            # Blocking would strand buffered responses until the next request
+            # arrives; the buffer is rank-local under attention DP, so ranks
+            # must agree before blocking.
+            has_pending_responses = bool(self._pending_transfer_responses)
+            if self.enable_attention_dp and self.dist.tp_size > 1:
+                has_pending_responses = bool(
+                    self.dist.tp_allreduce(int(has_pending_responses),
+                                           op=ReduceOp.MAX))
+            idle = not has_pending_responses
+        if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
             timeout = datetime.timedelta(
@@ -4353,6 +4375,8 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
+        self.guided_coordinator.start_compiles(validated_requests)
+
         self.active_requests.extend(validated_requests)
         return validated_requests
 
@@ -4518,6 +4542,19 @@ class PyExecutor:
             self._clear_schedulable_reuse_summaries(self.active_requests)
 
         num_fitting = scheduler_output.num_fitting_requests
+
+        scheduled_context_requests, generation_requests = \
+            self.guided_coordinator.filter_schedulable(
+                scheduled_context_requests,
+                scheduler_output.generation_requests)
+        if self._is_kv_manager_v2 and len(generation_requests) < len(
+                scheduler_output.generation_requests):
+            # Deferred requests must not hold KV grown during scheduling.
+            kept_gen = {r.py_request_id for r in generation_requests}
+            for req in scheduler_output.generation_requests:
+                if req.py_request_id not in kept_gen:
+                    self.kv_cache_manager.revert_allocate_generation(req)
+
         #TODO(TRTLLM-12359): remove the WAR when PythonMambaCacheManager is deprecated.
         if isinstance(
                 self.kv_cache_manager,
@@ -4543,7 +4580,7 @@ class PyExecutor:
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = scheduler_output.encoder_requests
         scheduled_requests.reset_context_requests(scheduled_context_requests)
-        scheduled_requests.generation_requests = scheduler_output.generation_requests
+        scheduled_requests.generation_requests = generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
@@ -4893,18 +4930,25 @@ class PyExecutor:
         excluded because they cannot participate in the forward pass
         until transfer completes.
 
+        Requests deferred on a guided-decoding grammar compile are also
+        excluded, so a rank whose only request is deferred pads a dummy
+        batch instead of stalling the attention-DP group.
+
         Returns:
             The number of active requests eligible for scheduling.
         """
         if self.kv_cache_transceiver is None:
-            return len(self.active_requests)
+            if self.guided_coordinator.decoder is None:
+                return len(self.active_requests)
+            return sum(1 for req in self.active_requests
+                       if not req.py_guided_compile_pending)
 
         def _is_awaiting_kv_transfer(req) -> bool:
             return (req.is_disagg_generation_init_state
                     or req.is_disagg_generation_transmission_in_progress)
 
-        return sum(1 for req in self.active_requests
-                   if not _is_awaiting_kv_transfer(req))
+        return sum(1 for req in self.active_requests if not (
+            _is_awaiting_kv_transfer(req) or req.py_guided_compile_pending))
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
@@ -5811,7 +5855,8 @@ class PyExecutor:
     @nvtx_range("_update_requests")
     def _update_requests(self,
                          sample_state: SampleState,
-                         resource_manager: Optional[ResourceManager] = None):
+                         resource_manager: Optional[ResourceManager] = None,
+                         scheduled_batch: Optional[ScheduledRequests] = None):
         try:
             self.sampler.update_requests(sample_state, resource_manager)
         except Exception as e:
@@ -5819,6 +5864,10 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+        # The sync above guarantees this batch's guided callbacks have run on
+        # this rank, so their failures drain rank-consistently.
+        self.guided_coordinator.drain_failures(scheduled_batch,
+                                               self.active_requests)
 
     def _handle_token_budget_error(self,
                                    error: TokenBudgetExceededError) -> None:
@@ -5840,7 +5889,8 @@ class PyExecutor:
                        *,
                        requests: Optional[List[LlmRequest]] = None,
                        charge_budget: bool = True,
-                       immediate_fatal: bool = False) -> None:
+                       immediate_fatal: bool = False,
+                       defer_enqueue: bool = False) -> None:
         """Fail requests and optionally initiate shutdown on fatal errors.
 
         When ``immediate_fatal`` is True, the error is treated as fatal
@@ -5881,6 +5931,10 @@ class PyExecutor:
                 server health.
             immediate_fatal: Whether to bypass the error budget and force a
                 fatal shutdown.
+            defer_enqueue: Buffer the error responses for the loops'
+                lock-step flush instead of enqueueing here. Required for
+                rank-local requests under multi-rank attention DP, where
+                ``_enqueue_responses`` is a collective gather.
         """
         self._drain_deferred_error_frees()
         error_responses: Dict[int, LlmResponse] = {}
@@ -5958,7 +6012,10 @@ class PyExecutor:
                 request for request in self.active_requests
                 if request not in requests
             ]
-        self._enqueue_responses(list(error_responses.items()))
+        if defer_enqueue:
+            self._pending_transfer_responses.extend(error_responses.items())
+        else:
+            self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
             self._terminate_request(request,
                                     free_delay_s=DISAGG_ERROR_FREE_DELAY_S)
@@ -6010,6 +6067,9 @@ class PyExecutor:
     def _release_request_resources(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
+
+        self.guided_coordinator.release(request)
+
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 
@@ -6482,17 +6542,18 @@ class PyExecutor:
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
             failed_requests: Optional[List[Tuple[int, str]]]):
-        """Handle errors that occurred during guided decoding.
+        """Terminate requests that failed guided decoding.
 
-        Args:
-            scheduled_batch: The current batch of scheduled requests
-            failed_requests: List of (request_id, error_message) tuples for failed requests,
-                           or None if no failures occurred
+        Merges failures returned by the guided decoder's execute() with
+        failures parked by the coordinator (recorded on CUDA-callback threads
+        with one-model speculative decoding).
         """
-        if not failed_requests:
+        failed_req_id_to_err = self.guided_coordinator.take_failures(
+            scheduled_batch, self.active_requests)
+        if failed_requests:
+            failed_req_id_to_err.update(failed_requests)
+        if not failed_req_id_to_err:
             return
-
-        failed_req_id_to_err = {req_id: err for req_id, err in failed_requests}
 
         for request in scheduled_batch.all_requests():
             if request.py_request_id not in failed_req_id_to_err:
@@ -6500,7 +6561,8 @@ class PyExecutor:
             error_msg = failed_req_id_to_err[request.py_request_id]
             self._handle_errors(error_msg,
                                 requests=[request],
-                                charge_budget=False)
+                                charge_budget=False,
+                                defer_enqueue=True)
 
 
 class DisaggPPTerminationHandler:
