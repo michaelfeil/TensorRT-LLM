@@ -1,3 +1,42 @@
+--- a/csrc/apis/attention.hpp
++++ b/csrc/apis/attention.hpp
+@@ -414,14 +414,22 @@
+           py::arg("compiled_dims") = "nk",
+           py::arg("disable_ue8m0_cast") = false);
+     m.def("fp8_fp4_mqa_logits", &fp8_fp4_mqa_logits,
++          // Release the GIL for the DSA/MQA entries: they hit the CUDA driver
++          // (kernel launches, first-use module loads, large transient allocs)
++          // on the serve path, and holding the GIL across a blocking driver
++          // call starves CUDA host-callback threads that need
++          // PyGILState_Ensure, wedging the whole rank.
++          py::call_guard<py::gil_scoped_release>(),
+           py::arg("q"), py::arg("kv"), py::arg("weights"),
+           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+           py::arg("clean_logits") = true,
+           py::arg("max_seqlen_k") = 0,
+           py::arg("logits_dtype") = torch::kFloat32);
+     m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
++          py::call_guard<py::gil_scoped_release>(),
+           py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"));
+     m.def("fp8_fp4_paged_mqa_logits", &fp8_fp4_paged_mqa_logits,
++          py::call_guard<py::gil_scoped_release>(),
+           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
+           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
+           py::arg("max_context_len"),
+@@ -429,11 +437,13 @@
+           py::arg("logits_dtype") = torch::kFloat32);
+     // Legacy API
+     m.def("fp8_mqa_logits", &fp8_mqa_logits,
++          py::call_guard<py::gil_scoped_release>(),
+           py::arg("q"), py::arg("kv"), py::arg("weights"),
+           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+           py::arg("clean_logits") = true,
+           py::arg("max_seqlen_k") = 0);
+     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
++          py::call_guard<py::gil_scoped_release>(),
+           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
+           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
+           py::arg("max_context_len"), py::arg("clean_logits") = false);
 --- a/csrc/jit/handle.hpp
 +++ b/csrc/jit/handle.hpp
 @@ -4,6 +4,8 @@
