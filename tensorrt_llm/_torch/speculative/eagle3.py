@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
@@ -17,12 +18,12 @@ from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
+from .b10_hs_capture import trt_prepare_api
 from .interface import (SpecMetadata, SpecWorkerBase,
                         _prepare_fast_sampling_metadata,
                         apply_one_model_fast_sampling_from_spec_metadata)
 from .mtp import MTPSampler, _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
-from .b10_hs_capture import trt_prepare_api
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
@@ -592,8 +593,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 hidden_start = i * self.hidden_size
                 hidden_end = hidden_start + self.hidden_size
                 hidden_slice = slice(hidden_start, hidden_end)
-                inplace_slice_copy(self.hidden_states, to_save,
-                                   hidden_start, hidden_end)
+                inplace_slice_copy(self.hidden_states, to_save, hidden_start,
+                                   hidden_end)
 
                 offloader_hidden_states = getattr(self,
                                                   'offloader_hidden_states',
@@ -883,9 +884,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
 
-        reuse_mtp_topk = (
-            self.is_mtp_eagle and hasattr(attn_metadata, "set_skip_topk")
-            and hasattr(attn_metadata, "set_in_mtp_draft_loop"))
+        reuse_mtp_topk = (self.is_mtp_eagle
+                          and hasattr(attn_metadata, "set_skip_topk")
+                          and hasattr(attn_metadata, "set_in_mtp_draft_loop"))
         if reuse_mtp_topk:
             attn_metadata.set_in_mtp_draft_loop(True)
         try:
@@ -910,14 +911,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         start_ids_gen = (
                             spec_metadata.batch_indices_cuda[:num_gens] *
                             (runtime_draft_len + 1)).long()
-                        gather_ids_gen = (
-                            start_ids_gen +
-                            num_accepted_tokens[num_contexts:] - 1 +
-                            attn_metadata.num_ctx_tokens)
-                        gather_ids = torch.concat([
-                            last_tokens_idx[:num_contexts], gather_ids_gen
-                        ],
-                                                  dim=0)
+                        gather_ids_gen = (start_ids_gen +
+                                          num_accepted_tokens[num_contexts:] -
+                                          1 + attn_metadata.num_ctx_tokens)
+                        gather_ids = torch.concat(
+                            [last_tokens_idx[:num_contexts], gather_ids_gen],
+                            dim=0)
                     else:
                         gather_ids = spec_metadata.batch_indices_cuda[:
                                                                       batch_size]

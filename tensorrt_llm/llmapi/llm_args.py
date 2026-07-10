@@ -793,7 +793,6 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 "layer 0 has no previous TopK indices to reuse.")
         return indexer_types
 
-
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
@@ -829,18 +828,16 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             index_topk_pattern = self._config_value(pretrained_config,
                                                     "index_topk_pattern")
             if index_topk_pattern is not None:
-                is_full = not (layer_idx < len(index_topk_pattern)
-                               and str(index_topk_pattern[layer_idx]).upper()
-                               == "S")
+                is_full = not (layer_idx < len(index_topk_pattern) and str(
+                    index_topk_pattern[layer_idx]).upper() == "S")
             else:
                 index_topk_freq = max(
                     self._config_value(pretrained_config, "index_topk_freq", 1)
                     or 1, 1)
                 index_skip_topk_offset = self._config_value(
                     pretrained_config, "index_skip_topk_offset", 2)
-                is_full = (
-                    max(layer_idx - index_skip_topk_offset + 1, 0) %
-                    index_topk_freq) == 0
+                is_full = (max(layer_idx - index_skip_topk_offset + 1, 0) %
+                           index_topk_freq) == 0
 
         if layer_idx == 0 and not is_full:
             logger.warning(
@@ -883,10 +880,9 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                                                "index_topk_freq"),
             index_topk_pattern=self._config_value(pretrained_config,
                                                   "index_topk_pattern"),
-            index_skip_topk_offset=self._config_value(
-                pretrained_config, "index_skip_topk_offset"),
-            index_share_for_mtp_iteration=(
-                self.index_share_for_mtp_iteration),
+            index_skip_topk_offset=self._config_value(pretrained_config,
+                                                      "index_skip_topk_offset"),
+            index_share_for_mtp_iteration=(self.index_share_for_mtp_iteration),
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -919,8 +915,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
-            index_share_for_mtp_iteration=(
-                self.index_share_for_mtp_iteration),
+            index_share_for_mtp_iteration=(self.index_share_for_mtp_iteration),
             index_share_for_target_layer=index_share_for_target_layer,
         )
 
@@ -1457,8 +1452,7 @@ class DecodingBaseConfig(StrictBaseModel):
         "request; this flag no longer has any effect.")
 
     enable_fast_sampling: bool = Field(
-        default=False,
-        description="Enables Baseten fast rejection sampling.")
+        default=False, description="Enables Baseten fast rejection sampling.")
 
     enable_training: bool = Field(
         default=False,
@@ -2173,6 +2167,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=0.0,
         description=
         "Probability threshold for relaxed acceptance. Only candidates with prob >= (top-1 prob - delta) are kept."
+    )
+    multiplicative_relaxed_acceptance: bool = Field(
+        default=False,
+        description=
+        "Interpret relaxed_delta multiplicatively in logit space (threshold = top-1 logit + log(delta)) "
+        "instead of subtractively in probability space (threshold = top-1 prob - delta)."
     )
     use_mtp_vanilla: bool = Field(
         default=False,
@@ -4972,16 +4972,10 @@ class TorchLlmArgs(BaseLlmArgs):
                 # Rejection sampling is only wired up for Eagle3 one-model paths.
                 # Silently fall back for other spec types so the new default
                 # (True) does not break them.
-                # TODO: extend rejection sampling to the remaining speculative
-                # decoding paths (MTP / DraftTarget / PARD / DFlash /
-                # SaveHiddenStates / SA) and unify the dispatch in SpecMetadata
-                # so new spec algorithms get rejection sampling for free; once
-                # all paths are covered this whitelist guard can be removed.
                 self.speculative_config.use_rejection_sampling = False
 
-            if (self.speculative_config.enable_fast_sampling
-                    and not self.speculative_config.spec_dec_mode
-                    .supports_fast_sampling()):
+            if (self.speculative_config.enable_fast_sampling and not self.
+                    speculative_config.spec_dec_mode.supports_fast_sampling()):
                 raise ValueError(
                     f"enable_fast_sampling is not supported for decoding type "
                     f"'{self.speculative_config.decoding_type}'. Only MTP "
