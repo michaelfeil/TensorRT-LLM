@@ -202,8 +202,7 @@ def is_vswa_enabled(kv_cache_config):
 
 
 def supports_deferred_secondary_pool_allocation(kv_cache_manager_cls) -> bool:
-    return (issubclass(kv_cache_manager_cls, KVCacheManager)
-            and
+    return (issubclass(kv_cache_manager_cls, KVCacheManager) and
             kv_cache_manager_cls.supports_deferred_secondary_pool_allocation())
 
 
@@ -1487,8 +1486,7 @@ class KvCacheCreator:
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config,
-                defer_secondary_pool_allocation=
-                defer_secondary_pool_allocation)
+                defer_secondary_pool_allocation=defer_secondary_pool_allocation)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
@@ -1718,6 +1716,7 @@ def _create_kv_cache_manager(
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
@@ -1732,8 +1731,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
-            defer_secondary_pool_allocation=
-            defer_secondary_pool_allocation,
+            defer_secondary_pool_allocation=defer_secondary_pool_allocation,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1925,8 +1923,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
-            defer_secondary_pool_allocation=
-            defer_secondary_pool_allocation,
+            defer_secondary_pool_allocation=defer_secondary_pool_allocation,
         )
     # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
     # via cache_layer_idx — shared layers use target layer's index for
