@@ -5492,6 +5492,17 @@ class PyExecutor:
         error_msg = _format_cache_transfer_error(error_msg_prefix,
                                                  self.global_rank)
         error_requests = self._get_disagg_reqs_in_error_state()
+        if error_msg_prefix == "context requests":
+            # Generation-transfer errors are owned exclusively by the
+            # "generation requests" path, whose consensus/ADP alignment keeps
+            # the tp_gather in _handle_errors rank-symmetric. Letting them
+            # leak into this per-rank-conditional path lets a single rank
+            # enter the gather its peers skip -> mismatched collectives ->
+            # MPI_ERR_TRUNCATE.
+            error_requests = [
+                request for request in error_requests
+                if request.is_context_only_request
+            ]
         is_aligned_adp_generation = (align_across_adp and error_msg_prefix
                                      == "generation requests"
                                      and self._is_multi_rank_attention_dp())
