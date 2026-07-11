@@ -593,8 +593,7 @@ void UcxConnectionManager::processPassiveConnectionRequests()
             std::shared_ptr<ucxx::Endpoint> newEp;
             {
                 std::scoped_lock lock(mEndpointCreationMutex);
-                // endpointErrorHandling=false: avoids ucxx's error-path cancelAll double-freeing UCP state.
-                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, false);
+                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, true);
             }
             std::shared_ptr<UcxConnection> connection = std::make_shared<UcxConnection>(
                 request.connectionId, newEp, this, false, request.requesterConnectionId);
@@ -758,8 +757,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
                 // TODO: createEndpointFromWorkerAddress does not require this mutex but is blocking; explore
                 // multi-threaded or non-blocking endpoint creation.
                 std::scoped_lock lock(mEndpointCreationMutex);
-                // endpointErrorHandling=false: see companion call site above (avoids ucxx cancelAll double-free).
-                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, false);
+                newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, true);
             }
             auto connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true, connectionId);
             TLLM_CHECK(connectionId != 0);
