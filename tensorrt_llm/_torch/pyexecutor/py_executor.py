@@ -2314,13 +2314,13 @@ class PyExecutor:
             return {}
 
         previewed_states: Dict[int, Tuple[int, int, int]] = {}
+        estimate_with_summary = getattr(
+            self.kv_cache_manager, "estimate_reusable_prompt_len_with_summary",
+            None)
         for request in requests:
             if not request.is_context_init_state or not request.is_first_context_chunk:
                 continue
 
-            estimate_with_summary = getattr(
-                self.kv_cache_manager,
-                "estimate_reusable_prompt_len_with_summary", None)
             if estimate_with_summary is not None:
                 reusable_prompt_len, reuse_summary = estimate_with_summary(
                     request)

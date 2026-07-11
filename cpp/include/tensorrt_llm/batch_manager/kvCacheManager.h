@@ -851,8 +851,7 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        SizeType32 numPlaceholderBlocks = 0,
-        std::optional<TpHostOffloadTopology> tpHostOffloadTopology = std::nullopt,
+        SizeType32 numPlaceholderBlocks = 0, std::optional<TpHostOffloadTopology> tpHostOffloadTopology = std::nullopt,
         std::optional<int> worldRankOverride = std::nullopt);
 
     ~WindowBlockManager();
@@ -2081,6 +2080,26 @@ public:
     [[nodiscard]] virtual PrefixReuseSummary analyzePrefixReuse(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
         = 0;
+
+    //! \brief Prefix reuse analysis reading the token sequence directly from the request.
+    //! \details Avoids materializing the (potentially very long) unique-token vector at the
+    //! Python/nanobind boundary: the tokens never leave C++. Uses the encoder unique tokens for
+    //! cross-KV managers (returning nullopt when the request has none) and the decoder unique
+    //! tokens at \p beamIdx otherwise.
+    [[nodiscard]] std::optional<PrefixReuseSummary> analyzePrefixReuseForRequest(
+        LlmRequest const& llmRequest, SizeType32 beamIdx = 0) const
+    {
+        if (isCrossKv())
+        {
+            auto const& encoderUniqueTokens = llmRequest.getEncoderUniqueTokens();
+            if (!encoderUniqueTokens.has_value() || !encoderUniqueTokens.value())
+            {
+                return std::nullopt;
+            }
+            return analyzePrefixReuse(*encoderUniqueTokens.value(), llmRequest);
+        }
+        return analyzePrefixReuse(llmRequest.getUniqueTokens(beamIdx), llmRequest);
+    }
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.

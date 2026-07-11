@@ -597,38 +597,60 @@ class KVCacheManager(BaseResourceManager):
         ]
 
         kwargs = {
-            'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
-            'size_per_head': head_dim,
-            'tokens_per_block': tokens_per_block,
-            'blocks_per_window': blocks_per_window,
-            'max_num_sequences': max_batch_size,
-            'max_beam_width': max_beam_width,
-            'max_attention_window_vec': self.max_attention_window_vec,
-            'dtype': dtype,
-            'sink_token_length': 0,
-            'stream': self._stream.cuda_stream,  # Pass to BufferManager
-            'max_sequence_length': self.max_seq_len,
-            'chunk_size': min(max_num_tokens, self.max_seq_len),
-            'enable_block_reuse': kv_cache_config.enable_block_reuse,
-            'cache_type': kv_cache_type,
+            'num_kv_heads_per_layer':
+            self.num_kv_heads_per_layer,
+            'size_per_head':
+            head_dim,
+            'tokens_per_block':
+            tokens_per_block,
+            'blocks_per_window':
+            blocks_per_window,
+            'max_num_sequences':
+            max_batch_size,
+            'max_beam_width':
+            max_beam_width,
+            'max_attention_window_vec':
+            self.max_attention_window_vec,
+            'dtype':
+            dtype,
+            'sink_token_length':
+            0,
+            'stream':
+            self._stream.cuda_stream,  # Pass to BufferManager
+            'max_sequence_length':
+            self.max_seq_len,
+            'chunk_size':
+            min(max_num_tokens, self.max_seq_len),
+            'enable_block_reuse':
+            kv_cache_config.enable_block_reuse,
+            'cache_type':
+            kv_cache_type,
             'secondary_offload_min_priority':
             kv_cache_config.secondary_offload_min_priority,
-            'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
-            'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
+            'enable_partial_reuse':
+            kv_cache_config.enable_partial_reuse,
+            'copy_on_partial_reuse':
+            kv_cache_config.copy_on_partial_reuse,
             'enable_tp_mla_replicated_host_offload':
             enable_tp_mla_replicated_host_offload,
             'tp_group_ranks':
             mapping.tp_group if enable_tp_mla_replicated_host_offload else [],
-            'kv_connector_manager': self.kv_connector_manager,
-            'enable_indexer_k_cache': enable_indexer_k_cache,
+            'kv_connector_manager':
+            self.kv_connector_manager,
+            'enable_indexer_k_cache':
+            enable_indexer_k_cache,
             'indexer_k_cache_quant_block_size':
             indexer_k_cache_quant_block_size,
-            'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
-            'indexer_k_cache_use_fp4': indexer_k_cache_use_fp4,
-            'linear_attention_metadata': linear_attention_metadata,
+            'indexer_k_cache_index_head_dim':
+            indexer_k_cache_index_head_dim,
+            'indexer_k_cache_use_fp4':
+            indexer_k_cache_use_fp4,
+            'linear_attention_metadata':
+            linear_attention_metadata,
             # Forward the (possibly remapped) per-pool configurations.
             # window_size values are aligned with the post-clamp sizes.
-            'pool_configurations': pool_configurations_cpp,
+            'pool_configurations':
+            pool_configurations_cpp,
         }
 
         if self.event_buffer_max_size > 0:
@@ -735,18 +757,17 @@ class KVCacheManager(BaseResourceManager):
         if not input_tokens:
             return 0
         from tensorrt_llm.bindings import SamplingConfig
-        from tensorrt_llm.bindings.internal.batch_manager import BlockKey
         from tensorrt_llm.bindings.internal.batch_manager import \
             LlmRequest as CppLlmRequest
-        block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
-        unique_tokens = block_key.unique_tokens
         dummy_req = CppLlmRequest(request_id=0,
                                   max_new_tokens=0,
                                   input_tokens=input_tokens,
                                   sampling_config=SamplingConfig(),
                                   is_streaming=False,
                                   lora_task_id=lora_task_id)
-        summary = self.impl.analyze_prefix_reuse(unique_tokens, dummy_req)
+        # Request-based overload: the C++ side reads the unique tokens the
+        # request constructor built from input_tokens.
+        summary = self.impl.analyze_prefix_reuse(dummy_req)
         return summary.reusable_blocks_all * self.tokens_per_block
 
     def shutdown(self):
@@ -1055,9 +1076,8 @@ class KVCacheManager(BaseResourceManager):
                                           self._kv_reserve_draft_tokens)
                 if self.dflash_block_size is not None:
                     assert draft_len <= self.dflash_block_size
-                    extra_len_for_draft = max(
-                        self.dflash_block_size,
-                        self._kv_reserve_draft_tokens)
+                    extra_len_for_draft = max(self.dflash_block_size,
+                                              self._kv_reserve_draft_tokens)
                 for _ in range(extra_len_for_draft):
                     self.impl.add_token(req.py_request_id)
 
@@ -1342,18 +1362,17 @@ class KVCacheManager(BaseResourceManager):
                 or self.is_vswa or not request.is_first_context_chunk):
             return 0, None
 
-        unique_tokens = request.get_unique_tokens(DEFAULT_BEAM_INDEX)
-        recoverable_unique_tokens = unique_tokens[:-1]
-        reusable_tokens_cap = (len(recoverable_unique_tokens) //
-                               self.tokens_per_block) * self.tokens_per_block
-        if reusable_tokens_cap == 0:
+        # Sequence insertion ignores the last prompt token because its KV
+        # cannot be recovered, so cap reuse at the last full block before it.
+        # Only the token count is needed here; materializing the unique-token
+        # list at the nanobind boundary is O(prompt_len) under the GIL.
+        num_tokens = request.get_num_tokens(DEFAULT_BEAM_INDEX)
+        reusable_tokens_cap = (
+            (num_tokens - 1) // self.tokens_per_block) * self.tokens_per_block
+        if reusable_tokens_cap <= 0:
             return 0, None
 
-        analyze_prefix_reuse = getattr(self.impl, "analyze_prefix_reuse", None)
-        if analyze_prefix_reuse is None:
-            return 0, None
-
-        summary = analyze_prefix_reuse(unique_tokens, request)
+        summary = self.impl.analyze_prefix_reuse(request, DEFAULT_BEAM_INDEX)
         reusable_prompt_len = min(
             summary.reusable_blocks_all * self.tokens_per_block,
             reusable_tokens_cap)

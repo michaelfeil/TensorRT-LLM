@@ -39,8 +39,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     SimpleUnifiedScheduler,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
-from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
-                                          PythonCapacitySchedulerPolicy)
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, PythonCapacitySchedulerPolicy
 
 
 @dataclass
@@ -193,17 +192,20 @@ class MockKVCacheManager:
     def scheduling_remove_sequence(self, req_id: int):
         pass
 
-    def analyze_prefix_reuse(self, unique_tokens, req):
+    def analyze_prefix_reuse(self, req, beam=0):
         self.analyze_prefix_reuse_calls += 1
-        if self.enable_block_reuse and unique_tokens:
-            # Derive a deterministic, hashable block key from the tokens so that
-            # duplicate requests produce equal first_new_block values and trigger
-            # the beneficial-to-skip logic.  UniqueToken objects (nanobind-wrapped
-            # C++ structs) have no __hash__/__eq__, so extract the primitive fields.
-            block_key = tuple(
-                t if isinstance(t, int) else (t.token_id, t.token_extra_id) for t in unique_tokens
-            )
-            return MockPrefixReuseSummary(first_new_block=block_key)
+        if self.enable_block_reuse:
+            unique_tokens = req.get_unique_tokens(beam)
+            if unique_tokens:
+                # Derive a deterministic, hashable block key from the tokens so that
+                # duplicate requests produce equal first_new_block values and trigger
+                # the beneficial-to-skip logic.  UniqueToken objects (nanobind-wrapped
+                # C++ structs) have no __hash__/__eq__, so extract the primitive fields.
+                block_key = tuple(
+                    t if isinstance(t, int) else (t.token_id, t.token_extra_id)
+                    for t in unique_tokens
+                )
+                return MockPrefixReuseSummary(first_new_block=block_key)
         return MockPrefixReuseSummary()
 
     def get_max_resource_count(self) -> int:
@@ -2866,22 +2868,19 @@ class TestPyCapacitySchedulerKVCacheReuse:
 
     def test_shortest_missed_sort_uses_preview_summary(self):
         """A previewed prefix summary is forwarded into the sort-key resource query."""
-        kv = MockKVCacheManager(num_free_blocks=100,
-                                blocks_per_request=3,
-                                enable_block_reuse=True)
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
         scheduler = PyCapacityScheduler(
             max_num_requests=4,
             kv_cache_manager=kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
             python_capacity_scheduler_policy=(
-                PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST),
+                PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+            ),
         )
         r0 = _make_request(0, prompt_len=21, input_tokens=list(range(21)))
         r1 = _make_request(1, prompt_len=22, input_tokens=list(range(22)))
-        summary0 = MockPrefixReuseSummary(reusable_blocks_allocated=1,
-                                          reusable_blocks_all=2)
-        summary1 = MockPrefixReuseSummary(reusable_blocks_allocated=2,
-                                          reusable_blocks_all=3)
+        summary0 = MockPrefixReuseSummary(reusable_blocks_allocated=1, reusable_blocks_all=2)
+        summary1 = MockPrefixReuseSummary(reusable_blocks_allocated=2, reusable_blocks_all=3)
         r0.py_schedulable_reuse_summary = summary0
         r1.py_schedulable_reuse_summary = summary1
 
@@ -2891,11 +2890,10 @@ class TestPyCapacitySchedulerKVCacheReuse:
 
     def test_duplicate_skip_uses_preview_summary_without_reanalysis(self):
         """Duplicate-skip can consume preview summaries without another tree walk."""
-        kv = MockKVCacheManager(num_free_blocks=100,
-                                blocks_per_request=3,
-                                enable_block_reuse=True)
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
         kv.analyze_prefix_reuse = Mock(
-            side_effect=AssertionError("unexpected prefix reuse re-analysis"))
+            side_effect=AssertionError("unexpected prefix reuse re-analysis")
+        )
         scheduler = PyCapacityScheduler(
             max_num_requests=3,
             kv_cache_manager=kv,

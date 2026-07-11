@@ -604,6 +604,11 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             nb::call_guard<nb::gil_scoped_release>())
+        // Request-based overload (registered first: it is the hot path): tokens are read inside
+        // C++, avoiding the O(prompt_len) C++ -> Python -> C++ UniqueToken conversion of the
+        // list-based overload. Returns None only for cross-KV managers without encoder tokens.
+        .def("analyze_prefix_reuse", &BaseKVCacheManager::analyzePrefixReuseForRequest, nb::arg("llm_request"),
+            nb::arg("beam") = 0, nb::call_guard<nb::gil_scoped_release>())
         .def("analyze_prefix_reuse", &BaseKVCacheManager::analyzePrefixReuse, nb::arg("unique_tokens"),
             nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
@@ -656,8 +661,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                  tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
                  std::shared_ptr<tbk::KVCacheEventManager>, bool, bool, bool, std::vector<SizeType32> const&,
                  std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32, bool,
-                 std::optional<tbk::LinearAttentionMetadata>,
-                 std::vector<tbk::PoolConfiguration> const&>(),
+                 std::optional<tbk::LinearAttentionMetadata>, std::vector<tbk::PoolConfiguration> const&>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("dtype"), nb::arg("sink_token_length"), nb::arg("stream"),

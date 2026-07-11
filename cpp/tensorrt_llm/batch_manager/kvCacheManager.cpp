@@ -1556,14 +1556,22 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     auto searchNode = mCachedBlocksRoot ? mCachedBlocksRoot->getLookupNode() : nullptr;
     SizeType32 candidateMatchedTokens{0};
     SizeType32 latestMissingAnchorEndToken{0};
+    // candidateMatches is append-only, so the safe prefix is fully described by a
+    // (match count, token count) pair; record it here and materialize the result
+    // once after the loop. Snapshotting the vector itself on every matched block
+    // would be O(prefix_blocks^2) in ReuseMatch copies (each with shared_ptr
+    // refcount traffic) — same accidental-quadratic class as the upstream
+    // findBlocksInReuseTreeByBlockKey fix (NVIDIA/TensorRT-LLM@8fff9c50).
+    std::size_t safeMatchCount{0};
+    SizeType32 safeMatchedTokens{0};
 
     auto updateSafePrefix = [&]()
     {
         if (!mIsSWA || latestMissingAnchorEndToken == 0
             || candidateMatchedTokens >= latestMissingAnchorEndToken + mWindowSize)
         {
-            result.matches = candidateMatches;
-            result.totalMatchedTokens = candidateMatchedTokens;
+            safeMatchCount = candidateMatches.size();
+            safeMatchedTokens = candidateMatchedTokens;
         }
     };
 
@@ -1634,6 +1642,10 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
         }
         break;
     }
+
+    candidateMatches.resize(safeMatchCount);
+    result.matches = std::move(candidateMatches);
+    result.totalMatchedTokens = safeMatchedTokens;
 
     if (result.matches.size() < blockKeys.size())
     {
@@ -3292,9 +3304,9 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype,
     SizeType32 sinkTokenLength, int64_t stream, runtime::SizeType32 maxSequenceLength, SizeType32 chunkSize,
     bool enableBlockReuse, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse,
-    bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks,
-    bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
+    bool enableTpMlaReplicatedHostOffload, std::vector<SizeType32> const& tpGroupRanks, bool enableIndexerKCache,
+    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata,
     std::vector<PoolConfiguration> const& poolConfigurations)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength,
@@ -3384,8 +3396,8 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength, std::move(stream),
         maxSequenceLength, chunkSize, enableBlockReuse, cacheType, secondaryOffloadMinPriority, std::move(eventManager),
         enablePartialReuse, copyOnPartialReuse, enableTpMlaReplicatedHostOffload, tpGroupRanks,
-        std::move(kvCacheConnectorManager), enableIndexerKCache, indexerKCacheQuantBlockSize,
-        indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations)
+        std::move(kvCacheConnectorManager), enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
+        indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations)
 {
 }
 

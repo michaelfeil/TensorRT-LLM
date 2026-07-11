@@ -1763,20 +1763,19 @@ class PyCapacityScheduler:
             # Check: isContextInitState() && !isFirstContextChunk()
             if req.is_context_init_state and not req.is_first_context_chunk:
                 # Chunked context request already executing
+                # summary.first_new_block builds a fresh Python BlockKey (token
+                # copy) on every access; read it once.
                 if enable_block_reuse:
-                    unique_tokens = req.get_unique_tokens(0)
-                    summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
-                    if summary.first_new_block is not None:
-                        newly_contributed_context_blocks.add(summary.first_new_block)
+                    summary = self.kv_cache_manager.analyze_prefix_reuse(req)
+                    first_new_block = summary.first_new_block
+                    if first_new_block is not None:
+                        newly_contributed_context_blocks.add(first_new_block)
 
                 if cross_enable_reuse:
-                    encoder_unique_tokens = req.get_encoder_unique_tokens()
-                    if encoder_unique_tokens is not None:
-                        summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
-                            encoder_unique_tokens, req
-                        )
-                        if summary.first_new_block is not None:
-                            newly_contributed_cross_context_blocks.add(summary.first_new_block)
+                    summary = self.cross_kv_cache_manager.analyze_prefix_reuse(req)
+                    first_new_block = summary.first_new_block if summary is not None else None
+                    if first_new_block is not None:
+                        newly_contributed_cross_context_blocks.add(first_new_block)
 
         return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
 
@@ -1820,14 +1819,15 @@ class PyCapacityScheduler:
                 if summary is not None and summary_by_req is not None:
                     summary_by_req[req_id] = summary
             if summary is None:
-                unique_tokens = req.get_unique_tokens(0)
-                summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+                summary = self.kv_cache_manager.analyze_prefix_reuse(req)
                 if summary_by_req is not None:
                     summary_by_req[req_id] = summary
-            if summary.first_new_block is not None:
-                if summary.first_new_block in newly_contributed_context_blocks:
+            # Single property read: each access copies the BlockKey out of C++.
+            first_new_block = summary.first_new_block
+            if first_new_block is not None:
+                if first_new_block in newly_contributed_context_blocks:
                     return True
-                ctx_new_block = summary.first_new_block
+                ctx_new_block = first_new_block
 
         if (
             self.cross_kv_cache_manager is not None
@@ -1835,17 +1835,14 @@ class PyCapacityScheduler:
         ):
             summary = cross_summary_by_req.get(req_id) if cross_summary_by_req is not None else None
             if summary is None:
-                encoder_unique_tokens = req.get_encoder_unique_tokens()
-                if encoder_unique_tokens is not None:
-                    summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
-                        encoder_unique_tokens, req
-                    )
-                    if cross_summary_by_req is not None:
-                        cross_summary_by_req[req_id] = summary
-            if summary is not None and summary.first_new_block is not None:
-                if summary.first_new_block in newly_contributed_cross_context_blocks:
+                summary = self.cross_kv_cache_manager.analyze_prefix_reuse(req)
+                if summary is not None and cross_summary_by_req is not None:
+                    cross_summary_by_req[req_id] = summary
+            first_new_block = summary.first_new_block if summary is not None else None
+            if first_new_block is not None:
+                if first_new_block in newly_contributed_cross_context_blocks:
                     return True
-                cross_new_block = summary.first_new_block
+                cross_new_block = first_new_block
 
         # Request is NOT skipped — register contributions so subsequent duplicate
         # requests can be deferred correctly.
