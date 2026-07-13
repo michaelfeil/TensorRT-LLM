@@ -4925,10 +4925,12 @@ class PyExecutor:
         """Count active requests that are ready for scheduling.
 
         In non-disaggregated mode, all active requests are schedulable.
-        In disaggregated mode, requests still waiting for KV cache
-        transfer (in INIT or transmission-in-progress state) are
-        excluded because they cannot participate in the forward pass
-        until transfer completes.
+        In disaggregated mode, only requests inside the scheduler's
+        schedulability window [CONTEXT_INIT, GENERATION_TO_COMPLETE) are
+        counted, mirroring the MicroBatchScheduler bounds
+        (no_schedule_until_state / no_schedule_after_state). States
+        outside the window cannot produce forward work, so counting them
+        would suppress the pad dummy while the rank schedules batch=0.
 
         Requests deferred on a guided-decoding grammar compile are also
         excluded, so a rank whose only request is deferred pads a dummy
@@ -4943,12 +4945,12 @@ class PyExecutor:
             return sum(1 for req in self.active_requests
                        if not req.py_guided_compile_pending)
 
-        def _is_awaiting_kv_transfer(req) -> bool:
-            return (req.is_disagg_generation_init_state
-                    or req.is_disagg_generation_transmission_in_progress)
+        context_init_value = LlmRequestState.CONTEXT_INIT.value
+        to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
 
-        return sum(1 for req in self.active_requests if not (
-            _is_awaiting_kv_transfer(req) or req.py_guided_compile_pending))
+        return sum(1 for req in self.active_requests
+                   if context_init_value <= req.state_value < to_complete_value
+                   and not req.py_guided_compile_pending)
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
@@ -5001,13 +5003,19 @@ class PyExecutor:
             dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
             draft_kv_cache_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-            llm_request = self.kv_cache_manager.add_dummy_requests(
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
                 draft_kv_cache_manager=draft_kv_cache_manager,
-            )[0]
+            )
+            if not dummy_requests:
+                logger.warning(
+                    "Cannot allocate ADP pad dummy (no free cache resources);"
+                    " rank schedules an empty batch this iteration.")
+                return
+            llm_request = dummy_requests[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)

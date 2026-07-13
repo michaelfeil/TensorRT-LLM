@@ -28,6 +28,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # ---------------------------------------------------------------------------
@@ -38,12 +39,20 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 def _make_active_request(
     in_init: bool = False,
     in_transfer: bool = False,
+    state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS,
 ) -> Mock:
     """Create an active request stub with disagg state flags."""
     req = Mock()
+    if in_init:
+        req.state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
+    elif in_transfer:
+        req.state_value = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value
+    else:
+        req.state_value = state.value
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
     req.is_attention_dp_dummy = False
+    req.py_guided_compile_pending = False
     return req
 
 
@@ -470,6 +479,40 @@ class TestPadAttentionDpDummyBenchmarkDisagg:
         )
         ex._pad_attention_dp_dummy_request()
         ex.kv_cache_manager.add_dummy_requests.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            LlmRequestState.GENERATION_TO_COMPLETE,
+            LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+        ],
+    )
+    def test_adds_dummy_when_requests_are_outside_scheduler_window(self, state):
+        ex = MockPadDummyExecutor(
+            is_benchmark_disagg=True,
+            benchmark_fill_phase_active=False,
+            kv_cache_transceiver=Mock(),
+            active_requests=[_make_active_request(state=state)],
+            expected_num_active_requests=2,
+        )
+
+        ex._pad_attention_dp_dummy_request()
+
+        ex.kv_cache_manager.add_dummy_requests.assert_called_once()
+
+    def test_dummy_allocation_failure_skips_padding(self):
+        ex = MockPadDummyExecutor(
+            is_benchmark_disagg=True,
+            benchmark_fill_phase_active=False,
+            kv_cache_transceiver=Mock(),
+            active_requests=[_make_active_request(state=LlmRequestState.GENERATION_TO_COMPLETE)],
+            expected_num_active_requests=2,
+        )
+        ex.kv_cache_manager.add_dummy_requests.return_value = None
+
+        ex._pad_attention_dp_dummy_request()
+
+        assert len(ex.active_requests) == 1
 
     def test_skips_when_adp_disabled(self):
         ex = MockPadDummyExecutor(
