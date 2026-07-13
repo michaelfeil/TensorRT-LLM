@@ -1055,17 +1055,17 @@ class PyTorchModelEngine(ModelEngine):
 
         can_run_general_warmup = (
             not self.is_draft_model and not self.mapping.has_cp_helix()
-            and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
-        self._run_attention_warmup(resource_manager, can_run_general_warmup)
+        with self._detached_guided_decoder():
+            self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
             warmup_requests_configs = self._get_full_general_warmup_requests(
                 resource_manager)
             # Currently graph has not been captured, disable cuda graph for this warmup.
-            with self.no_cuda_graph():
+            with self._detached_guided_decoder(), self.no_cuda_graph():
                 self._general_warmup(resource_manager, warmup_requests_configs)
                 # Release C++ MoE workspace buffers so the autotuner can
                 # reclaim the memory.  They will be re-allocated on next use.
@@ -1092,7 +1092,27 @@ class PyTorchModelEngine(ModelEngine):
             # fragmentation at runtime.
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
-            self._general_warmup(resource_manager, warmup_requests_configs)
+            with self._detached_guided_decoder():
+                self._general_warmup(resource_manager, warmup_requests_configs)
+
+    @contextlib.contextmanager
+    def _detached_guided_decoder(self):
+        # Warmup-only: forwards run exactly as in a deployment without guided
+        # decoding configured. Restores the decoder on both the engine and the
+        # model's spec worker afterwards.
+        guided_decoder = self.guided_decoder
+        if guided_decoder is None:
+            yield
+            return
+        self.guided_decoder = None
+        if hasattr(self.model, "set_guided_decoder"):
+            self.model.set_guided_decoder(None)
+        try:
+            yield
+        finally:
+            self.guided_decoder = guided_decoder
+            if hasattr(self.model, "set_guided_decoder"):
+                self.model.set_guided_decoder(guided_decoder)
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
