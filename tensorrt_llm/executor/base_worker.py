@@ -814,7 +814,7 @@ class BaseWorker(GenerationExecutor):
         # Already serialized on the producing rank via allgather — just emit.
         if (isinstance(stats, tuple) and len(stats) == 2
                 and stats[0] == "per_rank_dict"):
-            return json.dumps(stats[1])
+            return orjson.dumps(stats[1]).decode("utf-8")
 
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
@@ -830,7 +830,7 @@ class BaseWorker(GenerationExecutor):
             extra_stats = kv_iter_stats
             kv_iter_stats = None
 
-        stats_dict = json.loads(iteration_stats.to_json_str())
+        stats_dict = orjson.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
         # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
         # default to rank 0; ADP stats carry the rank supplied by PyExecutor.

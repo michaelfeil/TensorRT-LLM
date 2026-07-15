@@ -171,9 +171,10 @@ void initBindings(nb::module_& m)
         .def_rw("static_batching_stats", &tle::IterationStats::staticBatchingStats)
         .def_rw("inflight_batching_stats", &tle::IterationStats::inflightBatchingStats)
         .def_rw("specdec_stats", &tle::IterationStats::specDecodingStats)
-        .def("to_json_str",
-            [](tle::IterationStats const& iterationStats)
-            { return tle::JsonSerialization::toJsonStr(iterationStats); });
+        .def(
+            "to_json_str",
+            [](tle::IterationStats const& iterationStats) { return tle::JsonSerialization::toJsonStr(iterationStats); },
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tle::DebugTensorsPerIteration>(m, "DebugTensorsPerIteration")
         .def(nb::init<>())
@@ -207,16 +208,20 @@ void initBindings(nb::module_& m)
         .def_rw("reused_blocks_per_request", &tle::RequestStats::reusedBlocksPerRequest)
         .def_rw("missed_blocks_per_request", &tle::RequestStats::missedBlocksPerRequest)
         .def_rw("kv_cache_hit_rate_per_request", &tle::RequestStats::kvCacheHitRatePerRequest)
-        .def("to_json_str",
-            [](tle::RequestStats const& iterationStats) { return tle::JsonSerialization::toJsonStr(iterationStats); });
+        .def(
+            "to_json_str",
+            [](tle::RequestStats const& iterationStats) { return tle::JsonSerialization::toJsonStr(iterationStats); },
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tle::RequestStatsPerIteration>(m, "RequestStatsPerIteration")
         .def(nb::init<>())
         .def_rw("iter", &tle::RequestStatsPerIteration::iter)
         .def_rw("request_stats", &tle::RequestStatsPerIteration::requestStats)
-        .def("to_json_str",
+        .def(
+            "to_json_str",
             [](tle::RequestStatsPerIteration const& iterationStats)
-            { return tle::JsonSerialization::toJsonStr(iterationStats); });
+            { return tle::JsonSerialization::toJsonStr(iterationStats); },
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::module_ executor_kv_cache = m.def_submodule("kv_cache", "Executor KV Cache Manager");
 

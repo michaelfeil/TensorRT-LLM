@@ -707,6 +707,12 @@ class PyExecutor:
         self._kv_iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
+        # HBM composition moves far slower than the decode loop, and building
+        # it costs a full torch.cuda.memory_stats() allocator-dict walk under
+        # the GIL, so refresh it on an iteration interval and reuse between.
+        self._hbm_stats_interval = int(
+            os.environ.get("TLLM_HBM_STATS_INTERVAL_ITERS", "10"))
+        self._latest_hbm_stats_dict = None
         self._adp_iter_stats = ADPIterStatsBuffer()
         # Per-loop CPU wall and GPU forward time captured by the profile_step
         # closure (see _profiler). Populated whenever enable_iter_perf_stats or
@@ -1642,8 +1648,11 @@ class PyExecutor:
                 self._build_kv_pool_hbm_stats(
                     draft_kv_cache_manager.get_kv_cache_stats()))
 
-        extra_stats["hbmStats"] = self._build_hbm_stats(end, total_gpu_memory,
-                                                        kv_pools).to_dict()
+        if (self._latest_hbm_stats_dict is None
+                or self.iter_counter % self._hbm_stats_interval == 0):
+            self._latest_hbm_stats_dict = self._build_hbm_stats(
+                end, total_gpu_memory, kv_pools).to_dict()
+        extra_stats["hbmStats"] = self._latest_hbm_stats_dict
 
         # Attention-DP may add dummy requests to keep ranks aligned during
         # distributed scheduling. CUDA graph padding can add dummies too.
@@ -1964,7 +1973,9 @@ class PyExecutor:
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
                 and self.enable_attention_dp and attention_dp_rank is None):
-            import json as _json
+            # orjson: this runs on the executor thread every iteration, and
+            # the stdlib parser held the GIL ~3.6x longer per document.
+            import orjson as _json
             local_dict = _json.loads(stats.to_json_str())
             if req_stats:
                 local_dict["requestStats"] = [

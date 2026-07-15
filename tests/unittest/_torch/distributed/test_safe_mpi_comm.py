@@ -639,5 +639,53 @@ class TestMPIDistGather:
             assert result is None
 
 
+# ---------------------------------------------------------------------------
+# Tests for the safe_broadcast free function
+# ---------------------------------------------------------------------------
+
+
+class TestSafeBroadcast:
+    """Tests for the safe_broadcast free function."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Set up MPI environment for each test."""
+        if not BuildInfo.ENABLE_MULTI_DEVICE:
+            pytest.skip("Test requires ENABLE_MULTI_DEVICE build")
+        self.rank, self.world_size = get_mpi_info()
+        if self.world_size < 2:
+            pytest.skip("Test requires at least 2 MPI ranks (run with mpirun -n 2)")
+        self.comm = get_mpi_comm()
+
+    def test_broadcast_roundtrip(self):
+        """All ranks receive the root's object by value."""
+        expected = {"tokens": list(range(1000)), "tag": "req"}
+        obj = expected if self.rank == 0 else None
+
+        result = communicator.safe_broadcast(self.comm, obj, root=0)
+
+        assert result == expected
+
+    def test_broadcast_root_returns_original_object(self):
+        """Root skips deserializing its own payload and returns the input object."""
+        obj = {"payload": [1, 2, 3]} if self.rank == 0 else None
+
+        result = communicator.safe_broadcast(self.comm, obj, root=0)
+
+        if self.rank == 0:
+            assert result is obj
+        else:
+            assert result == {"payload": [1, 2, 3]}
+
+    def test_broadcast_multi_chunk_payload(self):
+        """Payload larger than chunk_size round-trips intact."""
+        payload = bytes(range(256)) * 4096  # 1 MiB
+        obj = payload if self.rank == 0 else None
+
+        result = communicator.safe_broadcast(self.comm, obj, root=0, chunk_size=64 * 1024)
+
+        assert result == payload
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -318,15 +318,10 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     # ---- Reconstruction and deserialization ----
     # Validate the received byte count and unpickle.
     if rank == root:
-        # Root already has `serialized`
-        if len(serialized) != total_size:
-            raise RuntimeError(
-                f"Data size mismatch at root: expected {total_size}, got {len(serialized)}"
-            )
-        try:
-            return pickle.loads(serialized)  # nosec B301
-        except Exception as e:
-            raise RuntimeError(f"Deserialization failed: {str(e)}") from e
+        # Root already has the object; deserializing its own bytes would only
+        # produce an equivalent copy while holding the GIL for O(payload).
+        # Callers receive the original (same as the world_size == 1 path).
+        return obj
     else:
         if len(dst_buf) != total_size:
             raise RuntimeError(
