@@ -15,6 +15,7 @@ UCXX_BUILD_PATH="${UCXX_BUILD_PATH:-/tmp/ucxx-python-build}"
 python3 -m pip install --no-cache-dir \
     --index-url https://pypi.nvidia.com \
     --extra-index-url https://pypi.org/simple \
+    "cython>=3.2.2" \
     "rapids-build-backend>=0.4.0,<0.5.0" \
     "scikit-build-core[pyproject]>=0.11.0" \
     "rmm-cu13==26.6.0" \
