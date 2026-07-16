@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation.base.agent import BaseTransferAgent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     RxSessionBase,
@@ -16,7 +17,11 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    TransferWorker,
+    TransferWorkerConfig,
+    _create_nixl_agent,
+)
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
@@ -72,19 +77,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self._device_id} in KvCacheTransceiverV2")
         self._instance_name = self._broadcast_instance_name()
-        self._transfer_worker = TransferWorker(
-            TransferWorkerConfig(
-                kv_cache_manager=kv_cache_manager,
-                device_id=self._device_id,
-                instance_name=self._instance_name,
-                # Context-only requests are released after KV transfer completes, so many batches
-                # can be in-flight simultaneously. AuxBuffer holds only small CPU metadata, so a
-                # large multiplier is cheap.
-                max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
-                tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
-                rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
-            )
-        )
+        self._transfer_worker = TransferWorker(self._transfer_worker_config(kv_cache_manager))
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
         self._context_info_endpoint = self._broadcast_context_endpoint()
         self._init_sync_policy()
@@ -96,6 +89,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        self._context_kv_transfer_error_events: list[tuple[int, int]] = []
+        self._generation_kv_transfer_error_events: list[tuple[int, int]] = []
+
+    def _create_transfer_agent(self, name: str) -> BaseTransferAgent:
+        return _create_nixl_agent(name)
+
+    def _transfer_worker_config(self, kv_cache_manager: KVCacheManager) -> TransferWorkerConfig:
+        return TransferWorkerConfig(
+            kv_cache_manager=kv_cache_manager,
+            device_id=self._device_id,
+            instance_name=self._instance_name,
+            # Context-only requests are released after KV transfer completes, so many batches
+            # can be in-flight simultaneously. AuxBuffer holds only small CPU metadata, so a
+            # large multiplier is cheap.
+            max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
+            tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
+            rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
+            agent_factory=self._create_transfer_agent,
+        )
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -173,42 +185,46 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             token_range = TokenRange(start=0, end=req.prompt_len)
 
         groups = []
-        for idx, lg in enumerate(layer_groups):
-            if isinstance(lg, MambaLayerGroup):
-                groups.append(np.array([], dtype=np.int64))
-                continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
-            # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
-            # Extra blocks from num_extra_kv_tokens (speculative decoding) have
-            # uninitialized KV data and must not be transferred.
-            total_blocks = (req.prompt_len + tpb - 1) // tpb
-            if block_ids.size > total_blocks:
-                block_ids = block_ids[:total_blocks]
-            window_size = lg.sliding_window_size
-
-            if window_size is not None:
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, total_blocks - stale_end)
-                # Stale prefix already pruned above; skip reuse-hit blocks that
-                # land inside the window. Clamp to 0: ctx side has cached_per_lg
-                # synthetically 0, and a reuse hit may fall entirely inside the
-                # stale region (those blocks were already pruned, no extra skip).
-                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
-            else:
+        adapter.begin_kv_slice(req)
+        try:
+            for idx, lg in enumerate(layer_groups):
+                if isinstance(lg, MambaLayerGroup):
+                    groups.append(np.array([], dtype=np.int64))
+                    continue
+                block_ids = adapter.get_block_ids(req, idx, lg)
+                # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
+                # Extra blocks from num_extra_kv_tokens (speculative decoding) have
+                # uninitialized KV data and must not be transferred.
                 total_blocks = (req.prompt_len + tpb - 1) // tpb
-                expected_valid = total_blocks
-                cache_skip = cached_per_lg[idx] // tpb
+                if block_ids.size > total_blocks:
+                    block_ids = block_ids[:total_blocks]
+                window_size = lg.sliding_window_size
 
-            block_ids = self._trim_packed_beam_block_ids(
-                block_ids,
-                beam_width=req.py_beam_width,
-                total_blocks=total_blocks,
-                expected_valid=expected_valid,
-                cache_skip=cache_skip,
-            )
+                if window_size is not None:
+                    # Drop stale blocks the manager may still expose (V1 pre-eviction).
+                    stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
+                    expected_valid = max(0, total_blocks - stale_end)
+                    # Stale prefix already pruned above; skip reuse-hit blocks that
+                    # land inside the window. Clamp to 0: ctx side has cached_per_lg
+                    # synthetically 0, and a reuse hit may fall entirely inside the
+                    # stale region (those blocks were already pruned, no extra skip).
+                    cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
+                else:
+                    total_blocks = (req.prompt_len + tpb - 1) // tpb
+                    expected_valid = total_blocks
+                    cache_skip = cached_per_lg[idx] // tpb
 
-            groups.append(block_ids)
+                block_ids = self._trim_packed_beam_block_ids(
+                    block_ids,
+                    beam_width=req.py_beam_width,
+                    total_blocks=total_blocks,
+                    expected_valid=expected_valid,
+                    cache_skip=cache_skip,
+                )
+
+                groups.append(block_ids)
+        finally:
+            adapter.end_kv_slice(req)
 
         mamba_state_index = None
         if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
@@ -330,7 +346,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return {rid for rid, c in cnt.items() if c == n_ranks}
 
     def _consensus_outcome(
-        self, to_process, cancelled, failed, completed, allgather: Callable, need_sync: bool
+        self,
+        to_process,
+        cancelled,
+        failed,
+        completed,
+        allgather: Callable,
+        need_sync: bool,
+        local_session_ids: Optional[list] = None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         all_c = self._allgather_or_passthrough(cancelled, allgather, need_sync)
@@ -340,21 +363,43 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
         global_completed = self._intersection(all_done, n)
-        new_cancelled = [rid for rid in to_process if rid in global_cancelled]
+        # Failure classification runs over ALL local sessions, not just
+        # to_process: every rank must mark the same rid DISAGG_TRANS_ERROR in
+        # the same poll. The executor's error sweep
+        # (_check_cache_transfer_errors → _handle_errors → tp_gather) is a
+        # collective driven by per-rank request state, so a rank that marks a
+        # poll late skips the gather its peers enter, and the mismatched
+        # collectives die with MPI_ERR_TRUNCATE.
+        failure_candidates = (
+            list(local_session_ids) if local_session_ids is not None else to_process
+        )
+        new_cancelled = [rid for rid in failure_candidates if rid in global_cancelled]
         cancel_set = set(new_cancelled)
-        new_failed = [rid for rid in to_process if rid in global_failed and rid not in cancel_set]
+        new_failed = [
+            rid for rid in failure_candidates if rid in global_failed and rid not in cancel_set
+        ]
         terminal = cancel_set | set(new_failed)
         new_completed = [
             rid for rid in to_process if rid in global_completed and rid not in terminal
         ]
         return new_cancelled, new_failed, new_completed
 
-    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
+    def _gen_consensus_outcome(
+        self, to_process, cancelled, failed, completed, local_session_ids=None
+    ):
         return self._consensus_outcome(
-            to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._gen_allgather,
+            self._gen_need_sync,
+            local_session_ids=local_session_ids,
         )
 
-    def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, timed_out):
+    def _ctx_consensus_outcome(
+        self, to_process, cancelled, failed, completed, timed_out, local_session_ids=None
+    ):
         # TP first, then PP.  timed_out is local-only (back-off signal).
         c, f, d = self._consensus_outcome(
             to_process,
@@ -363,10 +408,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             completed,
             self._dist.tp_allgather,
             self._ctx_need_tp_sync,
+            local_session_ids=local_session_ids,
         )
         if self._ctx_need_pp_sync:
             pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-            c, f, d = self._consensus_outcome(to_process, c, f, d, pp_allgather, True)
+            c, f, d = self._consensus_outcome(
+                to_process,
+                c,
+                f,
+                d,
+                pp_allgather,
+                True,
+                local_session_ids=local_session_ids,
+            )
         return c, f, d, timed_out
 
     def _collect_done(self, sessions: dict, reqs: dict):
@@ -392,12 +446,34 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 to_process.append(rid)
         return to_process
 
-    def _close_failed_sessions(self, sessions: dict, reqs: dict, failed: list):
-        for rid in failed:
+    @staticmethod
+    def _append_missing(target: list, request_ids: list) -> list:
+        seen = set(target)
+        for rid in request_ids:
+            if rid not in seen:
+                target.append(rid)
+                seen.add(rid)
+        return target
+
+    @staticmethod
+    def _close_sessions_with_error(
+        sessions: dict, reqs: dict, request_ids: list, cancel_first: bool = False
+    ) -> list:
+        """Mark requests DISAGG_TRANS_ERROR and close/delete their sessions.
+
+        Callers pass disjoint outcome classes from the same poll, so every rid
+        is expected to still be present.
+        """
+        closed = []
+        for rid in request_ids:
+            if cancel_first:
+                sessions[rid].cancel()
             reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
             sessions[rid].close()
             del reqs[rid]
             del sessions[rid]
+            closed.append(rid)
+        return closed
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
@@ -496,15 +572,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs[rid] = req
 
     def check_context_transfer_status(
-        self, at_least_request_num: Optional[int], mark_complete: bool = False
+        self,
+        at_least_request_num: Optional[int],
+        mark_complete: bool = False,
+        collect_kv_transfer_events: bool = False,
     ):
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
+        poll_only = wait_num == 0 and not block_all
 
         local_completed, local_failed = self._collect_done(self._send_sessions, self._send_reqs)
+        context_ready_ids = self._ctx_consensus(local_completed + local_failed)
+        self._append_missing(context_ready_ids, local_failed)
         to_process = self._build_to_process(
             self._send_sessions,
-            self._ctx_consensus(local_completed + local_failed),
+            context_ready_ids,
             wait_num,
             block_all,
         )
@@ -512,11 +594,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         completed, timed_out, failed, cancelled = [], [], [], []
         for rid in to_process:
             session = self._send_sessions[rid]
-            result = session.wait_complete()
+            if session.status == SessionStatus.CANCELLED:
+                cancelled.append(rid)
+                continue
+            if session.status == SessionStatus.ERROR:
+                failed.append(rid)
+                continue
+            result = session.wait_complete(blocking=not poll_only)
             if session.status == SessionStatus.CANCELLED:
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 completed.append(rid)
+            elif result is None:
+                continue
             elif result == WaitResult.TIMEOUT:
                 logger.warning(
                     f"TxSession rid={session.disagg_request_id} timed out after {self._sender_future_timeout_ms}ms"
@@ -528,13 +618,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
         cancelled, failed, completed, timed_out = self._ctx_consensus_outcome(
-            to_process, cancelled, failed, completed, timed_out
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            timed_out,
+            local_session_ids=list(self._send_sessions),
         )
 
-        for rid in cancelled:
-            self._send_sessions[rid].close()
-            del self._send_reqs[rid]
-            del self._send_sessions[rid]
+        cancelled_failed = self._close_sessions_with_error(
+            self._send_sessions, self._send_reqs, cancelled
+        )
 
         for rid in completed:
             if mark_complete:
@@ -542,22 +636,60 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._send_sessions[rid].close()
             del self._send_reqs[rid]
             del self._send_sessions[rid]
-        self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
+        closed_failed = self._close_sessions_with_error(
+            self._send_sessions, self._send_reqs, failed, cancel_first=True
+        )
 
         # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
-        return completed, failed
+        failed_for_return = list(dict.fromkeys(closed_failed + cancelled_failed))
+        success_events, error_events = self._collect_transfer_events(
+            collect_kv_transfer_events,
+            completed,
+            failed_for_return,
+            self._take_context_kv_transfer_error_events,
+            deferred_request_ids=set(self._send_sessions),
+        )
+        return completed, failed_for_return, success_events, error_events
 
-    def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
+    def _collect_transfer_events(
+        self,
+        collect_kv_transfer_events: bool,
+        completed: List[int],
+        failed_for_return: List[int],
+        take_buffered_error_events: Callable,
+        deferred_request_ids: set,
+    ):
+        if not collect_kv_transfer_events:
+            return [], []
+        success_events = self._ranked_events(completed)
+        buffered_error_events = take_buffered_error_events(
+            deferred_request_ids=deferred_request_ids
+        )
+        buffered_error_event_set = set(buffered_error_events)
+        error_events = buffered_error_events + [
+            event
+            for event in self._ranked_events(failed_for_return)
+            if event not in buffered_error_event_set
+        ]
+        return success_events, error_events
+
+    def check_gen_transfer_status(
+        self,
+        at_least_request_num: Optional[int],
+        collect_kv_transfer_events: bool = False,
+    ):
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        generation_ready_ids = self._gen_consensus(local_completed + local_failed)
+        self._append_missing(generation_ready_ids, local_failed)
         to_process = self._build_to_process(
             self._recv_sessions,
-            self._gen_consensus(local_completed + local_failed),
+            generation_ready_ids,
             wait_num,
             block_all,
         )
@@ -565,12 +697,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         completed, failed, cancelled = [], [], []
         for rid in to_process:
             session = self._recv_sessions[rid]
+            if session.status == SessionStatus.CANCELLED:
+                cancelled.append(rid)
+                continue
+            if session.status == SessionStatus.ERROR:
+                failed.append(rid)
+                continue
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
-                # Session cancelled — either by local cancel_request() (user
-                # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
-                # server timeout).  Return the req objects so the caller can
-                # distinguish the two cases and set the appropriate state.
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 completed.append(rid)
@@ -580,15 +714,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
         cancelled, failed, completed = self._gen_consensus_outcome(
-            to_process, cancelled, failed, completed
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            local_session_ids=list(self._recv_sessions),
         )
 
-        cancelled_reqs = []
-        for rid in cancelled:
-            cancelled_reqs.append(self._recv_reqs[rid])
-            self._recv_sessions[rid].close()
-            del self._recv_reqs[rid]
-            del self._recv_sessions[rid]
+        cancelled_failed = self._close_sessions_with_error(
+            self._recv_sessions, self._recv_reqs, cancelled
+        )
 
         for rid in completed:
             session = self._recv_sessions[rid]
@@ -599,12 +734,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
-        self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
+        closed_failed = self._close_sessions_with_error(
+            self._recv_sessions, self._recv_reqs, failed, cancel_first=True
+        )
 
-        return completed, failed, cancelled_reqs
+        failed_for_return = list(dict.fromkeys(closed_failed + cancelled_failed))
+        success_events, error_events = self._collect_transfer_events(
+            collect_kv_transfer_events,
+            completed,
+            failed_for_return,
+            self._take_generation_kv_transfer_error_events,
+            deferred_request_ids=set(self._recv_sessions),
+        )
+        return completed, failed_for_return, success_events, error_events
 
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
+
+    def has_pending_gen_transfer(self, req: LlmRequest) -> bool:
+        rid = get_unique_rid(req)
+        return rid in self._recv_sessions
 
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
@@ -640,6 +789,57 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if has_transferring:
             return False  # mid-write; caller must retry
         return True
+
+    def take_context_kv_transfer_event_report(self, req: LlmRequest) -> bool:
+        return not getattr(req, "py_kv_transfer_timed_out", False) or getattr(
+            req, "py_should_report_kv_transfer_failure_event", False
+        )
+
+    def record_context_kv_transfer_failure_event(self, req: LlmRequest) -> None:
+        rid = get_unique_rid(req)
+        if rid is not None:
+            self._context_kv_transfer_error_events.append((self._mapping.rank, int(rid)))
+
+    def record_generation_kv_transfer_failure_event(self, req: LlmRequest) -> None:
+        rid = get_unique_rid(req)
+        if rid is not None:
+            self._generation_kv_transfer_error_events.append((self._mapping.rank, int(rid)))
+
+    def _ranked_events(self, request_ids: List[int]) -> list[tuple[int, int]]:
+        return [(self._mapping.rank, int(request_id)) for request_id in request_ids]
+
+    @staticmethod
+    def _take_kv_transfer_error_events(
+        events: list[tuple[int, int]], deferred_request_ids: Optional[set[int]]
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        if not deferred_request_ids:
+            return events, []
+        ready_events = []
+        deferred_events = []
+        for event in events:
+            if int(event[1]) in deferred_request_ids:
+                deferred_events.append(event)
+            else:
+                ready_events.append(event)
+        return ready_events, deferred_events
+
+    def _take_context_kv_transfer_error_events(
+        self, deferred_request_ids: Optional[set[int]] = None
+    ) -> list[tuple[int, int]]:
+        events, deferred_events = self._take_kv_transfer_error_events(
+            self._context_kv_transfer_error_events, deferred_request_ids
+        )
+        self._context_kv_transfer_error_events = deferred_events
+        return events
+
+    def _take_generation_kv_transfer_error_events(
+        self, deferred_request_ids: Optional[set[int]] = None
+    ) -> list[tuple[int, int]]:
+        events, deferred_events = self._take_kv_transfer_error_events(
+            self._generation_kv_transfer_error_events, deferred_request_ids
+        )
+        self._generation_kv_transfer_error_events = deferred_events
+        return events
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
         # Keep this aligned with fields populated in respond_and_send_async().

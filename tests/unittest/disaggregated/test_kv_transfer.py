@@ -89,6 +89,31 @@ def test_token_range_invalid_start_ge_end():
         TokenRange(start=10, end=3)
 
 
+def test_tx_session_wait_complete_nonblocking_does_not_wait_on_pending_task():
+    class FakeTask:
+        status = transfer_mod.TaskStatus.TRANSFERRING
+
+        def __init__(self):
+            self.wait_calls = []
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            return True
+
+    task = FakeTask()
+    session = transfer_mod.TxSession.__new__(transfer_mod.TxSession)
+    session._timeout_s = 0.25
+    session._need_aux = False
+    session._terminal_status = None
+    session._exception = None
+    session.receiver_ready = True
+    session.kv_tasks = [task]
+    session.aux_task = None
+
+    assert session.wait_complete(blocking=False) is None
+    assert task.wait_calls == []
+
+
 def test_layer_range_valid():
     lr = LayerRange(start=0, end=32)
     assert lr.start == 0

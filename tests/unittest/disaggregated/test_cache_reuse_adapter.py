@@ -16,6 +16,7 @@
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm._torch.disaggregation.base.transfer import TokenRange
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
@@ -97,6 +98,143 @@ class TestAlignKvBlocks:
         )
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [20, 21])
+
+
+# ---------------------------------------------------------------------------
+# V1 physical block IDs backed by the host-cache offset snapshot.
+# ---------------------------------------------------------------------------
+
+
+class _HostOffsetCopyImpl:
+    def __init__(self, encoded_offsets: tuple[int, ...]) -> None:
+        self._encoded_offsets = torch.tensor(encoded_offsets, dtype=torch.int64)
+        self.copy_calls = 0
+        self.last_destination: torch.Tensor | None = None
+
+    def copy_batch_block_offsets(
+        self, dst_tensor: torch.Tensor, request_ids: list[int], beam_width: int, offset: int
+    ) -> None:
+        assert request_ids == [123]
+        assert beam_width == 1
+        assert offset == 0
+        self.copy_calls += 1
+        self.last_destination = dst_tensor
+        dst_tensor[0, offset, 0, : self._encoded_offsets.numel()] = self._encoded_offsets
+
+
+class _V1HostCacheManager:
+    enable_block_reuse = True
+    tokens_per_block = 32
+    kv_factor = 2
+
+    def __init__(
+        self,
+        logical_block_ids: tuple[int, ...],
+        encoded_offsets: tuple[int, ...],
+        *,
+        blocks_in_secondary_pool: int = 0,
+        blocks_per_window: dict[object | None, tuple[int, int]] | None = None,
+    ) -> None:
+        self.blocks_in_secondary_pool = blocks_in_secondary_pool
+        self.blocks_per_window = blocks_per_window
+        self.kv_cache_pool_mapping = {
+            0: torch.tensor([0]),
+            1: torch.tensor([0]),
+        }
+        width = len(logical_block_ids)
+        self.host_kv_cache_block_offsets = torch.arange(3 * 2 * width, dtype=torch.int64).reshape(
+            1, 3, 2, width
+        )
+        self.impl = _HostOffsetCopyImpl(encoded_offsets)
+        self._logical_block_ids = list(logical_block_ids)
+
+    def get_batch_cache_indices(
+        self,
+        request_ids: list[int],
+        layer_idx: int | None = None,
+        beam_width: int = 1,
+    ) -> list[list[int]]:
+        assert request_ids == [123]
+        assert layer_idx in (0, 1)
+        assert beam_width == 1
+        return [self._logical_block_ids]
+
+
+def _v1_host_cache_request(prompt_len: int) -> "_FakeReq":
+    req = _FakeReq(prompt_len=prompt_len)
+    req.py_request_id = 123
+    req.py_beam_width = 1
+    return req
+
+
+class TestV1PhysicalBlockIds:
+    @pytest.mark.parametrize(
+        ("blocks_in_secondary_pool", "blocks_per_window"),
+        [
+            (16, None),
+            (0, {None: (32, 16)}),
+        ],
+        ids=["secondary-pool-count", "blocks-per-window"],
+    )
+    def test_decodes_from_owned_host_offset_snapshot(
+        self,
+        blocks_in_secondary_pool: int,
+        blocks_per_window: dict[object | None, tuple[int, int]] | None,
+    ) -> None:
+        mgr = _V1HostCacheManager(
+            (1000, 1001, 1002, 1003),
+            (14, 16, 18, 20),
+            blocks_in_secondary_pool=blocks_in_secondary_pool,
+            blocks_per_window=blocks_per_window,
+        )
+        shared_offsets_before = mgr.host_kv_cache_block_offsets.clone()
+        req = _v1_host_cache_request(prompt_len=128)
+        adapter = _CacheReuseAdapterV1(mgr)
+
+        adapter.begin_kv_slice(req)
+        try:
+            block_ids = adapter.get_block_ids(req, 0, _lg())
+        finally:
+            adapter.end_kv_slice(req)
+
+        np.testing.assert_array_equal(block_ids, [7, 8, 9, 10])
+        assert mgr.impl.copy_calls == 1
+        assert mgr.impl.last_destination is not mgr.host_kv_cache_block_offsets
+        assert torch.equal(mgr.host_kv_cache_block_offsets, shared_offsets_before)
+
+    def test_reuses_snapshot_across_layer_groups(self) -> None:
+        mgr = _V1HostCacheManager(
+            (1000, 1001),
+            (22, 24),
+            blocks_per_window={None: (32, 16)},
+        )
+        req = _v1_host_cache_request(prompt_len=64)
+        adapter = _CacheReuseAdapterV1(mgr)
+        second_layer_group = AttentionLayerGroup(
+            pool_group_idx=0,
+            sliding_window_size=None,
+            local_layers=[LocalLayer(local_layer_id=1, global_layer_id=1)],
+        )
+
+        adapter.begin_kv_slice(req)
+        try:
+            first = adapter.get_block_ids(req, 0, _lg())
+            second = adapter.get_block_ids(req, 1, second_layer_group)
+        finally:
+            adapter.end_kv_slice(req)
+
+        assert mgr.impl.copy_calls == 1
+        np.testing.assert_array_equal(first, [11, 12])
+        np.testing.assert_array_equal(second, [11, 12])
+
+    def test_skips_decode_without_secondary_pool(self) -> None:
+        mgr = _V1HostCacheManager((3, 4, 5), (14, 16, 18))
+        req = _v1_host_cache_request(prompt_len=96)
+
+        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids(req, 0, _lg())
+
+        assert mgr.impl.copy_calls == 0
+        np.testing.assert_array_equal(block_ids, [3, 4, 5])
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,14 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
+def indexer_k_cache_enabled(kv_cache_manager: KVCacheManager) -> bool:
+    """V1 managers expose the flag either directly or on the C++ impl."""
+    enabled = getattr(kv_cache_manager, "enable_indexer_k_cache", None)
+    if enabled is None:
+        enabled = getattr(getattr(kv_cache_manager, "impl", None), "enable_indexer_k_cache", False)
+    return bool(enabled)
+
+
 def _build_layer_group_for_mamba(
     manager: MambaHybridCacheManager, pool_group_idx: int
 ) -> MambaLayerGroup:
@@ -197,7 +205,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         pool_views = [kv_view]
 
         # Indexer K cache support
-        if getattr(kv_cache_manager, "enable_indexer_k_cache", False):
+        if indexer_k_cache_enabled(kv_cache_manager):
             indexer_pool = kv_cache_manager.impl.get_indexer_k_cache_pool()
             # indexer_pool shape: (numBlocks, numLayers, kvFactor, blockSize), dtype=UINT8
             # slot_bytes = numLayers * kvFactor * blockSize * element_size

@@ -36,6 +36,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
+from .cache_transceiver_runtime import is_python_cache_transceiver_runtime
 from .config_utils import is_hybrid_linear
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -642,10 +643,10 @@ def create_py_executor(
     if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
             cache_transceiver_config is not None
             and cache_transceiver_config.backend is not None
-            and cache_transceiver_config.transceiver_runtime == "PYTHON"):
+            and is_python_cache_transceiver_runtime(cache_transceiver_config)):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when disagg + Python transceiver enabled"
-        )
+            "Disabling block reuse for MambaHybridCacheManager-based models "
+            "when disagg + Python-style transceiver enabled")
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                        False)
@@ -861,7 +862,7 @@ def create_py_executor(
         if is_disagg and is_hybrid:
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
             # no effect in disagg. The disagg manager choice is driven solely
-            # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
+            # by transceiver_runtime: PYTHON/B10 => PythonMambaCacheManager,
             # otherwise CppMambaCacheManager. Clear the var here so the
             # mutual-exclusion check in use_cpp_mamba_cache_manager() does
             # not fire after we force TRTLLM_USE_CPP_MAMBA=1 below.
@@ -869,6 +870,7 @@ def create_py_executor(
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
                     "use cache_transceiver_config.transceiver_runtime='PYTHON' "
+                    "or 'B10' "
                     "to select PythonMambaCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "

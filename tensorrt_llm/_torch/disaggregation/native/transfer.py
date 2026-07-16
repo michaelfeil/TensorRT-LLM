@@ -7,7 +7,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -45,7 +45,6 @@ from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
-from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -159,10 +158,22 @@ class SendTaskBase:
         self.status = TaskStatus.INIT
         self._event = threading.Event()
         self._exception: Optional[Exception] = None
+        self._agent_statuses: list[object] = []
+        self._cancel_requested = False
         self.lock = threading.Lock()
         self._params = params
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
+
+    @staticmethod
+    def _cancel_agent_status(agent_status: object) -> None:
+        cancel = getattr(agent_status, "cancel", None)
+        if cancel is None:
+            return
+        try:
+            cancel()
+        except Exception as exc:
+            logger.warning(f"Failed to cancel transfer status: {exc}")
 
     def fail(self, exc: Exception) -> None:
         self._exception = exc
@@ -176,6 +187,34 @@ class SendTaskBase:
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Block until terminal state. Returns True if done, False on timeout."""
         return self._event.wait(timeout=timeout)
+
+    def set_agent_status(self, agent_status: object) -> None:
+        should_cancel = False
+        with self.lock:
+            self._agent_statuses.append(agent_status)
+            should_cancel = self._cancel_requested
+        if should_cancel:
+            self._cancel_agent_status(agent_status)
+
+    def clear_agent_status(self, agent_status: object) -> None:
+        with self.lock:
+            try:
+                self._agent_statuses.remove(agent_status)
+            except ValueError:
+                # Clearing is idempotent: tolerate a status that was
+                # already removed so overlapping teardown paths stay safe.
+                pass
+
+    def cancel_agent_transfer(self) -> None:
+        with self.lock:
+            self._cancel_requested = True
+            agent_statuses = list(self._agent_statuses)
+        for agent_status in agent_statuses:
+            self._cancel_agent_status(agent_status)
+
+    def finish_cancelled_transfer(self, exc: Exception) -> None:
+        if not self.is_done:
+            self.fail(exc)
 
     @property
     def is_done(self) -> bool:
@@ -233,6 +272,13 @@ class Sender(SenderBase):
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
+        # Agents that can ingest descriptor arrays directly (B10) expose a
+        # side-channel submit; hand them the (ptrs, sizes, device) columns we
+        # already hold so they skip the per-item walk of the C++ MemoryDescs.
+        # Probed once, like set_incoming_write_listener; None for NIXL/others.
+        self._submit_with_desc_arrays = getattr(
+            agent, "submit_transfer_requests_with_desc_arrays", None
+        )
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -417,7 +463,14 @@ class Sender(SenderBase):
 
     @staticmethod
     @nvtx_range("_make_agent_request")
-    def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
+    def _make_agent_request(
+        write_meta: WriteMeta,
+        device_id: int,
+        sync_message: Optional[str] = None,
+    ) -> tuple["TransferRequest", int, int]:
+        """Build the TransferRequest; also return (src_dev, dst_dev) so the
+        caller can offer the descriptor arrays to a side-channel-capable
+        agent without re-deriving the devices."""
         if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
             raise ValueError(
                 f"Pointer/size mismatch for unique_rid={write_meta.unique_rid}: "
@@ -450,9 +503,42 @@ class Sender(SenderBase):
         # NOTE: TransferRequest moves (not copies) src/dst MemoryDescs internally.
         # After this call, src_memory_descs and dst_memory_descs are in a moved-from
         # state and must NOT be accessed again.
-        return TransferRequest(
-            TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, None
+        request = TransferRequest(
+            TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, sync_message
         )
+        return request, src_dev, dst_dev
+
+    def _submit_and_wait_agent_write(self, task, write_meta: WriteMeta) -> bool:
+        """Submit write_meta to the transfer agent and wait for completion.
+
+        Registers the agent status on the task for the duration of the wait so
+        cancel_agent_transfer() can reach an in-flight transfer. Returns True
+        on success.
+        """
+        sync_message = (
+            str(int(write_meta.unique_rid))
+            if getattr(self._agent, "supports_request_sync_message_metadata", False)
+            else None
+        )
+        request, src_dev, dst_dev = Sender._make_agent_request(
+            write_meta, device_id=self._device_id, sync_message=sync_message
+        )
+        if self._submit_with_desc_arrays is not None:
+            # WriteMeta arrays are never mutated once built, so the agent
+            # may alias them (AUX `sizes` aliases the long-lived
+            # AuxBufferMeta.item_sizes, not a per-transfer copy).
+            transfer_status = self._submit_with_desc_arrays(
+                request,
+                (write_meta.src_ptrs, write_meta.sizes, src_dev),
+                (write_meta.dst_ptrs, write_meta.sizes, dst_dev),
+            )
+        else:
+            transfer_status = self._agent.submit_transfer_requests(request)
+        task.set_agent_status(transfer_status)
+        try:
+            return bool(transfer_status.wait())
+        finally:
+            task.clear_agent_status(transfer_status)
 
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
@@ -509,14 +595,16 @@ class Sender(SenderBase):
 
         agent_result = AgentResult.SUCCESS
         if write_meta.src_ptrs.size > 0:
-            request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
+            if not self._submit_and_wait_agent_write(task, write_meta):
                 agent_result = AgentResult.FAILED
                 task.fail(RuntimeError(f"KV transfer failed for request {write_meta.unique_rid}"))
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
+
+        if session.status == SessionStatus.CANCELLED:
+            agent_result = AgentResult.FAILED
 
         ## TODO: just last slice need to send task state?
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
@@ -534,6 +622,12 @@ class Sender(SenderBase):
             timer.record_task_end(write_meta.peer_rank)
         ri = self._registrar.self_rank_info
         task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
+
+        if session.status == SessionStatus.CANCELLED:
+            task.finish_cancelled_transfer(
+                RuntimeError(f"session {write_meta.unique_rid} cancelled, transfer aborted")
+            )
+            return
 
         with task.lock:
             task.transferred_count += 1
@@ -571,16 +665,43 @@ class Sender(SenderBase):
         if timer:
             timer.record_push_end(write_meta.peer_rank)
 
+        with session.lock:
+            status = session.status
+            if status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                should_abort = True
+            else:
+                aux_task.status = TaskStatus.TRANSFERRING
+                should_abort = False
+
+        if should_abort:
+            aux_task.finish_cancelled_transfer(
+                RuntimeError(
+                    f"session {write_meta.unique_rid} {status.value}, aux transfer aborted"
+                )
+            )
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+                [
+                    MessageType.AUX_AGENT_RESULT,
+                    str(self._instance_rank).encode("ascii"),
+                    str(write_meta.unique_rid).encode("ascii"),
+                    AgentResult.FAILED.value.encode("ascii"),
+                ]
+            )
+            return
+
         agent_result = AgentResult.SUCCESS
         if write_meta.src_ptrs.size > 0:
-            request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
+            if not self._submit_and_wait_agent_write(aux_task, write_meta):
                 agent_result = AgentResult.FAILED
-                session.set_exception("aux transfer agent request failed")
+                if session.status != SessionStatus.CANCELLED:
+                    session.set_exception("aux transfer agent request failed")
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
+
+        if session.status == SessionStatus.CANCELLED:
+            agent_result = AgentResult.FAILED
 
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
@@ -595,6 +716,12 @@ class Sender(SenderBase):
             timer.record_task_end(write_meta.peer_rank)
         ri = self._registrar.self_rank_info
         aux_task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
+
+        if session.status == SessionStatus.CANCELLED:
+            aux_task.finish_cancelled_transfer(
+                RuntimeError(f"session {write_meta.unique_rid} cancelled, aux transfer aborted")
+            )
+            return
 
         with aux_task.lock:
             aux_task._transfer_count += 1
@@ -1115,6 +1242,12 @@ class TxSession(TxSessionBase):
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
+        if (
+            self._exception is not None
+            or any(t.status == TaskStatus.ERROR for t in self.kv_tasks)
+            or (self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR)
+        ):
+            return SessionStatus.ERROR
         kv_all_transferred = bool(self.kv_tasks) and all(
             t.status == TaskStatus.TRANSFERRED for t in self.kv_tasks
         )
@@ -1172,7 +1305,8 @@ class TxSession(TxSessionBase):
     def cancel(self) -> None:
         """Cancel the session and notify the remote receiver.
 
-        Safe to call multiple times. TRANSFERRING tasks keep running (mid-write).
+        Safe to call multiple times. TRANSFERRING tasks request agent
+        cancellation and keep running (mid-write).
         Only INIT tasks have their events signalled immediately.
         The lock serializes with _deliver_kv_to_agent() so has_transferring_tasks()
         is accurate the moment this returns.
@@ -1184,24 +1318,49 @@ class TxSession(TxSessionBase):
             exc = RuntimeError(f"TxSession {self.disagg_request_id} cancelled")
             for task in self.kv_tasks:
                 if task.status == TaskStatus.INIT:
+                    task.cancel_agent_transfer()
                     task.fail(exc)
+                elif task.status == TaskStatus.TRANSFERRING:
+                    task.cancel_agent_transfer()
             if self.aux_task is not None and self.aux_task.status == TaskStatus.INIT:
+                self.aux_task.cancel_agent_transfer()
                 self.aux_task.fail(exc)
+            elif self.aux_task is not None and self.aux_task.status == TaskStatus.TRANSFERRING:
+                self.aux_task.cancel_agent_transfer()
         # Send outside the lock to avoid holding it during I/O.
         self._sender.send_cancel_to_receivers(self.disagg_request_id)
 
     def has_transferring_tasks(self) -> bool:
-        """True if any KV task is currently mid-write (TRANSFERRING).
+        """True if any KV or aux task is currently mid-write (TRANSFERRING).
 
         cancel_request() must return False while this is True.
         """
-        return any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks)
+        return any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks) or (
+            self.aux_task is not None and self.aux_task.status == TaskStatus.TRANSFERRING
+        )
 
-    def wait_complete(self) -> Optional[WaitResult]:
-        """Block until KV (and optionally aux) transfer finishes.
+    def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
+        """Poll or block until KV (and optionally aux) transfer finishes.
 
-        Returns WaitResult.COMPLETED, WaitResult.FAILED, or WaitResult.TIMEOUT.
+        With blocking=True (default): waits up to _timeout_s for each task.
+        With blocking=False: polls non-blockingly; returns None if any KV task
+        or aux is not yet done.
         """
+        if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            return WaitResult.FAILED
+        if not blocking:
+            for task in self.kv_tasks:
+                if task.status == TaskStatus.ERROR:
+                    return WaitResult.FAILED
+                if task.status != TaskStatus.TRANSFERRED:
+                    return None
+            if self._need_aux and self.aux_task is not None:
+                if self.aux_task.status == TaskStatus.ERROR:
+                    return WaitResult.FAILED
+                if self.aux_task.status != TaskStatus.TRANSFERRED:
+                    return None
+            return WaitResult.COMPLETED
+
         for task in self.kv_tasks:
             if not task.wait(timeout=self._timeout_s):
                 return WaitResult.TIMEOUT
@@ -1219,6 +1378,8 @@ class TxSession(TxSessionBase):
         if reason:
             msg += f": {reason}"
         with self.lock:
+            if self._terminal_status == SessionStatus.CANCELLED:
+                return
             self._exception = RuntimeError(msg)
             self._terminal_status = SessionStatus.ERROR
             for task in self.kv_tasks:
@@ -1325,6 +1486,13 @@ class Receiver(ReceiverBase):
         self._shutdown = False
 
         self._start_listener()
+        # Agents whose receive path observes incoming writes directly (B10)
+        # can complete receive tasks locally, without depending on the
+        # sender's KV_AGENT_RESULT notification surviving the network and the
+        # ZMQ listener thread. The notification still arrives and is deduped.
+        set_incoming_write_listener = getattr(agent, "set_incoming_write_listener", None)
+        if set_incoming_write_listener is not None:
+            set_incoming_write_listener(self._process_local_agent_result)
         logger.info(f"Receiver init with endpoint: {self._messenger.endpoint}")
 
     @property
@@ -1367,6 +1535,18 @@ class Receiver(ReceiverBase):
             logger.warning(f"RxSession {unique_rid} has been garbage collected")
             return None
         return session
+
+    def _process_local_agent_result(self, unique_rid: int, success: bool) -> None:
+        """Local completion signal from the transfer agent's own receive
+        path. Runs on the agent's event loop thread; must stay brief."""
+        session = self._get_session(unique_rid)
+        if session is None:
+            logger.debug(
+                f"_process_local_agent_result: session {unique_rid} not found, "
+                f"dropping local result"
+            )
+            return
+        session.process_local_kv_result(success)
 
     def _build_recv_req_info(self, task: KVRecvTask) -> RecvReqInfo:
         self_ri = self._registrar.self_rank_info
@@ -1664,6 +1844,34 @@ class RxSession(RxSessionBase):
         self._kv_tasks.append(task)
         self._receiver.dispatch_task(task)
 
+    def process_local_kv_result(self, success: bool) -> None:
+        """Complete the receive task from the local agent's own terminal
+        signal instead of the sender's KV_AGENT_RESULT notification.
+
+        Only the single-slice/single-transfer session shape is eligible: with
+        multiple slices or multiple expected transfers the local signal cannot
+        be attributed to a (slice, peer) pair, so those shapes keep the
+        notification path. The sender's notification still arrives afterwards
+        and is dropped by the task.is_done guard in process_kv_agent_result.
+        """
+        with self.lock:
+            if len(self._kv_tasks) != 1:
+                return
+            task = self._kv_tasks[0]
+            if task.expected_transfers != 1 or task.is_done:
+                return
+            if success:
+                task.last_slice_count += 1
+                task.complete()
+            else:
+                task.fail(
+                    RuntimeError(
+                        f"KV transfer failed for request {self.request_id} (local agent result)"
+                    )
+                )
+                if self._terminal_status is None:  # Don't overwrite CANCELLED with ERROR
+                    self._terminal_status = SessionStatus.ERROR
+
     def process_kv_agent_result(
         self, peer_rank: int, sender_slice_id: int, is_last_slice: bool, status: AgentResult
     ):
@@ -1674,6 +1882,11 @@ class RxSession(RxSessionBase):
                 f"Sender/receiver slice count mismatch."
             )
             task = self._kv_tasks[sender_slice_id]
+            if task.is_done:
+                # Already resolved, e.g. by process_local_kv_result; the
+                # sender's notification is redundant. Counting it again would
+                # push transferred counts past expected_transfers.
+                return
             if status == AgentResult.SUCCESS:
                 if is_last_slice:
                     task.last_slice_count += 1
@@ -1785,6 +1998,18 @@ class RxSession(RxSessionBase):
                     task.fail(exc)
         # Send outside the lock to avoid holding it during I/O.
         self._receiver.send_cancel_to_senders(self.disagg_request_id, self._sender_endpoints)
+
+    def fail_cancelled_transfers(self, exc: Exception) -> None:
+        """Fail cancelled receive tasks after agent-specific buffer safety is established."""
+        with self.lock:
+            if self._terminal_status != SessionStatus.CANCELLED:
+                return
+            for task in self._kv_tasks:
+                if task.status == TaskStatus.TRANSFERRING:
+                    task.fail(exc)
+            if self._need_aux and self._aux_status == TaskStatus.INIT:
+                self._aux_status = TaskStatus.ERROR
+                self._exception = exc
 
     def has_transferring_tasks(self) -> bool:
         """True if any KV task is currently mid-write (TRANSFERRING).
@@ -1911,7 +2136,9 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str) -> NixlTransferAgent:
+def _create_nixl_agent(name: str) -> BaseTransferAgent:
+    from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
+
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
@@ -1959,6 +2186,7 @@ class TransferWorkerConfig:
     max_draft_len: Optional[int] = None
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
+    agent_factory: Optional[Callable[[str], BaseTransferAgent]] = None
 
 
 class TransferWorker:
@@ -2023,7 +2251,8 @@ class TransferWorker:
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)
         CUASSERT(cudart.cudaSetDevice(self._config.device_id))
-        self._agent = _create_nixl_agent(
+        agent_factory = self._config.agent_factory or _create_nixl_agent
+        self._agent = agent_factory(
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )
         self._registered_mem: list = []
@@ -2040,6 +2269,12 @@ class TransferWorker:
             self._rank_info.self_endpoint = self._receiver.endpoint
         except Exception:
             self._finalizer()
+            shutdown = getattr(self._agent, "shutdown", None)
+            if shutdown is not None:
+                try:
+                    shutdown()
+                except Exception as exc:
+                    logger.warning(f"Transfer agent shutdown failed during setup cleanup: {exc}")
             raise
 
     def _register_kv_cache(self):
@@ -2101,6 +2336,10 @@ class TransferWorker:
         finalizer = getattr(self, "_finalizer", None)
         if finalizer is not None:
             finalizer()
+        agent = getattr(self, "_agent", None)
+        shutdown = getattr(agent, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
 
     def __del__(self):
         try:

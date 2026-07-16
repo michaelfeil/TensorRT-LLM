@@ -51,6 +51,64 @@ class DummyRankInfo:
         return 2 if not self.is_mla else 1
 
 
+class _FakePoolTensor:
+    def __init__(self, shape, element_size=1, data_ptr=0x100000):
+        self.shape = shape
+        self._element_size = element_size
+        self._data_ptr = data_ptr
+
+    def element_size(self):
+        return self._element_size
+
+    def data_ptr(self):
+        return self._data_ptr
+
+
+class _FakeIndexerImpl:
+    enable_indexer_k_cache = True
+
+    def get_primary_pool_data(self, layer_idx):
+        return _FakePoolTensor((8, 2, 64), element_size=2, data_ptr=0x100000)
+
+    def get_indexer_k_cache_pool(self):
+        return _FakePoolTensor((8, 4, 1, 4352), element_size=1, data_ptr=0x200000)
+
+
+class _FakeIndexerCacheManager:
+    dtype = DataType.HALF
+    tokens_per_block = 32
+    layer_offsets = {
+        0: 0,
+        1: 1,
+        2: 2,
+        3: 3,
+    }
+    kv_cache_pool_mapping = [np.array([0]) for _ in range(4)]
+    kv_cache_pool_pointers = [np.array([0x100000])]
+    num_kv_heads_per_layer = [8, 8, 8, 8]
+    kv_factor = 2
+    head_dim = 16
+    impl = _FakeIndexerImpl()
+
+    def _get_window_size_to_layers(self):
+        return {None: [0, 1, 2, 3]}
+
+
+def test_build_page_table_includes_impl_indexer_k_cache_pool():
+    page_table = build_page_table(_FakeIndexerCacheManager())
+
+    lg = page_table.layer_groups[0]
+    assert len(lg.pool_views) == 2
+
+    kv_view = next(pv for pv in lg.pool_views if len(pv.buffer_entries) > 0)
+    assert get_pool_role(kv_view, kv_factor=2) == PoolRole.KV_CACHE
+
+    indexer_view = next(pv for pv in lg.pool_views if len(pv.buffer_entries) == 0)
+    indexer_pool = get_physical_pool(page_table, 0, indexer_view.pool_idx)
+    assert indexer_pool.base_address == 0x200000
+    assert indexer_pool.slot_bytes == 4 * 1 * 4352
+
+
 @pytest.mark.cuda
 def test_extract():
     num_layers = 1

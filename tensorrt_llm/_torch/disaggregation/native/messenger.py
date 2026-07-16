@@ -86,6 +86,18 @@ class ZMQMessenger(MessengerInterface):
         self._context = zmq.Context()
         self._mode = mode
         self._socket = self._context.socket(self.SOCKET_MODES[mode])
+        # Control-plane messages are tiny (~100B) but must never block a
+        # delivery worker: when a peer's listener thread stalls (GIL-starved
+        # under load), TCP backpressure fills the default 1000-message send
+        # HWM and send_multipart() then blocks silently — the worker wedges
+        # after the KV write already succeeded, both sides' sessions never
+        # complete, and the transfer watchdog kills healthy requests 30s
+        # later. Unbounded HWMs keep sends non-blocking; SNDTIMEO turns any
+        # residual block into a raised zmq.Again that the delivery worker
+        # catches and converts to a fast, logged task failure.
+        self._socket.setsockopt(zmq.SNDHWM, 0)
+        self._socket.setsockopt(zmq.RCVHWM, 0)
+        self._socket.setsockopt(zmq.SNDTIMEO, 10000)
         self._endpoint: Optional[str] = None
         self._lock = Lock()
         self._closed = False

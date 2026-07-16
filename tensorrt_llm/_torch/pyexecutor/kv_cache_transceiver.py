@@ -9,6 +9,7 @@ from tensorrt_llm.bindings import WorldConfig
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
+from .cache_transceiver_runtime import is_python_cache_transceiver_runtime
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager)
@@ -29,6 +30,7 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
                        gpus_per_node=mapping.gpus_per_node,
                        device_ids=None,
                        enable_attention_dp=mapping.enable_attention_dp)
+
 
 def _normalize_cache_transceiver_backend(
         cache_transceiver_config: Optional[CacheTransceiverConfig]):
@@ -57,8 +59,8 @@ def _normalize_cache_transceiver_backend(
 def should_defer_kv_cache_secondary_pool_allocation(
         cache_transceiver_config: Optional[CacheTransceiverConfig]) -> bool:
     backend = _normalize_cache_transceiver_backend(cache_transceiver_config)
-    return (backend == "UCX" and cache_transceiver_config is not None
-            and cache_transceiver_config.transceiver_runtime != "PYTHON")
+    return (backend == "UCX" and cache_transceiver_config is not None and
+            not is_python_cache_transceiver_runtime(cache_transceiver_config))
 
 
 def create_kv_cache_transceiver(
@@ -69,22 +71,27 @@ def create_kv_cache_transceiver(
         cache_transceiver_config: CacheTransceiverConfig,
         mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
     backend = _normalize_cache_transceiver_backend(cache_transceiver_config)
+    if (cache_transceiver_config is not None
+            and cache_transceiver_config.transceiver_runtime == "B10"
+            and backend != "UCX"):
+        raise ValueError(
+            f"B10 transceiver requires cache_transceiver_config.backend='UCX', "
+            f"got {cache_transceiver_config.backend}.")
     if backend is None:
         logger.info("cache_transceiver is disabled")
         return None
 
-    if cache_transceiver_config.backend == "MPI":
-        logger.warning(
-            "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
-    elif cache_transceiver_config.backend == "UCX":
-        logger.info(
-            f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
-            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
-            f"hangs or lower-than-expected performance.")
-
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver
+    # transceiver_runtime == "B10" -> use UCXX-based Python transceiver
+    if cache_transceiver_config.transceiver_runtime == "B10":
+        from tensorrt_llm._torch.disaggregation.b10.transceiver import \
+            B10CacheTransceiver
+        logger.info("Using B10CacheTransceiver")
+        return B10CacheTransceiver(mapping, dist, kv_cache_manager,
+                                   cache_transceiver_config)
+
     if cache_transceiver_config.transceiver_runtime == "PYTHON":
         # Python transceiver currently only supports NIXL and DEFAULT backend
         if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
@@ -100,6 +107,15 @@ def create_kv_cache_transceiver(
                                     cache_transceiver_config)
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
+    if cache_transceiver_config.backend == "MPI":
+        logger.warning(
+            "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
+    elif cache_transceiver_config.backend == "UCX":
+        logger.info(
+            f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
+            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
+            f"hangs or lower-than-expected performance.")
+
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config,
                                   mamba_cache_manager)

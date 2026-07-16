@@ -31,6 +31,7 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
+from .cache_transceiver_runtime import is_python_cache_transceiver_runtime
 from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
                            is_hybrid_linear, is_mla, is_nemotron_hybrid,
                            is_qwen3_hybrid)
@@ -110,14 +111,13 @@ def get_kv_cache_manager_cls(
             return MixedMambaHybridCacheManager
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
+        if is_python_cache_transceiver_runtime(cache_transceiver_config):
+            logger.info("Python transceiver detected; using "
+                        "MixedMambaHybridCacheManager for hybrid mamba model")
+            return MixedMambaHybridCacheManager
         if use_cpp_mamba_cache_manager():
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
-        if (cache_transceiver_config is not None
-                and cache_transceiver_config.transceiver_runtime == "PYTHON"):
-            logger.info("Python transceiver detected; using "
-                        "MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager
         default_cls = CppMambaHybridCacheManager
         env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)

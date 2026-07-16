@@ -152,9 +152,10 @@
     {
       "allowed_values": [
         "CPP",
-        "PYTHON"
+        "PYTHON",
+        "B10"
       ],
-      "annotation": "Optional[Literal['CPP', 'PYTHON']]",
+      "annotation": "Optional[Literal['CPP', 'PYTHON', 'B10']]",
       "converter": "",
       "kind": "categorical",
       "path": "cache_transceiver_config.transceiver_runtime"
@@ -2485,9 +2486,10 @@
     {
       "allowed_values": [
         "CPP",
-        "PYTHON"
+        "PYTHON",
+        "B10"
       ],
-      "annotation": "Optional[Literal['CPP', 'PYTHON']]",
+      "annotation": "Optional[Literal['CPP', 'PYTHON', 'B10']]",
       "converter": "",
       "kind": "categorical",
       "path": "cache_transceiver_config.transceiver_runtime"
