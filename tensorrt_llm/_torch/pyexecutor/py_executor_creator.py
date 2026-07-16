@@ -40,7 +40,8 @@ from .config_utils import is_hybrid_linear
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
-from .kv_cache_transceiver import should_defer_kv_cache_secondary_pool_allocation
+from .kv_cache_transceiver import \
+    should_defer_kv_cache_secondary_pool_allocation
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -790,6 +791,15 @@ def create_py_executor(
                 "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
             )
 
+        if spec_config is not None and not spec_config.is_linear_tree:
+            raise NotImplementedError(
+                "KV connector is not supported with non-linear-tree speculative"
+                " decoding (e.g. Eagle with static or dynamic draft trees)."
+                " External connector behavior with non-linear draft trees"
+                " (block save/load semantics across rewind that frees blocks"
+                " at tree boundaries) is not yet validated. Linear-tree"
+                " specdec (MTP, linear Eagle) is supported.")
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -1009,7 +1019,8 @@ def create_py_executor(
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
-            allocate_kv_cache_secondary_pools=allocate_initial_kv_cache_secondary_pools,
+            allocate_kv_cache_secondary_pools=
+            allocate_initial_kv_cache_secondary_pools,
         )
 
     # Originally, peft_cache_config might be mutated inside
@@ -1089,7 +1100,8 @@ def create_py_executor(
                 virtual_memory_pools=vm_pools,
                 execution_stream=execution_stream,
                 dwdp_manager=dwdp_manager,
-                allocate_kv_cache_secondary_pools=allocate_final_deferred_secondary_kv_pools,
+                allocate_kv_cache_secondary_pools=
+                allocate_final_deferred_secondary_kv_pools,
             )
 
     _adjust_torch_mem_fraction()

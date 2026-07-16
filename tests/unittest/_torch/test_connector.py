@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 
 import pickle
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import cloudpickle
 import mpi4py
@@ -26,6 +26,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager,
     KvCacheConnectorSchedulerOutputManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
+                                                             KVCacheManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -250,3 +252,147 @@ def test_scheduler_output_block_hashes_read_through():
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
     for call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
         assert call.args == (req, )
+
+
+def test_scheduler_output_on_rewind_trims_stale_block_ids():
+    """``on_rewind`` re-syncs block_ids after specdec rewind frees blocks.
+
+    Covers the full cycle:
+      1. Build with blocks [0, 1, 2] (accepted + draft tokens).
+      2. Rewind frees block 2 → on_rewind trims block_ids to [0, 1].
+      3. Next step allocates a new block 3 → build_scheduler_output must emit
+         new_block_ids == [3] and still emit accepted new_tokens.
+
+    Also verifies that ``on_rewind`` does NOT extend ``tokens`` when the
+    request's token list grew (accepted tokens added by sampling before
+    rewind).  Extending would suppress those tokens from the next
+    ``new_tokens`` delta.
+    """
+    kv_cache_manager = MagicMock()
+
+    req = MagicMock()
+    req.request_id = 42
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_draft_tokens = []
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    # Step 1: normal build — blocks [0, 1, 2], tokens [1..5]
+    req.get_tokens.return_value = [1, 2, 3, 4, 5]
+    kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
+                                   kv_cache_manager)
+    req_state = manager.requests[42]
+    assert req_state.block_ids == [0, 1, 2]
+    assert req_state.tokens == [1, 2, 3, 4, 5]
+
+    # Step 2: sampling accepted 1 draft token (token 6) then rewind freed
+    # block 2.  req.get_tokens now includes the accepted token [1..6],
+    # but live cache indices shrank to [0, 1].
+    req.get_tokens.return_value = [1, 2, 3, 4, 5, 6]
+    kv_cache_manager.get_cache_indices.return_value = [0, 1]
+    manager.on_rewind(req, kv_cache_manager)
+
+    # block_ids trimmed to live indices
+    assert req_state.block_ids == [0, 1], \
+        f"Expected [0, 1] after rewind, got {req_state.block_ids}"
+    # tokens NOT extended — accepted token 6 must still be emitted as new
+    assert req_state.tokens == [1, 2, 3, 4, 5], \
+        f"on_rewind must not extend tokens; got {req_state.tokens}"
+
+    # Step 3: next step allocates new block 3 for the accepted token.
+    # build_scheduler_output must emit new_block_ids == [3] and
+    # new_tokens == [6] (the accepted token not yet reported).
+    kv_cache_manager.get_cache_indices.return_value = [0, 1, 3]
+    output3 = manager.build_scheduler_output(scheduled_batch,
+                                             AsyncRequests({}, {}),
+                                             kv_cache_manager)
+    cached = output3.cached_requests[0]
+    assert cached.new_block_ids == [3], \
+        f"Expected new_block_ids == [3], got {cached.new_block_ids}"
+    assert cached.new_tokens == [6], \
+        f"Expected accepted token 6 in new_tokens, got {cached.new_tokens}"
+
+
+def _make_kv_cache_manager_for_update_resources(is_draft: bool):
+    manager = object.__new__(KVCacheManager)
+    manager.kv_cache_type = CacheTypeCpp.SELF
+    manager.is_draft = is_draft
+    manager.kv_connector_manager = MagicMock()
+    manager._kv_reserve_draft_tokens = 0
+    manager.rewind_kv_cache = MagicMock()
+    return manager
+
+
+def _make_generation_request_for_rewind(rewind_len: int):
+    req = MagicMock()
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_rewind_len = rewind_len
+    req.py_num_accepted_draft_tokens = 0
+    return req
+
+
+def test_update_resources_notifies_connector_only_from_target_kv_manager():
+    req = _make_generation_request_for_rewind(rewind_len=1)
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = _make_kv_cache_manager_for_update_resources(is_draft=False)
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2._update_kv_cache_draft_token_location"
+    ):
+        manager.update_resources(scheduled_batch)
+
+    manager.rewind_kv_cache.assert_called_once_with(req, 1)
+    manager.kv_connector_manager.on_rewind.assert_called_once_with(req, manager)
+
+
+def test_update_resources_draft_kv_manager_does_not_notify_connector():
+    req = _make_generation_request_for_rewind(rewind_len=1)
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = _make_kv_cache_manager_for_update_resources(is_draft=True)
+    manager._kv_reserve_draft_tokens = 2
+
+    manager.update_resources(scheduled_batch)
+
+    assert manager.rewind_kv_cache.call_count == 2
+    manager.rewind_kv_cache.assert_any_call(req, 1)
+    manager.kv_connector_manager.on_rewind.assert_not_called()
+
+
+def test_connector_manager_on_rewind_forwards_to_scheduler():
+    """KvCacheConnectorManager.on_rewind must forward live_block_ids to the
+    external scheduler on rank 0."""
+    worker = MagicMock()
+    scheduler = MagicMock()
+
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+    req = MagicMock()
+    req.request_id = 42
+    req.get_tokens.return_value = [1, 2, 3]
+
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0, 1]
+
+    req_state = manager.scheduler_output_manager.requests[42]
+    req_state.block_ids = [0, 1, 2]
+    req_state.tokens = [1, 2, 3, 4]
+
+    manager.on_rewind(req, kv_cache_manager)
+
+    assert req_state.block_ids == [0, 1]
+    assert req_state.tokens == [1, 2, 3]
+
+    # scheduler.on_rewind must be called with the post-rewind live block ids.
+    scheduler.on_rewind.assert_called_once()
+    forwarded_req, forwarded_ids = scheduler.on_rewind.call_args.args
+    assert forwarded_req is req
+    assert forwarded_ids == [0, 1]
