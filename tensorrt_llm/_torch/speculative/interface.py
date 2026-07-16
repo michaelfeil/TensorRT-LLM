@@ -234,6 +234,12 @@ class SpeculativeDecodingMode(IntEnum):
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
     DFLASH = auto()
+    # Baseten's custom DFlash implementation (originally named "Dflash").
+    # Kept alongside the upstream DFLASH mode above.
+    BASETEN_DFLASH_ONE_MODEL = auto()
+    # DSpark (arXiv 2026, DeepSeek): BasetenDFlash parallel backbone plus a
+    # sequential Markov logit-bias head and a per-position confidence head.
+    BASETEN_DSPARK_ONE_MODEL = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -260,13 +266,32 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_external_drafter() or self.is_sa()
 
     def is_eagle3_one_model(self):
-        return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+        # Baseten's custom DFlash reuses the Eagle3 one-model pipeline
+        # (metadata/resource manager/sampler), so it is treated as an
+        # Eagle3 one-model mode here.
+        return (self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+                or self.is_baseten_dflash_one_model())
 
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
 
     def is_dflash(self):
         return self == SpeculativeDecodingMode.DFLASH
+
+    def is_dflash_one_model(self):
+        # Name probed via getattr by merged-master call sites
+        # (modeling_speculative extra-attr merge); alias of the
+        # BASETEN_-prefixed predicate below.
+        return self.is_baseten_dflash_one_model()
+
+    def is_baseten_dflash_one_model(self):
+        # DSpark shares the whole BasetenDFlash pipeline (block KV sizing,
+        # sampler block_size, separate draft KV cache), so it matches here.
+        return (self == SpeculativeDecodingMode.BASETEN_DFLASH_ONE_MODEL
+                or self == SpeculativeDecodingMode.BASETEN_DSPARK_ONE_MODEL)
+
+    def is_baseten_dspark_one_model(self):
+        return self == SpeculativeDecodingMode.BASETEN_DSPARK_ONE_MODEL
 
     def is_parallel_draft(self):
         return self.is_pard() or self.is_dflash()
@@ -475,6 +500,8 @@ class SpecMetadata:
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
+    embedding_bias: Optional[torch.Tensor] = None
+    embedding_bias_dtype: Optional[torch.dtype] = None
     # Whether top-k/top-p/temperature are globally disabled for the current batch.
     skip_temperature: bool = False
     skip_top_k: bool = False
@@ -651,6 +678,19 @@ class SpecMetadata:
         has_greedy_requests = False
         per_request_slot_ids: list[int] = []
 
+        row_offset = 0
+        if self.vocab_size > 0:
+            if self.embedding_bias is None:
+                self.embedding_bias = torch.zeros(
+                    (self.max_draft_len + 1) * self.max_num_requests,
+                    self.vocab_size,
+                    dtype=self.embedding_bias_dtype or torch.float32,
+                    device='cuda')
+            used_rows = sum(1 + self.runtime_draft_len if request.state ==
+                            LlmRequestState.GENERATION_IN_PROGRESS else 1
+                            for request in requests)
+            self.embedding_bias[:used_rows].zero_()
+
         for request in requests:
             sampling_config = request.sampling_config
             temp_val = getattr(request, "py_dynamic_temperature_override", None)
@@ -661,6 +701,23 @@ class SpecMetadata:
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+
+            bias_1d = getattr(request, "_py_embedding_bias_1d", None)
+            if self.embedding_bias is not None and bias_1d is not None:
+                # upload once; per-step fill is device-to-device
+                dev_bias = getattr(request, "_py_embedding_bias_dev", None)
+                if dev_bias is None:
+                    if bias_1d.shape[-1] != self.embedding_bias.shape[1]:
+                        raise ValueError(
+                            f"logit_bias vocab {bias_1d.shape[-1]} != model vocab "
+                            f"{self.embedding_bias.shape[1]}")
+                    dev_bias = bias_1d.to(device='cuda',
+                                          dtype=self.embedding_bias.dtype,
+                                          non_blocking=True)
+                    request._py_embedding_bias_dev = dev_bias
+                self.embedding_bias[row_offset:row_offset +
+                                    num_tokens].copy_(dev_bias)
+            row_offset += num_tokens
 
             (
                 temp_val,
@@ -931,9 +988,8 @@ class SpecWorkerBase(nn.Module, ABC):
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
         )
-        self.use_flashinfer = (IS_FLASHINFER_AVAILABLE
-                               and Version(flashinfer.__version__) >= Version(
-                                   "0.6.4")
+        self.use_flashinfer = (IS_FLASHINFER_AVAILABLE and Version(
+            flashinfer.__version__) >= Version("0.6.4")
                                and not disable_flashinfer_sampling)
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
@@ -1247,12 +1303,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
     def _check_relaxed_acceptance_greedy_only(
             self, spec_metadata: "SpecMetadata") -> None:
-        if (spec_metadata.is_all_greedy_sample
-                or getattr(spec_metadata, "_force_non_greedy_for_capture",
-                           False)):
+        if (spec_metadata.is_all_greedy_sample or getattr(
+                spec_metadata, "_force_non_greedy_for_capture", False)):
             return
-        raise AssertionError(
-            "Relaxed acceptance only supports greedy sampling")
+        raise AssertionError("Relaxed acceptance only supports greedy sampling")
 
     def _update_relaxed_acceptance_deltas(
         self,
@@ -1908,6 +1962,10 @@ class SpecWorkerBase(nn.Module, ABC):
             sampled_tokens: [num_tokens] - Sampled token ids
             sampled_log_probs: [num_tokens] - Logprob of sampled token ids
         """
+        # Bias before the greedy/sampled split so logit_bias applies at any temperature.
+        if spec_metadata.embedding_bias is not None:
+            logits = logits + spec_metadata.embedding_bias[:logits.shape[0]]
+
         if not spec_metadata.is_all_greedy_sample:
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured

@@ -34,10 +34,15 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
-from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
-                                    fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
-                                    fp8_paged_mqa_logits,
+from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
+
+try:
+    from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
+                                        fp8_fp4_paged_mqa_logits)
+except ImportError:
+    fp8_fp4_mqa_logits = None
+    fp8_fp4_paged_mqa_logits = None
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1475,8 +1480,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 # the wider slice here.
                 if (self.max_draft_tokens > 0
                         and not self.use_expanded_buffers_for_mtp):
-                    context_lens_full_next_n = self.kv_lens_cuda_2d[
-                        :self.num_generations, :next_n_cap]
+                    context_lens_full_next_n = self.kv_lens_cuda_2d[:self.
+                                                                    num_generations, :
+                                                                    next_n_cap]
                     scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
                         context_lens_full_next_n, _DG_SCHEDULE_BLOCK_KV,
                         self.num_sms)
@@ -1712,8 +1718,8 @@ class Indexer(nn.Module):
 
         self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
                                        and get_sm_version() >= 100)
-        self._needs_heuristic_topk_warmup = (
-            self._enable_heuristic_topk and layer_idx == 0)
+        self._needs_heuristic_topk_warmup = (self._enable_heuristic_topk
+                                             and layer_idx == 0)
 
         if (self.use_cute_dsl_topk
                 or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
@@ -2022,8 +2028,7 @@ class Indexer(nn.Module):
                 gen_seq_lens.unsqueeze(-1).expand(-1, next_n_cap))
             context_lens_next_n1 = gen_seq_lens.view(-1, 1)
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                context_lens_next_n1, _DG_SCHEDULE_BLOCK_KV,
-                metadata.num_sms)
+                context_lens_next_n1, _DG_SCHEDULE_BLOCK_KV, metadata.num_sms)
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                      non_blocking=True)
             if metadata.max_draft_tokens > 0:
@@ -2454,10 +2459,9 @@ class Indexer(nn.Module):
             topk_indices_buffer[:num_ctx_tokens, :] = \
                 metadata.topk_indices_buffer[:num_ctx_tokens, :]
 
-        reuse_mtp_topk = (
-            metadata.index_share_for_mtp_iteration
-            and metadata.indexer_skip_topk
-            and metadata.shared_topk_indices is not None)
+        reuse_mtp_topk = (metadata.index_share_for_mtp_iteration
+                          and metadata.indexer_skip_topk
+                          and metadata.shared_topk_indices is not None)
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_mtp_topk:
             topk_indices_buffer[
@@ -2713,13 +2717,12 @@ class Indexer(nn.Module):
             rows = None
             if num_generations > 0:
                 next_n = num_gen_tokens // num_generations
-                rows = topk_indices_buffer[
-                    num_ctx_tokens:num_ctx_tokens + num_gen_tokens][next_n -
-                                                                    1::next_n]
+                rows = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                           num_gen_tokens][next_n - 1::next_n]
             if num_contexts > 0:
                 ctx_last = (torch.cumsum(
-                    metadata.seq_lens_cuda[:num_contexts].to(torch.long),
-                    dim=0) - 1)
+                    metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0)
+                            - 1)
                 ctx_rows = topk_indices_buffer[ctx_last]
                 rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
             if rows is not None:

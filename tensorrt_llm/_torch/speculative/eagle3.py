@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import mpi_rank, prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -526,6 +526,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         self.offloader_target_hidden_states = None
         self.offloader_input_ids = None
         self.offloader_position_ids = None
+        # enable_training is the config flag; hs_capture_enabled is the
+        # rank-local derived gate (capture only on rank 0).
+        self.hs_capture_enabled = self.enable_training and mpi_rank() == 0
         if self.hs_capture_enabled:
             trt_prepare_api().alloc_capture_buffers(self)
 

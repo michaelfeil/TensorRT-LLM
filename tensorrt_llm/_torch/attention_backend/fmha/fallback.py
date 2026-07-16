@@ -108,7 +108,11 @@ class FallbackFmha(Fmha):
             spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
             spec_decoding_target_max_draft_tokens=metadata.max_total_draft_tokens,
             spec_bl_tree_first_sparse_mask_offset_kv=metadata.spec_bl_tree_first_sparse_mask_offset_kv,
-            num_sparse_topk=metadata.num_sparse_topk,
+            # Only sparse-attention ops consume topk_indices; a dense layer
+            # sharing sparse (DSA) metadata — e.g. an MHA draft head over a
+            # DSA target — must not inherit num_sparse_topk, or the kernel
+            # takes the sparse path with null indices past index_topk tokens.
+            num_sparse_topk=(metadata.num_sparse_topk if attn.sparse_params is not None else 0),
             flash_mla_tile_scheduler_metadata=metadata.flash_mla_tile_scheduler_metadata,
             flash_mla_num_splits=metadata.flash_mla_num_splits,
             num_contexts=metadata.num_contexts,

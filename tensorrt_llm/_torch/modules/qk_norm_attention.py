@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import math
 from typing import Optional
 
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_hf_rope_theta
+from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import PositionalEmbeddingParams
@@ -47,17 +50,25 @@ def compute_yarn_parameters(
 
     # If config does not contain rope_scaling or rope_type is not yarn, it means the model is not using yarn
     rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling is None or getattr(rope_scaling, "rope_type",
-                                       None) != "yarn":
+    if rope_scaling is None:
+        return 1.0, 0, 0, 1.0
+    # rope_scaling is a plain dict (HF config); attribute access silently
+    # returns None and used to disable YaRN for every yarn checkpoint routed
+    # through the fused qk-norm-rope path (e.g. Kimi DFlash/DSpark MHA drafts),
+    # collapsing speculative acceptance with no error.
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    if rope_type != "yarn":
         return 1.0, 0, 0, 1.0
 
-    base = config.rope_theta
+    # transformers>=5 nests rope_theta under rope_parameters; config.rope_theta
+    # can be absent. Never let it default silently.
+    base = get_hf_rope_theta(config, 10000.0)
     partial_rotary_factor = config.partial_rotary_factor if hasattr(
         config, "partial_rotary_factor") else 1.0
     head_dim = getattr(config, "head_dim",
                        config.hidden_size // config.num_attention_heads)
     dim = int(head_dim * partial_rotary_factor)
-    factor = getattr(rope_scaling, "factor", 1.0)
+    factor = rope_scaling.get("factor", 1.0)
     attention_factor = rope_scaling.get("attention_factor")
     mscale = rope_scaling.get("mscale")
     mscale_all_dim = rope_scaling.get("mscale_all_dim")
@@ -65,7 +76,11 @@ def compute_yarn_parameters(
     if "original_max_position_embeddings" in rope_scaling:
         original_max_position_embeddings = rope_scaling[
             "original_max_position_embeddings"]
-        factor = config.max_position_embeddings / original_max_position_embeddings
+        # An explicit factor wins over the implicit max/original ratio,
+        # matching transformers' YaRN behavior (it warns and keeps the
+        # explicit value; Kimi drafts ship factor=16 with a 64x ratio).
+        if "factor" not in rope_scaling:
+            factor = config.max_position_embeddings / original_max_position_embeddings
     else:
         original_max_position_embeddings = config.max_position_embeddings
 
@@ -164,11 +179,17 @@ class QKNormRoPEAttention(Attention):
         reduce_output: bool = True,
         rope_fusion: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
+        apply_yarn_in_fused_rope: bool = False,
     ):
         self.pretrained_config = config.pretrained_config
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
         self.skip_rope = skip_rope
+        # Opt-in (Baseten DFlash/DSpark qwen3 drafts only): make the fused
+        # qk-norm-rope kernel apply the checkpoint's YaRN scaling and stop the
+        # attention op from rotating q/k a second time. Off by default so every
+        # other model keeps the legacy wiring bit-for-bit.
+        self.apply_yarn_in_fused_rope = apply_yarn_in_fused_rope
         # Gemma-style RMSNorm (scale by (1 + weight)) is supported by the fused
         # qk_norm_rope kernel via the use_gemma flag threaded through below.
         self.use_gemma_rms_norm = use_gemma_rms_norm
@@ -180,6 +201,21 @@ class QKNormRoPEAttention(Attention):
         self.is_qk_norm = is_qk_norm
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
+
+        # The fused qk-norm-rope kernel fully applies RoPE (including YaRN via
+        # compute_yarn_parameters), so the attention op must not rotate again.
+        # Attention.__init__ passes pos_embd_params to the op whenever
+        # `not type.is_rope()` — and PositionEmbeddingType.yarn is not in
+        # is_rope() — which double-applies RoPE for yarn checkpoints on this
+        # path (the fused kernel and then the op), collapsing speculative
+        # acceptance for the Kimi DFlash/DSpark qwen3 drafts. Downgrade the
+        # advertised type to plain neox RoPE so the op receives no rope params;
+        # yarn is applied by the fused kernel instead.
+        if (self.apply_yarn_in_fused_rope and self.fuse_qk_norm_rope
+                and pos_embd_params is not None
+                and pos_embd_params.type == PositionEmbeddingType.yarn):
+            pos_embd_params = dataclasses.replace(
+                pos_embd_params, type=PositionEmbeddingType.rope_gpt_neox)
 
         super().__init__(
             hidden_size=hidden_size,
@@ -235,8 +271,14 @@ class QKNormRoPEAttention(Attention):
         return q, k
 
     def apply_qk_norm_rope(self, qkv, position_ids):
-        factor, low, high, attention_factor = compute_yarn_parameters(
-            self.pretrained_config)
+        if self.apply_yarn_in_fused_rope:
+            factor, low, high, attention_factor = compute_yarn_parameters(
+                self.pretrained_config)
+        else:
+            # Legacy behavior for all other models: compute_yarn_parameters'
+            # attribute-style read of the rope_scaling dict always fell through
+            # to these defaults (plain RoPE), so keep them verbatim.
+            factor, low, high, attention_factor = 1.0, 0, 0, 1.0
 
         partial_rotary_factor = self.pretrained_config.partial_rotary_factor if hasattr(
             self.pretrained_config, "partial_rotary_factor") else 1.0

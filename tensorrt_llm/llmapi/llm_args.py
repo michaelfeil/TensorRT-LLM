@@ -1749,6 +1749,35 @@ class EagleDecodingConfig(DecodingBaseConfig):
         default="llama3",
         description="The model architecture of the eagle3 model.")
 
+    use_relaxed_acceptance_for_thinking: bool = Field(
+        default=False,
+        description=
+        "Enable relaxed acceptance during the thinking phase for reasoning models."
+    )
+    relaxed_topk: PositiveInt = Field(
+        default=1,
+        description=
+        "Maximum number of target-model candidates eligible for relaxed acceptance."
+    )
+    relaxed_delta: NonNegativeFloat = Field(
+        default=0.0,
+        description="Probability threshold for relaxed acceptance.")
+    multiplicative_relaxed_acceptance: bool = Field(
+        default=True,
+        description=
+        "Use a multiplicative top-1 probability threshold instead of an additive threshold."
+    )
+    begin_thinking_phase_token: Optional[int] = Field(
+        default=128798,
+        description=
+        "Token marking the start of thinking. If None, relaxed acceptance starts enabled."
+    )
+    end_thinking_phase_token: Optional[int] = Field(
+        default=128799,
+        description=
+        "Token marking the end of thinking. If None, relaxed acceptance is not disabled by a token."
+    )
+
     @field_validator('eagle_choices', mode='before')
     @classmethod
     def validate_eagle_choices(cls, v):
@@ -1933,6 +1962,141 @@ class Eagle3DecodingConfig(EagleDecodingConfig):
         status="beta",
         description="Optional Suffix Automaton configuration. When set, "
         "combines SA drafting with Eagle3 speculative decoding.")
+
+
+class BasetenDFlashDecodingConfig(EagleDecodingConfig):
+    """Configuration for Baseten's custom DFlash speculative decoding.
+
+    This is Baseten's own DFlash implementation (originally named "Dflash").
+    It is kept alongside the upstream :class:`DFlashDecodingConfig` and is
+    intentionally named ``BasetenDFlash`` to avoid conflicts. It reuses the
+    Eagle3 one-model pipeline and denoises a fixed-size block of mask tokens
+    per step.
+    """
+    block_size: int = Field(
+        default=16,
+        description="Size of the denoising block. DFlash requires "
+        "max_draft_len <= block_size - 1; DSpark permits "
+        "max_draft_len <= block_size.")
+    dflash_one_model: Optional[bool] = Field(
+        default=True,
+        description="Whether to use the one-model implementation. Only the "
+        "one-model implementation is currently supported.")
+    use_mla: Optional[bool] = Field(
+        default=False,
+        description="Whether the draft model uses MLA attention (e.g. a "
+        "DeepSeek-V3-style draft head).")
+
+    decoding_type: Literal["BasetenDFlash"] = Field(default="BasetenDFlash")
+
+    def _max_supported_draft_len(self) -> int:
+        return self.block_size - 1
+
+    @model_validator(mode="after")
+    def validate_baseten_dflash_config(self) -> 'BasetenDFlashDecodingConfig':
+        assert self.max_draft_len is not None, "max_draft_len is required for BasetenDFlash"
+        max_supported_draft_len = self._max_supported_draft_len()
+        assert self.max_draft_len <= max_supported_draft_len, (
+            f"max_draft_len must be <= {max_supported_draft_len} for "
+            f"{self.decoding_type}")
+        # BasetenDFlash reuses the Eagle3 one-model pipeline.
+        self.eagle3_one_model = self.dflash_one_model
+        assert self.eagle3_one_model, "BasetenDFlash currently only supports one model architecture, please set dflash_one_model to True"
+        return self
+
+    def validate(self) -> None:
+        if self.speculative_model is None:
+            raise ValueError(
+                f"Draft model must be provided for {self.decoding_type}")
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        if self.dflash_one_model:
+            return TorchSpeculativeDecodingMode.BASETEN_DFLASH_ONE_MODEL
+        raise ValueError(
+            "BasetenDFlash currently only supports one model architecture, please set dflash_one_model to True"
+        )
+
+
+class BasetenDSparkDecodingConfig(BasetenDFlashDecodingConfig):
+    """Configuration for DSpark speculative decoding (Baseten implementation).
+
+    DSpark (DeepSeek, 2026) keeps the BasetenDFlash parallel draft backbone and
+    adds a lightweight sequential stage: a low-rank Markov head that biases each
+    draft position's logits with the previously sampled token, and a confidence
+    head that estimates per-position acceptance probabilities. Architecture
+    hyperparameters (markov_rank, confidence head, reduced draft vocab) are read
+    from the draft checkpoint's config.json (``dspark_config``), not from here.
+
+    ``block_size`` and ``eagle3_layers_to_capture`` are checkpoint-intrinsic and
+    are filled from the draft config when omitted (same idea as upstream DFlash
+    resolving ``dflash_config`` fields). Explicit yaml values are cross-checked.
+    """
+    enable_confidence_head: bool = Field(
+        default=False,
+        description="Run the checkpoint's confidence head each draft step, "
+        "recording per-position prefix-survival estimates in the worker's "
+        "draft_survival buffer (telemetry / future confidence-scheduled "
+        "draft length). Off by default: it costs two small GEMMs per draft "
+        "position and nothing consumes the estimates yet.")
+
+    decoding_type: Literal["BasetenDSpark"] = Field(default="BasetenDSpark")
+
+    def _max_supported_draft_len(self) -> int:
+        return self.block_size
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_from_draft_checkpoint(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        model = data.get("speculative_model") or data.get(
+            "speculative_model_dir")
+        if model is None:
+            return data
+        from transformers import PretrainedConfig as HFPretrainedConfig
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import \
+            normalize_dspark_draft_config_dict
+
+        config_dict, _ = HFPretrainedConfig.get_config_dict(str(model))
+        draft_cfg = normalize_dspark_draft_config_dict(config_dict)
+        checkpoint_facts = {
+            "block_size":
+            draft_cfg["block_size"],
+            "eagle3_layers_to_capture":
+            draft_cfg["dflash_config"]["target_layer_ids"],
+        }
+
+        def _list_or_scalar(value: object) -> object:
+            if isinstance(value, (list, tuple, set)):
+                return sorted(value)
+            return value
+
+        for key, checkpoint_value in checkpoint_facts.items():
+            yaml_value = data.get(key)
+            if yaml_value is None:
+                data[key] = checkpoint_value
+            elif _list_or_scalar(yaml_value) != _list_or_scalar(
+                    checkpoint_value):
+                raise ValueError(
+                    f"speculative_config.{key}={yaml_value!r} contradicts the "
+                    f"draft checkpoint ({checkpoint_value!r}); drop it from "
+                    "the yaml or match the checkpoint.")
+        data.setdefault("max_draft_len", draft_cfg["block_size"])
+        return data
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        if not self.dflash_one_model:
+            raise ValueError(
+                "BasetenDSpark currently only supports one model architecture, "
+                "please set dflash_one_model to True")
+        return TorchSpeculativeDecodingMode.BASETEN_DSPARK_ONE_MODEL
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
@@ -3053,6 +3217,8 @@ SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
         Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
+        BasetenDSparkDecodingConfig,  # Must be before BasetenDFlashDecodingConfig since it's a subclass
+        BasetenDFlashDecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
         LookaheadDecodingConfig,
         MedusaDecodingConfig,
@@ -4156,6 +4322,12 @@ class TrtLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     "speculative_config.decoding_type 'Eagle3' is only supported on the PyTorch backend. "
                     "Use decoding_type 'Eagle' for the TensorRT backend.")
+
+            elif isinstance(self.speculative_config,
+                            BasetenDFlashDecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'BasetenDFlash' is only supported on the PyTorch backend."
+                )
 
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0

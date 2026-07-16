@@ -35,7 +35,8 @@ from ..quantization.modelopt_config import (is_modelopt_quant_config,
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 # yapf: disable
-from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
+from .llm_args import (BasetenDFlashDecodingConfig, BasetenDSparkDecodingConfig,
+                       CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
                        DraftTargetDecodingConfig, Eagle3DecodingConfig,
                        EagleDecodingConfig, EncodeCudaGraphConfig,
                        KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
@@ -1025,6 +1026,8 @@ __all__ = [
     'CachedModelLoader',
     'EagleDecodingConfig',
     'Eagle3DecodingConfig',
+    'BasetenDFlashDecodingConfig',
+    'BasetenDSparkDecodingConfig',
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',
     'apply_model_defaults_to_llm_args',

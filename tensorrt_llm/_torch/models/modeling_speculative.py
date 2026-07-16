@@ -8,10 +8,12 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ...functional import PositionEmbeddingType, RotaryScalingType
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention_backend.interface import (PositionalEmbeddingParams,
+                                           PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import MLA, Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -1675,9 +1677,527 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
         )
 
 
+class BasetenDFlashDecoderLayer(DecoderLayer):
+    """Decoder layer for Baseten's custom DFlash draft model.
+
+    This is Baseten's own DFlash implementation (originally named "Dflash"),
+    kept alongside the upstream ``DFlash`` implementation to avoid conflicts.
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        layer_idx: int = 0,
+        # parameters for MLA
+        use_mla: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        mapping_with_cp: Optional[Mapping] = None,
+        reduce_output: bool = True,
+    ) -> None:
+        super().__init__()
+        # Lazy imports to avoid circular imports (modeling_qwen3 and
+        # modeling_deepseekv3 both import from this module).
+        from .modeling_deepseekv3 import DeepseekV3Attention
+        from .modeling_qwen3 import Qwen3Attention
+
+        config = model_config.pretrained_config
+
+        self.layer_idx = layer_idx
+        self.use_mla = use_mla
+        if use_mla:
+            self.self_attn = DeepseekV3Attention(
+                model_config,
+                layer_idx=layer_idx,
+                aux_stream=aux_stream,
+                mapping_with_cp=mapping_with_cp,
+                reduce_output=reduce_output,
+            )
+        else:
+            self.self_attn = Qwen3Attention(
+                model_config,
+                layer_idx=layer_idx,
+                # DFlash/DSpark qwen3 drafts are trained with YaRN; apply it in
+                # the fused qk-norm-rope kernel (and only there — the attention
+                # op must not rotate again). Guarded to this draft path so no
+                # other qwen3 model changes behavior.
+                apply_yarn_in_fused_rope=True,
+            )
+
+        inter_size = config.intermediate_size
+
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=inter_size,
+            bias=getattr(config, "mlp_bias", False),
+            dtype=config.torch_dtype,
+            config=model_config,
+            overridden_tp_size=1
+            if model_config.mapping.enable_attention_dp else None,
+        )
+        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                       eps=config.rms_norm_eps,
+                                       dtype=config.torch_dtype)
+        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                                eps=config.rms_norm_eps,
+                                                dtype=config.torch_dtype)
+
+    def prefill_forward(
+        self,
+        position_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        if self.use_mla:
+            self.self_attn(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+            )
+            return
+
+        self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+        )
+
+    def forward(
+        self,
+        position_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        if self.use_mla:
+            # MLA denoising use causal
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+            )
+        else:
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                attention_mask=PredefinedAttentionMask.FULL,
+            )
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = hidden_states + residual
+        return hidden_states
+
+
+class BasetenDFlashDraftModel(DecoderModel):
+
+    def __init__(
+        self,
+        model_config,
+        start_layer_idx=0,
+        use_mla: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        mapping_with_cp: Optional[Mapping] = None,
+        reduce_output: bool = True,
+    ):
+        super().__init__(model_config)
+        config = model_config.pretrained_config
+        self.spec_config = model_config.spec_config
+        self.dtype = getattr(config, "torch_dtype",
+                             getattr(config, "dtype", None))
+        self.hidden_size = config.hidden_size
+        self.mapping = model_config.mapping
+        self.num_layers = model_config.pretrained_config.num_hidden_layers
+
+        self.mask_token_id = config.dflash_config['mask_token_id']
+        self.use_mla = use_mla
+
+        def build_target_layer_ids(num_target_layers: int,
+                                   num_draft_layers: int):
+            if num_draft_layers == 1:
+                return [(num_target_layers // 2)]
+            start = 1
+            end = num_target_layers - 3
+            span = end - start
+            target_layer_ids = [
+                int(round(start + (i * span) / (num_draft_layers - 1)))
+                for i in range(num_draft_layers)
+            ]
+            return target_layer_ids
+
+        # NB: don't pass build_target_layer_ids(...) as a dict.get default —
+        # it evaluates eagerly and config.num_target_layers only exists on
+        # checkpoints that omit explicit target_layer_ids.
+        target_layer_ids = config.dflash_config.get("target_layer_ids")
+        if target_layer_ids is None:
+            target_layer_ids = build_target_layer_ids(
+                config.num_target_layers, self.spec_config.num_capture_layers)
+        self.target_layer_ids = target_layer_ids
+
+        self.fc = Linear(
+            config.hidden_size * len(self.target_layer_ids),
+            config.hidden_size,
+            bias=False,
+            dtype=config.torch_dtype,
+        )
+        self.norm = RMSNorm(hidden_size=config.hidden_size,
+                            eps=config.rms_norm_eps,
+                            dtype=self.dtype)
+        self.hidden_norm = RMSNorm(hidden_size=config.hidden_size,
+                                   eps=config.rms_norm_eps,
+                                   dtype=self.dtype)
+
+        self.embed_tokens = None
+
+        self.layers = nn.ModuleList([
+            BasetenDFlashDecoderLayer(
+                model_config,
+                layer_idx=start_layer_idx + i,
+                use_mla=self.use_mla,
+                aux_stream=aux_stream,
+                mapping_with_cp=mapping_with_cp,
+                reduce_output=reduce_output,
+            ) for i in range(self.num_layers)
+        ])
+
+    def prefill_forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+    ):
+        for layer in self.layers:
+            layer.prefill_forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+            )
+        return self.norm(hidden_states)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+    ):
+        for layer in self.layers:
+            hidden_states = layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+            )
+        return self.norm(hidden_states)
+
+
+@register_auto_model("DflashQwenForCausalLM")
+@register_auto_model("DflashMLAForCausalLM")
+class BasetenDFlashForCausalLM(DecoderModelForCausalLM[BasetenDFlashDraftModel,
+                                                       PretrainedConfig]):
+
+    # Subclasses (BasetenDSpark) swap the draft-model class and may shrink the
+    # lm_head to a reduced draft vocab.
+    draft_model_cls = BasetenDFlashDraftModel
+
+    def _lm_head_vocab_size(self, model_config) -> int:
+        return model_config.pretrained_config.vocab_size
+
+    def __init__(
+        self,
+        model_config: LlamaConfig,
+        start_layer_idx: int = 0,
+    ):
+        spec_config = getattr(model_config, 'spec_config', None)
+        use_mla = bool(getattr(spec_config, 'use_mla', False))
+        if not use_mla:
+            kv_lora_rank = getattr(model_config.pretrained_config,
+                                   'kv_lora_rank', None)
+            use_mla = bool(kv_lora_rank)
+        self.use_mla = use_mla
+        self.aux_stream = torch.cuda.Stream() if use_mla else None
+
+        super().__init__(
+            type(self).draft_model_cls(
+                model_config,
+                start_layer_idx=start_layer_idx,
+                use_mla=use_mla,
+                aux_stream=self.aux_stream,
+                # maybe add mapping_with_cp and reduce_output as params later
+            ),
+            config=model_config,
+            hidden_size=model_config.pretrained_config.hidden_size,
+            vocab_size=self._lm_head_vocab_size(model_config))
+        self.load_lm_head_from_target = True
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        noise_embeddings: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        output = self.model.prefill_forward(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+            hidden_states=hidden_states,
+        )
+
+        output = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+            hidden_states=noise_embeddings,
+        )
+
+        return self.logits_processor.forward(
+            output,
+            self.lm_head,
+            attn_metadata,
+            return_context_logits,
+        )
+
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        new_weights = {}
+        for k, v in weights.items():
+            if 'lm_head' not in k:
+                new_k = "model." + k
+            else:
+                self.load_lm_head_from_target = False
+                new_k = k
+            new_weights[new_k] = v
+
+        if self.use_mla:
+            from .modeling_deepseekv3 import DeepseekV3WeightLoader
+            weight_loader = DeepseekV3WeightLoader(self, is_draft_model=False)
+            if self.load_lm_head_from_target:
+                weight_loader.load_weights(new_weights,
+                                           skip_modules=['lm_head'])
+            else:
+                weight_loader.load_weights(new_weights)
+        else:
+            super().load_weights(weights=new_weights,
+                                 weight_mapper=weight_mapper,
+                                 skip_modules=['lm_head'])
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        self.model.embed_tokens = target_model.model.embed_tokens
+        self.lm_head = target_model.lm_head
+
+    def apply_dflash_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.model.dtype)
+        hidden_states = self.model.fc(hidden_states)
+        hidden_states = self.model.hidden_norm(hidden_states)
+        return hidden_states
+
+    def initialize_blocks(
+        self,
+        block_size: int,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        last_token = torch.gather(accepted_tokens, 1,
+                                  (num_accepted_tokens - 1).unsqueeze(1))
+        N = accepted_tokens.shape[0]
+        dflash_block = torch.ones(
+            (N, block_size),
+            dtype=accepted_tokens.dtype,
+            device=accepted_tokens.device) * self.model.mask_token_id
+
+        dflash_block[:, 0] = last_token.squeeze(1)
+        dflash_embeddings = self.model.embed_tokens(
+            dflash_block.flatten()).view(N, block_size, -1)
+
+        input_ids = dflash_block.reshape(-1, dflash_block.shape[-1])
+        hidden_states = dflash_embeddings.reshape(-1,
+                                                  dflash_embeddings.shape[-1])
+
+        return input_ids, hidden_states
+
+
+class BasetenDSparkMarkovHead(nn.Module):
+    """Low-rank first-order Markov logit bias: B(x_prev, .) = W2 @ W1[x_prev].
+
+    W1 embeds the previously sampled token (target-vocab id); W2 projects the
+    rank-r embedding to a bias over the draft vocab. Small and replicated on
+    every TP rank (no sharding).
+    """
+
+    def __init__(self, vocab_size: int, draft_vocab_size: int, rank: int,
+                 dtype: torch.dtype):
+        super().__init__()
+        self.markov_w1 = nn.Embedding(vocab_size, rank, dtype=dtype)
+        self.markov_w2 = nn.Linear(rank,
+                                   draft_vocab_size,
+                                   bias=False,
+                                   dtype=dtype)
+
+    def prev_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.markov_w1(token_ids.long())
+
+    def bias(self, prev_embedding: torch.Tensor) -> torch.Tensor:
+        return self.markov_w2(prev_embedding)
+
+
+class BasetenDSparkConfidenceHead(nn.Module):
+    """Per-position conditional acceptance estimate.
+
+    c_k = sigmoid(w . [h_k ; W1[x_{k-1}]]): probability that draft position k
+    survives target verification given all earlier positions were accepted.
+    """
+
+    def __init__(self, input_dim: int, dtype: torch.dtype):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, 1, dtype=dtype)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.proj(features).float()).squeeze(-1)
+
+
+class BasetenDSparkDraftModel(BasetenDFlashDraftModel):
+    """DSpark draft model: BasetenDFlash backbone + Markov/confidence heads.
+
+    Architecture hyperparameters come from ``config.dspark_config`` in the
+    draft checkpoint (normalized from speculators-format configs by
+    ``load_pretrained_config``). A reduced draft vocab registers ``d2t``
+    (additive draft-id -> target-id offsets), mirroring Eagle3.
+    """
+
+    def __init__(self, model_config, **kwargs):
+        super().__init__(model_config, **kwargs)
+        if self.use_mla:
+            raise NotImplementedError(
+                "BasetenDSpark only supports MHA draft heads; released DSpark "
+                "checkpoints use qwen3-style full-attention draft layers.")
+        config = model_config.pretrained_config
+        dspark_config = getattr(config, 'dspark_config', None)
+        if dspark_config is None:
+            raise ValueError(
+                "Draft checkpoint config is missing 'dspark_config'. "
+                "Speculators-format DSpark configs are normalized in "
+                "load_pretrained_config; ensure speculative_model points at "
+                "a DSpark draft checkpoint.")
+
+        self.draft_vocab_size = int(
+            dspark_config.get('draft_vocab_size') or config.vocab_size)
+        if self.draft_vocab_size != config.vocab_size:
+            self.d2t = nn.Parameter(torch.empty((self.draft_vocab_size, ),
+                                                dtype=torch.int32),
+                                    requires_grad=False)
+
+        markov_rank = int(dspark_config.get('markov_rank', 0))
+        markov_head_type = dspark_config.get('markov_head_type', 'vanilla')
+        if markov_rank > 0 and markov_head_type != 'vanilla':
+            raise NotImplementedError(
+                f"markov_head_type={markov_head_type!r} is not supported; "
+                "only 'vanilla' (first-order Markov bias) is implemented.")
+        self.markov_head = BasetenDSparkMarkovHead(
+            config.vocab_size, self.draft_vocab_size, markov_rank,
+            self.dtype) if markov_rank > 0 else None
+
+        # Opt-in via the serving config: the head costs two GEMMs per draft
+        # position and its survival estimates are telemetry until
+        # confidence-scheduled draft length lands. The checkpoint flag only
+        # says whether the weights exist.
+        enable_confidence = bool(
+            getattr(self.spec_config, 'enable_confidence_head', False))
+        if enable_confidence and not dspark_config.get(
+                'enable_confidence_head'):
+            raise ValueError("enable_confidence_head requested but the draft "
+                             "checkpoint has no confidence head weights.")
+        self.confidence_with_markov = bool(
+            dspark_config.get('confidence_head_with_markov', True))
+        if enable_confidence and self.confidence_with_markov \
+                and self.markov_head is None:
+            raise ValueError(
+                "confidence_head_with_markov requires markov_rank > 0.")
+        confidence_input_dim = config.hidden_size + (
+            markov_rank if self.confidence_with_markov else 0)
+        self.confidence_head = BasetenDSparkConfidenceHead(
+            confidence_input_dim, self.dtype) if enable_confidence else None
+
+
+@register_auto_model("DsparkQwenForCausalLM")
+class BasetenDSparkForCausalLM(BasetenDFlashForCausalLM):
+
+    draft_model_cls = BasetenDSparkDraftModel
+
+    def _lm_head_vocab_size(self, model_config) -> int:
+        config = model_config.pretrained_config
+        dspark_config = getattr(config, 'dspark_config', None) or {}
+        return int(dspark_config.get('draft_vocab_size') or config.vocab_size)
+
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        weights = dict(weights)
+        weights.pop('t2d', None)  # target->draft mask: training-only
+        has_lm_head = any(k.startswith('lm_head') for k in weights)
+        if not has_lm_head and hasattr(self.model, 'd2t'):
+            # Falling back to the target's full-vocab head would let the
+            # draft argmax exceed the d2t table -> device-side OOB gather.
+            raise ValueError(
+                "DSpark checkpoint declares a reduced draft_vocab_size but "
+                "ships no lm_head weights; a reduced draft vocab requires "
+                "the checkpoint's own lm_head.")
+        self.load_lm_head_from_target = not has_lm_head
+        new_weights = {}
+        for k, v in weights.items():
+            new_weights[k if k.startswith('lm_head') else 'model.' + k] = v
+        skip_modules = [] if has_lm_head else ['lm_head']
+        # Skip the BasetenDFlash override (its MLA branch cannot load the
+        # DSpark heads); the generic loader handles every module here.
+        DecoderModelForCausalLM.load_weights(self,
+                                             weights=new_weights,
+                                             weight_mapper=weight_mapper,
+                                             skip_modules=skip_modules)
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        self.model.embed_tokens = target_model.model.embed_tokens
+        # A reduced-draft-vocab lm_head comes from the draft checkpoint and
+        # must not be clobbered by the target's full-vocab head.
+        if self.load_lm_head_from_target:
+            self.lm_head = target_model.lm_head
+        if self.model.markov_head is not None:
+            # markov_w1 is indexed by target-sampled token ids; a target with
+            # a larger vocab than the speculator was built for would OOB the
+            # embedding inside the captured graph.
+            target_vocab = target_model.model.embed_tokens.num_embeddings
+            markov_vocab = self.model.markov_head.markov_w1.num_embeddings
+            if markov_vocab < target_vocab:
+                raise ValueError(
+                    f"DSpark markov head covers {markov_vocab} token ids but "
+                    f"the target vocab is {target_vocab}; the speculator was "
+                    "built for a different target.")
+
+
 def get_draft_model(model_config, draft_config, lm_head, model):
     assert getattr(model_config, 'spec_config', None) is not None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
+    if spec_dec_mode.is_baseten_dspark_one_model():
+        return BasetenDSparkForCausalLM(
+            draft_config, model_config.pretrained_config.num_hidden_layers)
+    if spec_dec_mode.is_baseten_dflash_one_model():
+        return BasetenDFlashForCausalLM(
+            draft_config, model_config.pretrained_config.num_hidden_layers)
     if spec_dec_mode.is_eagle3_one_model():
         if model_config.spec_config.eagle3_model_arch == "llama3":
             # Eagle3ForCausalLM handles both Llama3 and DeepSeekV3 architectures
@@ -1727,7 +2247,19 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
-                if spec_config.spec_dec_mode.is_eagle3_one_model():
+                if spec_config.spec_dec_mode.is_baseten_dflash_one_model():
+                    self.draft_config = ModelConfig.from_pretrained(
+                        model_config.spec_config.speculative_model,
+                        trust_remote_code=True,
+                        attn_backend=model_config.attn_backend,
+                        moe_backend=model_config.moe_backend,
+                        mapping=model_config.mapping,
+                        spec_config=model_config.spec_config,
+                        max_num_tokens=model_config.max_num_tokens,
+                        moe_max_num_tokens=model_config.moe_max_num_tokens)
+                    self.draft_config.quant_config.kv_cache_quant_algo = \
+                        model_config.quant_config.kv_cache_quant_algo
+                elif spec_config.spec_dec_mode.is_eagle3_one_model():
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
                             MistralConfigLoader
@@ -1791,13 +2323,37 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 getattr(model_config.spec_config, 'use_mla', False)))
             is_eagle3_llama3 = (spec_mode.is_eagle3_one_model()
                                 and model_config.spec_config.eagle3_model_arch
-                                == "llama3"
-                                and not is_dflash_one_model)
+                                == "llama3" and not is_dflash_one_model)
             if (self.draft_config is not None
                     and (is_eagle3_llama3 or is_dflash_mla)):
                 _merge_draft_attention_extra_attrs(
                     model_config.extra_attrs, self.draft_config.extra_attrs,
                     self.use_separate_draft_kv_cache)
+
+            # Baseten DFlash/DSpark: the draft must not share a KV cache with
+            # a target from a different attention family; fail loud instead of
+            # corrupting the layout (the MLA-draft attr merge itself is the
+            # is_dflash_mla path above).
+            if is_dflash_one_model and self.draft_config is not None:
+                draft_is_mla = bool(
+                    getattr(model_config.spec_config, 'use_mla', False))
+                target_is_mla = bool(
+                    getattr(model_config.pretrained_config, 'kv_lora_rank',
+                            None))
+                if (draft_is_mla != target_is_mla
+                        and not self.use_separate_draft_kv_cache):
+                    # Covers both directions, incl. the MHA-draft-on-MLA-target
+                    # case DSpark ships; note py_executor_creator's
+                    # cache-transceiver WAR force-disables the separate draft
+                    # cache in disaggregated serving even when the config
+                    # enables it.
+                    raise ValueError(
+                        f"Draft ({'MLA' if draft_is_mla else 'MHA'}) and "
+                        f"target ({'MLA' if target_is_mla else 'MHA'}) "
+                        "attention families differ and cannot share a single "
+                        "KV cache layout; allow_separate_draft_kv_cache must "
+                        "be enabled (and not force-disabled by the "
+                        "cache-transceiver WAR).")
 
             # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(

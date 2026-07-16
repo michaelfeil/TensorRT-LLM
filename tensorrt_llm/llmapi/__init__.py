@@ -6,8 +6,9 @@ from ..scheduling_params import SchedulingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
-                       CacheTransceiverConfig, CalibConfig,
+from .llm_args import (AttentionDpConfig, AutoDecodingConfig,
+                       BasetenDFlashDecodingConfig, BasetenDSparkDecodingConfig,
+                       BatchingType, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DecodeCudaGraphConfig,
                        DeepSeekSparseAttentionConfig, DFlashDecodingConfig,
@@ -18,12 +19,12 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        MedusaDecodingConfig, MiniMaxM3SparseAttentionConfig,
                        MoeConfig, MTPDecodingConfig, NGramDecodingConfig,
                        PARDDecodingConfig, PrometheusMetricsConfig,
+                       PythonCapacitySchedulerPolicy,
                        ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
                        SADecodingConfig, SAEnhancerConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
                        SkipSoftmaxAttentionConfig, TorchCompileConfig,
                        TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
-from .llm_args import PythonCapacitySchedulerPolicy
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
@@ -70,6 +71,8 @@ __all__ = [
     'NGramDecodingConfig',
     'PARDDecodingConfig',
     'DFlashDecodingConfig',
+    'BasetenDFlashDecodingConfig',
+    'BasetenDSparkDecodingConfig',
     'SADecodingConfig',
     'SAEnhancerConfig',
     'UserProvidedDecodingConfig',

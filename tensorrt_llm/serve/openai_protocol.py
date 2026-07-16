@@ -114,11 +114,17 @@ class PromptTokensDetails(OpenAIBaseModel):
     cached_tokens: int = 0
 
 
+# class CompletionTokensDetails(OpenAIBaseModel):
+#     avg_decoded_tokens_per_iter: Optional[float] = None
+#     avg_accepted_draft_tokens_per_iter: Optional[float] = None
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    # completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class ModelCard(OpenAIBaseModel):

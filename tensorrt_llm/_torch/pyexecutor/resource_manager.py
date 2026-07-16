@@ -372,7 +372,8 @@ class KVCacheManager(BaseResourceManager):
         self.linear_attention_metadata = linear_attention_metadata
         self.dflash_block_size = (
             spec_config.block_size if spec_config is not None
-            and spec_config.spec_dec_mode.is_dflash() else None)
+            and spec_config.spec_dec_mode.is_baseten_dflash_one_model() else
+            None)
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.kv_cache_pool_pointers = None

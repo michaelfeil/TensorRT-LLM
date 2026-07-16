@@ -1,4 +1,6 @@
 from .auto_heuristic import suggest_spec_config
+from .baseten_dflash import BasetenDFlashOneModelWorker
+from .baseten_dspark import BasetenDSparkOneModelWorker
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
@@ -24,6 +26,8 @@ from .utils import (get_draft_kv_cache_manager, get_num_extra_kv_tokens,
                     get_spec_worker, update_spec_config_from_model_config)
 
 __all__ = [
+    "BasetenDFlashOneModelWorker",
+    "BasetenDSparkOneModelWorker",
     "DFlashSpecMetadata",
     "DFlashWorker",
     "DraftTargetOneModelSpecMetadata",

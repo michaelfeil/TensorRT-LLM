@@ -174,6 +174,17 @@ class SamplerEvent:
         if self.side_stream_event is not None:
             self.side_stream_event.synchronize()
 
+    def query(self) -> bool:
+        # Non-blocking counterpart of synchronize(); used by hs-capture
+        # work_until() to drain UCX while waiting for the sampler D2H.
+        if self.worker_futures and not all(future.done() for future in self.worker_futures):
+            return False
+        if not self.cuda_event.query():
+            return False
+        if self.side_stream_event is not None and not self.side_stream_event.query():
+            return False
+        return True
+
 
 GenericSampleStateTensorsHost = TypeVar("GenericSampleStateTensorsHost", bound=SampleStateTensors)
 GenericSampleStateTensorsDevice = TypeVar(

@@ -1905,6 +1905,12 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager=spec_resource_manager,
             is_draft_model=self.is_draft_model,
             max_seq_len=self.max_seq_len)
+        # Reuse SpecMetadata.vocab_size (also used for draft_probs); only
+        # overwrite when the model config exposes a concrete value.
+        model_vocab_size = getattr(self.model.config, "vocab_size", None)
+        if model_vocab_size is not None:
+            self.spec_metadata.vocab_size = model_vocab_size
+        self.spec_metadata.embedding_bias_dtype = self.dtype
         return self.spec_metadata
 
     @staticmethod
@@ -2565,6 +2571,8 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.request_accepted_path = request_accepted_path
 
             spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.num_ctx_tokens = attn_metadata.num_ctx_tokens
+            spec_metadata.is_warmup = self.is_warmup
             self._prepare_spec_logprob_metadata(scheduled_requests,
                                                 spec_metadata)
             spec_metadata.prepare()
@@ -2870,6 +2878,14 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.gather_ids = self.gather_ids_cuda[:total_num_tokens]
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:
                                                                                           num_extend_requests]
+            spec_metadata.request_ids = [
+                r.py_request_id for r in extend_requests
+            ]
+            spec_metadata.num_generations = num_extend_requests
+            spec_metadata.seq_lens = [
+                num_tokens_per_extend_request
+            ] * num_extend_reqeust_wo_dummy + [0] * num_extend_dummy_requests
+            spec_metadata.is_warmup = self.is_warmup
 
         # Determine if we're using extend_ctx mode for linear tree decoding
         num_extend_ctx_requests = 0
@@ -3938,9 +3954,12 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.num_ctx_tokens = attn_metadata.num_ctx_tokens
             spec_metadata.seq_lens = sequence_lengths
+            spec_metadata.is_warmup = self.is_warmup
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)]
+            spec_metadata.position_ids = position_ids
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
             self._prepare_spec_logprob_metadata(scheduled_requests,
@@ -4110,7 +4129,10 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
+            spec_metadata.num_ctx_tokens = attn_metadata.num_ctx_tokens
             spec_metadata.seq_lens = sequence_lengths
+            spec_metadata.position_ids = position_ids.tolist()
+            spec_metadata.is_warmup = self.is_warmup
             self._prepare_spec_logprob_metadata(scheduled_requests,
                                                 spec_metadata)
             spec_metadata.prepare()

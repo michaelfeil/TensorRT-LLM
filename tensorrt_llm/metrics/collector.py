@@ -388,10 +388,10 @@ class MetricsCollector:
             name=self.metric_prefix + "total_context_tokens",
             documentation="Total number of context tokens",
             labelnames=self.labels.keys())
-        self.avg_decoded_tokens_per_iter = Gauge(
-            name=self.metric_prefix + "avg_decoded_tokens_per_iter",
-            documentation="Average number of decoded tokens per iteration",
-            labelnames=self.labels.keys())
+        # NB: avg_decoded_tokens_per_iter is exposed as a Histogram below
+        # (histogram_avg_decoded_tokens_per_iter). A same-named Gauge here would
+        # collide in the Prometheus registry ("Duplicated timeseries"), so the
+        # gauge variant is intentionally omitted.
 
         # Speculative decoding metrics
         self.counter_spec_decode_num_draft_tokens = Counter(
@@ -686,9 +686,8 @@ class MetricsCollector:
                                     gen_ppl)
             if avg_decoded_tokens_per_iter := metrics_dict.get(
                     MetricNames.AVG_DECODED_TOKENS_PER_ITER, 0):
-                self._log_histogram(
-                    self.histogram_avg_decoded_tokens_per_iter,
-                    avg_decoded_tokens_per_iter)
+                self._log_histogram(self.histogram_avg_decoded_tokens_per_iter,
+                                    avg_decoded_tokens_per_iter)
             if input_tokens := metrics_dict.get(MetricNames.INPUT_TOKENS, 0):
                 self._log_histogram(self.histogram_input_tokens, input_tokens)
             if output_tokens := metrics_dict.get(MetricNames.OUTPUT_TOKENS, 0):
@@ -813,9 +812,9 @@ class MetricsCollector:
                 if num_ctx_tokens > 0:
                     self._log_histogram(self.histogram_prefill_batch_tokens,
                                         num_ctx_tokens)
-            if "avgNumDecodedTokensPerIter" in ifb_stats:
-                self._log_gauge(self.avg_decoded_tokens_per_iter,
-                                ifb_stats["avgNumDecodedTokensPerIter"])
+            # avgNumDecodedTokensPerIter is captured via
+            # histogram_avg_decoded_tokens_per_iter (logged from metrics_dict),
+            # so no separate gauge is emitted here.
 
             # Prefill batch occupancy: context_requests / max_active_requests
             num_context = ifb_stats.get("numContextRequests", 0)

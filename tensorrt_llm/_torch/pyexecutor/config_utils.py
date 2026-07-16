@@ -1,12 +1,89 @@
 import dataclasses
 import re
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import transformers
 
 from tensorrt_llm.logger import logger
+
+_SPECULATORS_ONLY_KEYS = (
+    "auto_map",
+    "speculators_config",
+    "speculators_model_type",
+    "speculators_version",
+)
+
+
+def is_speculators_dspark_config(config: Dict[str, Any]) -> bool:
+    return config.get("speculators_model_type") == "dspark"
+
+
+def is_native_dspark_config(config: Dict[str, Any]) -> bool:
+    return "Qwen3DSparkModel" in (config.get("architectures") or [])
+
+
+def normalize_dspark_draft_config_dict(
+        config: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a DSpark draft config.json into the layout BasetenDSpark expects.
+
+    Speculators (RedHatAI) checkpoints nest the draft transformer under
+    ``transformer_layer_config``. Native DeepSeek checkpoints use a flat
+    ``Qwen3DSparkModel`` config with top-level head fields. BasetenDFlash-style
+    checkpoints already ship the target ``dflash_config``/``dspark_config``
+    bags. This returns that final flat layout in-memory.
+    """
+    if "dspark_config" in config and "dflash_config" in config:
+        return config
+    is_speculators = is_speculators_dspark_config(config)
+    is_native = is_native_dspark_config(config)
+    if not is_speculators and not is_native:
+        raise ValueError(
+            "Draft config is neither a BasetenDSpark layout (dspark_config + "
+            "dflash_config), a speculators DSpark config, nor a native "
+            "Qwen3DSparkModel config.")
+
+    layer_config: Dict[str, Any] = (config["transformer_layer_config"]
+                                    if is_speculators else config)
+    converted: Dict[str, Any] = dict(layer_config)
+    converted["architectures"] = ["DsparkQwenForCausalLM"]
+    converted["torch_dtype"] = config.get("dtype", "bfloat16")
+    # transformers>=5 nests rope config; TRT-LLM's qwen3 path reads rope_theta.
+    # A silently-defaulted rope_theta (10000) would collapse acceptance with
+    # no error, so require an explicit value from either layout.
+    rope_parameters: Dict[str, Any] = layer_config.get("rope_parameters") or {}
+    rope_theta: Any = rope_parameters.get("rope_theta",
+                                          layer_config.get("rope_theta"))
+    if rope_theta is None:
+        raise ValueError(
+            "DSpark draft config has no rope_theta under "
+            "transformer_layer_config or "
+            "transformer_layer_config.rope_parameters; refusing to default it.")
+    converted["rope_theta"] = rope_theta
+    converted["block_size"] = config["block_size"]
+    converted["dflash_config"] = {
+        "mask_token_id":
+        config["mask_token_id"],
+        "target_layer_ids":
+        config["aux_hidden_state_layer_ids"
+               if is_speculators else "target_layer_ids"],
+    }
+    converted["dspark_config"] = {
+        "markov_rank":
+        config.get("markov_rank", 0),
+        "markov_head_type":
+        config.get("markov_head_type", "vanilla"),
+        "enable_confidence_head":
+        config.get("enable_confidence_head", False),
+        "confidence_head_with_markov":
+        config.get("confidence_head_with_markov", True),
+        "draft_vocab_size":
+        config.get("draft_vocab_size"),
+    }
+    for key in _SPECULATORS_ONLY_KEYS:
+        converted.pop(key, None)
+    return converted
 
 
 def is_gemma4_hybrid(config):
@@ -454,6 +531,14 @@ def load_pretrained_config(model_name_or_path: str,
                            **kwargs) -> transformers.PretrainedConfig:
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
         model_name_or_path, **kwargs)
+    # Speculators DSpark nests the draft transformer and points auto_map at
+    # the remote ``speculators`` package. Flatten in-memory (same layout as
+    # BasetenDFlash checkpoints) so AutoConfig never needs trust_remote_code
+    # or a writable config.json rewrite.
+    dspark_normalized = (is_speculators_dspark_config(config_dict)
+                         or is_native_dspark_config(config_dict))
+    if dspark_normalized:
+        config_dict = normalize_dspark_draft_config_dict(config_dict)
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
 
@@ -462,6 +547,22 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif dspark_normalized:
+        # Must use from_dict: from_pretrained would re-read the nested file.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        if model_type not in CONFIG_MAPPING:
+            raise ValueError(
+                f"Unsupported DSpark draft model_type={model_type!r} after "
+                "speculators flatten; expected a transformers CONFIG_MAPPING "
+                "entry (e.g. 'qwen3').")
+        model_config = CONFIG_MAPPING[model_type].from_dict(config_dict)
+        # Qwen3Config may drop non-schema keys depending on transformers
+        # version; force the draft-side bags BasetenDSpark reads. Do not
+        # overwrite torch_dtype: from_dict normalizes its string value to a
+        # torch.dtype, which TRT-LLM needs when allocating draft weights.
+        for key in ("dflash_config", "dspark_config", "block_size"):
+            if key in config_dict:
+                setattr(model_config, key, config_dict[key])
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

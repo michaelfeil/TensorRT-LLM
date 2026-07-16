@@ -37,6 +37,7 @@ class Qwen3Attention(QKNormRoPEAttention):
         disable_deep_gemm: bool = False,
         reduce_output: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
+        apply_yarn_in_fused_rope: bool = False,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -82,6 +83,7 @@ class Qwen3Attention(QKNormRoPEAttention):
             disable_deep_gemm=disable_deep_gemm,
             reduce_output=reduce_output,
             mapping_with_cp=mapping_with_cp,
+            apply_yarn_in_fused_rope=apply_yarn_in_fused_rope,
         )
 
 

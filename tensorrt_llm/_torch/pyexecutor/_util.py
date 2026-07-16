@@ -907,10 +907,15 @@ class KvCacheCreator:
         back to the target model's config via _get_effective_draft_config().
         """
         if self._mapping.enable_attention_dp:
-            logger.info(
-                "Attention DP is enabled, separate draft KV cache is not supported."
-            )
-            return False
+            spec_cfg = self._speculative_config
+            is_baseten_dflash = (
+                spec_cfg is not None
+                and spec_cfg.spec_dec_mode.is_baseten_dflash_one_model())
+            if not is_baseten_dflash:
+                logger.info(
+                    "Attention DP is enabled, separate draft KV cache is not supported."
+                )
+                return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
     def _get_effective_draft_config(self) -> ModelConfig:
@@ -2319,9 +2324,10 @@ def create_torch_sampler_args(
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
                               speculative_config.tokens_per_gen_step - 1)
-    block_size = (speculative_config.block_size if
-                  (speculative_config is not None
-                   and speculative_config.spec_dec_mode.is_dflash()) else None)
+    block_size = (speculative_config.block_size if (
+        speculative_config is not None
+        and speculative_config.spec_dec_mode.is_baseten_dflash_one_model()) else
+                  None)
 
     return TorchSampler.Args(
         max_seq_len=max_seq_len,

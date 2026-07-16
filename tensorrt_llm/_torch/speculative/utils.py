@@ -13,6 +13,8 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
+from .baseten_dflash import BasetenDFlashOneModelWorker
+from .baseten_dspark import BasetenDSparkOneModelWorker
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
@@ -344,6 +346,11 @@ def get_num_spec_layers(spec_config):
         return 1
     if spec_config.spec_dec_mode.is_mtp_vanilla():
         return spec_config.num_nextn_predict_layers
+    if spec_config.spec_dec_mode.is_baseten_dflash_one_model():
+        from ..pyexecutor.config_utils import load_pretrained_config
+        draft_cfg = load_pretrained_config(str(spec_config.speculative_model),
+                                           trust_remote_code=True)
+        return draft_cfg.num_hidden_layers
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         num_eagle_layers = spec_config.num_eagle_layers
         return num_eagle_layers if num_eagle_layers is not None else 1
@@ -355,6 +362,12 @@ def get_spec_worker(spec_config,
                     mapping,
                     use_separate_draft_kv_cache: bool = False):
     spec_dec_mode = spec_config.spec_dec_mode
+    if spec_dec_mode.is_baseten_dspark_one_model():
+        return BasetenDSparkOneModelWorker(spec_config, mapping,
+                                           use_separate_draft_kv_cache)
+    if spec_dec_mode.is_baseten_dflash_one_model():
+        return BasetenDFlashOneModelWorker(spec_config, mapping,
+                                           use_separate_draft_kv_cache)
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config, model_config, use_separate_draft_kv_cache)
     if spec_dec_mode.is_mtp_eagle_one_model():
@@ -387,6 +400,8 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
+    if spec_config.spec_dec_mode.is_baseten_dflash_one_model():
+        return spec_config.block_size
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
     return 0
