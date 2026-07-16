@@ -1287,6 +1287,9 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             is_draft=is_draft,
             pool_configurations=pool_configurations,
         )
+        # The KV pools here are attention-only (mamba states live in the
+        # Python-side pool), but the model has linear attention layers.
+        self.has_linear_attention_layers = True
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         MambaCacheManager.prepare_resources(self, scheduled_batch)
@@ -1539,6 +1542,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
             )
+            # No linear_attention_metadata was passed above, so the rank-local
+            # is_linear_attention stays False; the model still has linear
+            # attention layers on other PP ranks.
+            self.has_linear_attention_layers = True
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)

@@ -155,6 +155,18 @@ def test_estimate_reusable_prompt_len_with_summary(kv_cache_manager):
     assert summary is None
 
 
+def test_estimate_reusable_prompt_len_skips_linear_attention(kv_cache_manager):
+    # Model-global flag: True on every rank of a hybrid model, including PP
+    # ranks whose local pools are attention-only.
+    kv_cache_manager.has_linear_attention_layers = True
+    request = _make_request(0, PROMPT_A)
+
+    reusable_len, summary = kv_cache_manager.estimate_reusable_prompt_len_with_summary(request)
+
+    assert reusable_len == 0
+    assert summary is None
+
+
 def test_probe_prefix_match_length(kv_cache_manager):
     assert kv_cache_manager.probe_prefix_match_length(PROMPT_A) == 0
 

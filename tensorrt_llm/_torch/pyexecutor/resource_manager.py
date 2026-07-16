@@ -418,6 +418,11 @@ class KVCacheManager(BaseResourceManager):
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
             w > 0 for w in self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
+        # Model-global counterpart to the rank-local is_linear_attention:
+        # hybrid managers force this True even on PP ranks that own no
+        # linear-attention layers, so scheduling-rank decisions (e.g. the
+        # schedulable reuse preview) hold for the whole model.
+        self.has_linear_attention_layers = self.is_linear_attention
 
         # Calculate kv cache blocks for each window size
         # FIXME: flashinfer.py accesses kv_cache_manager.blocks_in_primary_pool
@@ -1366,7 +1371,8 @@ class KVCacheManager(BaseResourceManager):
     def estimate_reusable_prompt_len_with_summary(
             self, request: LlmRequest) -> Tuple[int, Optional[object]]:
         if (not self.enable_block_reuse or self.enable_partial_reuse
-                or self.is_vswa or not request.is_first_context_chunk):
+                or self.is_vswa or self.has_linear_attention_layers
+                or not request.is_first_context_chunk):
             return 0, None
 
         # Sequence insertion ignores the last prompt token because its KV

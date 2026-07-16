@@ -2273,14 +2273,15 @@ class PyExecutor:
         # remaining prompt length. This lets multiple mostly-cached requests fit
         # into the same chunk when their actual remaining work is small. Apply
         # it only when local KV reuse can estimate whole-request reuse; partial
-        # reuse and VSWA already have more specific allocation behavior, and
-        # the KV connector path should not mutate prepopulation state before
-        # connector-managed cache loading runs.
+        # reuse, VSWA, and linear attention already have more specific
+        # allocation behavior, and the KV connector path should not mutate
+        # prepopulation state before connector-managed cache loading runs.
         return (self.enable_kv_cache_reuse
                 and self.kv_cache_manager is not None and hasattr(
                     self.kv_cache_manager, "estimate_reusable_prompt_len")
                 and not self.kv_cache_manager.enable_partial_reuse
                 and not self.kv_cache_manager.is_vswa
+                and not self.kv_cache_manager.has_linear_attention_layers
                 and self.kv_connector_manager is None)
 
     def _capture_schedulable_reuse_state(
