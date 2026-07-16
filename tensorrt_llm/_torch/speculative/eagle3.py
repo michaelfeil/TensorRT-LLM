@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
@@ -660,6 +675,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # Mode flag: True = MTP Eagle one-model, False = Eagle3 one-model.
         self.is_mtp_eagle = spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        self._use_greedy_draft_tokens = (self.is_mtp_eagle and getattr(
+            spec_config, 'use_greedy_draft_tokens', True))
 
         # SA enhancer (common to both modes)
         self.sa_enhancer: Optional[SADraftEnhancer] = None
@@ -1074,7 +1091,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # validity flag and d2t for next-iter target-side verification.
         if spec_metadata.use_rejection_sampling:
             if (not spec_metadata.is_all_greedy_sample
-                    and not uses_greedy_lm_head_tp_drafts):
+                    and not uses_greedy_lm_head_tp_drafts
+                    and not getattr(self, '_use_greedy_draft_tokens', False)):
                 d2t_param = getattr(getattr(draft_model, 'model', None), "d2t",
                                     None)
                 spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
@@ -1308,6 +1326,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         return accepted_tokens, num_accepted_tokens, sampled_log_probs
 
     def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata) -> bool:
+        if getattr(self, '_use_greedy_draft_tokens', False):
+            return False
         # ADP LM-head TP drafts use greedy TP-aware proposals even for
         # non-greedy requests. They do not populate proposal probabilities, so
         # target verification must use strict acceptance.
@@ -1342,6 +1362,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         '''
 
         d2t = getattr(getattr(draft_model, 'model', None), "d2t", None)
+        if getattr(self, '_use_greedy_draft_tokens', False):
+            return self.draft_sampler(logits)
         # All-greedy fast path must stay TP-aware. When the draft LM head is
         # plain tensor-parallel (tp_size>1 without attention DP), the draft
         # logits are sharded along the vocab dim. A plain per-rank argmax then

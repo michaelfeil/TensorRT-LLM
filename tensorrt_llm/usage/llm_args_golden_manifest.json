@@ -1654,6 +1654,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "speculative_config.use_greedy_draft_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "speculative_config.use_mtp_vanilla"
     },
     {
@@ -3870,6 +3877,13 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.use_dynamic_tree"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.use_greedy_draft_tokens"
     },
     {
       "allowed_values": [],

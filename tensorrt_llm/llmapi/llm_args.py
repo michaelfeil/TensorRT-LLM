@@ -2348,6 +2348,13 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
+    use_greedy_draft_tokens: bool = Field(
+        default=True,
+        description=
+        "Use TP-aware greedy sampling for MTP-Eagle draft proposals, regardless of the target request's sampling parameters. "
+        "When False, non-greedy requests use their temperature, top-k, and top-p settings for draft proposals. "
+        "Final target-token sampling is unaffected. Rejection sampling is bypassed while this option is enabled."
+    )
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
