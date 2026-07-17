@@ -3199,10 +3199,17 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     llmRequest1->addNewToken(100 + 2 * tokensPerBlock, beamIdx);
     kvCacheManager.addToken(requestId1);
 
-    // Verify that block 2 is free, has no parent
-    EXPECT_EQ(block2->getPrevBlock(), nullptr);
+    // Block 2 is detached from reuse but retains its old key.
+    EXPECT_EQ(block2->getLookupNode(), nullptr);
+    EXPECT_FALSE(block2->getUniqueTokens().empty());
     // Verify that it is block 0 that is in secondary
     auto block0 = blockManager.getBlockById(0, maxAttentionWindow);
+    EXPECT_FALSE(block0->isPrimary());
+
+    // Reject and reschedule the boundary token, as MTP does.
+    kvCacheManager.rewindKVCache(requestId1, 1);
+    kvCacheManager.addToken(requestId1);
+    EXPECT_EQ(seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx).back(), block2->getBlockId());
     EXPECT_FALSE(block0->isPrimary());
 
     // Cleanup

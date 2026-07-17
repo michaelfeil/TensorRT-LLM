@@ -1329,16 +1329,21 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
 {
     // eviction policy get free primary block
     auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel, wantPlaceholder);
+    bool isRegisteredForReuse{false};
+    {
+        std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
+        isRegisteredForReuse = block->getLookupNode() != nullptr;
+    }
     if (block->getUniqueTokens().empty())
     {
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
     // Offloading is an option only when these conditions are met:
-    // 1. Block contains state (evidenced by presence of tokens)
+    // 1. Block is registered for reuse and contains state
     // 2. Eviction policy indicated block can be offloaded
     // 3. At least one free block in secondary memory
-    if (!wantPlaceholder && !block->getUniqueTokens().empty() && canOffload
+    if (!wantPlaceholder && isRegisteredForReuse && !block->getUniqueTokens().empty() && canOffload
         && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
     {
         // Offload block in primary memory before repurposing
