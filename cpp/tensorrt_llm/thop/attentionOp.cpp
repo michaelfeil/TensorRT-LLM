@@ -363,8 +363,8 @@ public:
         torch::optional<torch::Tensor> softmax_stats_tensor,
         std::optional<torch::Tensor> spec_decoding_generation_lengths,
         std::optional<torch::Tensor> spec_decoding_position_offsets_for_cpp,
-        std::optional<torch::Tensor> spec_decoding_packed_mask,
-        std::optional<torch::Tensor> spec_decoding_bl_tree_mask_offset,
+        std::optional<torch::Tensor> spec_decoding_packed_mask, bool const is_ragged_gen, int32_t const max_gen_q_len,
+        std::optional<torch::Tensor> gen_cu_q_seqlens, std::optional<torch::Tensor> spec_decoding_bl_tree_mask_offset,
         std::optional<torch::Tensor> spec_decoding_bl_tree_mask,
         std::optional<torch::Tensor> spec_bl_tree_first_sparse_mask_offset_kv,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
@@ -432,8 +432,8 @@ public:
         torch::optional<torch::Tensor> softmax_stats_tensor,
         std::optional<torch::Tensor> spec_decoding_generation_lengths,
         std::optional<torch::Tensor> spec_decoding_position_offsets_for_cpp,
-        std::optional<torch::Tensor> spec_decoding_packed_mask,
-        std::optional<torch::Tensor> spec_decoding_bl_tree_mask_offset,
+        std::optional<torch::Tensor> spec_decoding_packed_mask, bool const is_ragged_gen, int32_t const max_gen_q_len,
+        std::optional<torch::Tensor> gen_cu_q_seqlens, std::optional<torch::Tensor> spec_decoding_bl_tree_mask_offset,
         std::optional<torch::Tensor> spec_decoding_bl_tree_mask,
         std::optional<torch::Tensor> spec_bl_tree_first_sparse_mask_offset_kv,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
@@ -861,9 +861,21 @@ public:
             TLLM_CHECK(batch_beam % beam_width == 0);
             int32_t const num_requests = batch_beam / beam_width;
 
-            TLLM_CHECK_WITH_INFO(num_tokens % num_seqs == 0,
-                "seq_len should be same for all generation requests, num_tokens=%d, num_seqs=%d", num_tokens, num_seqs);
-            int32_t const input_seq_length = num_tokens / num_seqs;
+            int32_t input_seq_length = 0;
+            if (is_ragged_gen)
+            {
+                TLLM_CHECK_WITH_INFO(spec_decoding_generation_lengths.has_value(),
+                    "Ragged generation requires spec_decoding_generation_lengths.");
+                TLLM_CHECK_WITH_INFO(max_gen_q_len > 0, "Ragged generation requires max_gen_q_len > 0.");
+                input_seq_length = max_gen_q_len;
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(num_tokens % num_seqs == 0,
+                    "seq_len should be same for all generation requests, num_tokens=%d, num_seqs=%d", num_tokens,
+                    num_seqs);
+                input_seq_length = num_tokens / num_seqs;
+            }
 
             common_enqueue_params.input_seq_length = input_seq_length;
             AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
@@ -922,6 +934,12 @@ public:
                         = spec_decoding_position_offsets_for_cpp->sizes()[1];
                 }
             }
+            else if (is_ragged_gen)
+            {
+                enqueue_params.spec_decoding_generation_lengths = spec_decoding_generation_lengths->data_ptr<int32_t>();
+                enqueue_params.spec_decoding_is_generation_length_variable = true;
+                enqueue_params.spec_decoding_max_generation_length = max_gen_q_len;
+            }
 
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
             if (op.isMLAEnabled())
@@ -942,6 +960,13 @@ public:
                     }
                 }
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
+                if (is_ragged_gen)
+                {
+                    TORCH_CHECK(gen_cu_q_seqlens.has_value(), "Ragged MLA generation requires gen_cu_q_seqlens.");
+                    TORCH_CHECK(gen_cu_q_seqlens->scalar_type() == at::ScalarType::Int,
+                        "gen_cu_q_seqlens must have int32 dtype.");
+                    mla_params.gen_cu_q_seqlens = gen_cu_q_seqlens->data_ptr<int32_t>();
+                }
                 {
                     op.mlaGeneration<T>(mla_params, enqueue_params, stream);
                 }
@@ -1028,7 +1053,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
     std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens)
+    std::optional<int64_t> spec_decoding_target_max_draft_tokens, bool const is_ragged_gen, int64_t const max_gen_q_len,
+    std::optional<torch::Tensor> gen_cu_q_seqlens)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1271,6 +1297,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         attn_input_type = static_cast<AttentionInputType>(attention_input_type.value());
     }
     bool const is_gen_only = attn_input_type == AttentionInputType::GenerationOnly;
+    int32_t const max_gen_q_len_i32 = static_cast<int32_t>(max_gen_q_len);
 
     int32_t const num_generations = num_seqs - static_cast<int32_t>(num_contexts);
     int32_t const num_tokens = qkv_or_q.size(0);
@@ -1321,7 +1348,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
             latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
             helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
+            spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, /*is_ragged_gen=*/false,
+            /*max_gen_q_len=*/0, /*gen_cu_q_seqlens=*/std::nullopt, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
@@ -1343,12 +1371,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
             latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
             helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
-            spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
-            sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
-            num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
+            spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, is_ragged_gen, max_gen_q_len_i32,
+            gen_cu_q_seqlens, spec_decoding_bl_tree_mask_offset, spec_decoding_bl_tree_mask,
+            spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices, sparse_kv_offsets,
+            sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value,
+            sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
+            quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits, trtllm_gen_jit_warmup,
+            compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

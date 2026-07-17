@@ -84,7 +84,17 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
     // The actual number of seqLenKv.
     int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
     // Consider the causal-mask speculative decoding.
-    seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
+    if (params.ptrCumSeqLensQ == nullptr)
+    {
+        seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
+    }
+    else
+    {
+        // Ragged batches: seqLenQ is per-request rather than params.mMaxSeqLenQ. A CTA
+        // may group multiple Q tokens, so size the KV reduction for its last valid token.
+        int32_t const lastTokenIdxQ{ctaIdxQ * params.mNumTokensPerCtaQ + numValidTokens - 1};
+        seqLenKv = seqLenKv - ((seqLenQ - 1) - lastTokenIdxQ);
+    }
     // Consider sparseAttnTopK and variable sparse MLA topK lengths.
     if (supportsVarSparseMlaTopKLens)
     {

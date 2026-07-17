@@ -56,6 +56,8 @@ class FmhaParams:
     num_requests: int = 0
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    is_ragged_gen: bool = False
+    max_gen_q_len: int = 0
 
 
 class PhasedFmha(Fmha):
@@ -224,12 +226,22 @@ class PhasedFmha(Fmha):
             max_past_kv_len = int(
                 host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
             )
-            input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
+            input_seq_length = (
+                metadata.max_gen_q_len
+                if metadata.is_ragged_gen
+                else num_gen_tokens // num_seqs
+                if num_seqs > 0
+                else 1
+            )
 
             predicted_tokens_per_seq = attn.predicted_tokens_per_seq
             spec_gen_lengths = None
             spec_pos_offsets = None
-            if metadata.is_spec_decoding_enabled and predicted_tokens_per_seq > 1:
+            # Ragged generation must forward the per-request q-lens even when
+            # is_spec_decoding_enabled is False
+            if (
+                metadata.is_spec_decoding_enabled and predicted_tokens_per_seq > 1
+            ) or metadata.is_ragged_gen:
                 spec_gen_lengths = metadata.spec_decoding_generation_lengths
                 position_offsets_for_cpp = metadata.spec_decoding_position_offsets_for_cpp
                 if position_offsets_for_cpp is not None and position_offsets_for_cpp.dim() == 1:
@@ -249,6 +261,8 @@ class PhasedFmha(Fmha):
             params.num_requests = num_seqs // metadata.beam_width
             params.spec_decoding_generation_lengths = spec_gen_lengths
             params.spec_decoding_position_offsets = spec_pos_offsets
+            params.is_ragged_gen = metadata.is_ragged_gen
+            params.max_gen_q_len = metadata.max_gen_q_len
             if attn.is_mla_enable:
                 self.run_mla_generation(params)
             else:

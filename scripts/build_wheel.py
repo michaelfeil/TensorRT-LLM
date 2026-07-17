@@ -793,8 +793,10 @@ def main(*,
             dst = os.path.abspath(dst)
             if os.path.isdir(dst):
                 dst = os.path.join(dst, os.path.basename(src))
-            if os.path.exists(dst):
+            if os.path.islink(dst) or os.path.isfile(dst):
                 os.remove(dst)
+            elif os.path.isdir(dst):
+                rmtree(dst)
             os.symlink(src, dst)
 
         install_file = symlink_remove_dst
@@ -802,7 +804,11 @@ def main(*,
         def symlink_remove_dst_tree(src, dst, dirs_exist_ok=True):
             src = os.path.abspath(src)
             dst = os.path.abspath(dst)
-            if dirs_exist_ok and os.path.exists(dst):
+            if dirs_exist_ok and os.path.islink(dst):
+                os.remove(dst)
+            elif dirs_exist_ok and os.path.isdir(dst):
+                rmtree(dst)
+            elif dirs_exist_ok and os.path.exists(dst):
                 os.remove(dst)
             os.symlink(src, dst)
 

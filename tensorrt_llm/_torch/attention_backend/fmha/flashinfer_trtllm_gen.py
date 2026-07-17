@@ -621,6 +621,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 "FlashInfer trtllm-gen does not support spec-dec tree/custom masks.",
             )
+        if meta.is_ragged_gen and is_mla_enable:
+            return (
+                False,
+                "FlashInfer trtllm-gen MLA does not support ragged generation.",
+            )
         if is_mla_enable and fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "trtllm-gen MLA supports generation-only attention."
 
@@ -1063,6 +1068,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.total_num_blocks,  # total_num_blocks
             params.kv_factor,  # kv_factor
             True,  # need_build_kv_cache_metadata
+            params.is_ragged_gen,  # is_ragged_gen
         )
 
         # FIXME: Flashinfer trtllm-gen API doesn't support a separate

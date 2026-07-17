@@ -143,6 +143,14 @@ class AttentionMetadata:
     cu_q_seqlens: Optional[torch.Tensor] = None
     cu_kv_seqlens: Optional[torch.Tensor] = None
 
+    # Per-request generation query boundaries for heterogeneous speculative
+    # batches. The executor populates these before attention; backends that
+    # support ragged generation consume the stable CUDA buffer.
+    is_ragged_gen: bool = False
+    max_gen_q_len: int = 0
+    _ragged_gen_q_lens_cuda: Optional[torch.Tensor] = None
+    gen_cu_q_seqlens: Optional[torch.Tensor] = None
+
     # These fields indicate whether the runtime can use various features.
     # The kernels may or may not have different behaviors when these
     # are enabled.

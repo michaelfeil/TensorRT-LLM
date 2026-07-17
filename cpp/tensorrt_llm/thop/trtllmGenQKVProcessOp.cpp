@@ -577,14 +577,17 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     int64_t const rotary_embedding_max_positions, int64_t const position_embedding_type, double const bmm1_scale,
     double const bmm2_scale, bool const fp8_context_fmha, int64_t const predicted_tokens_per_seq,
     int64_t const attention_chunk_size, int64_t const multi_processor_count, int64_t const total_num_blocks,
-    int64_t const kv_factor, bool const need_build_kv_cache_metadata)
+    int64_t const kv_factor, bool const need_build_kv_cache_metadata, bool const is_ragged_gen)
 {
     TORCH_CHECK(host_kv_cache_pool_pointers.has_value(), "host_kv_cache_pool_pointers is required.");
     TORCH_CHECK(host_kv_cache_pool_mapping.has_value(), "host_kv_cache_pool_mapping is required.");
     TORCH_CHECK(kv_cache_block_offsets.has_value(), "kv_cache_block_offsets is required.");
     (void) bmm2_scale;
 
-    bool const isMultiTokenGen = spec_decoding_generation_lengths.has_value() && predicted_tokens_per_seq > 1;
+    // Ragged generation (heterogeneous per-request q-lens) must take the
+    // multi-token path even when predicted_tokens_per_seq == 1 for ragged
+    bool const isMultiTokenGen
+        = spec_decoding_generation_lengths.has_value() && (predicted_tokens_per_seq > 1 || is_ragged_gen);
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
@@ -632,7 +635,10 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     decoderInfoParams.rotaryEmbeddingInvFreqCache = optPtr<float>(rotary_inv_freq);
     decoderInfoParams.rotaryEmbeddingCoeffCache = nullptr;
     decoderInfoParams.rotaryEmbeddingMaxPositions = static_cast<int>(rotary_embedding_max_positions);
-    bool const buildDecoderInfoNeeded = decoderInfoParams.isBuildDecoderInfoKernelNeeded();
+    // Multi-token generation (uniform spec-dec or ragged per-request q-lens)
+    // always needs BuildDecoderInfo because it produces cuSeqlens and
+    // tokensInfo.
+    bool const buildDecoderInfoNeeded = decoderInfoParams.isBuildDecoderInfoKernelNeeded() || isMultiTokenGen;
     if (buildDecoderInfoNeeded)
     {
         tensorrt_llm::kernels::invokeBuildDecoderInfo(decoderInfoParams, stream);

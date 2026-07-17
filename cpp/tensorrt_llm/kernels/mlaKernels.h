@@ -117,6 +117,10 @@ struct MlaParams
     // for Helix parallelism: whether the current rank is inactive, shape [b]
     // (the current query tokens are not appended to this rank's KV cache)
     bool const* helix_is_inactive_rank{nullptr};
+
+    // Cumulative q-seqlens for ragged generation. When set, generation kernels
+    // derive (batch_idx, local_token_idx) from this instead of uniform seq_len.
+    int32_t const* gen_cu_q_seqlens{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>

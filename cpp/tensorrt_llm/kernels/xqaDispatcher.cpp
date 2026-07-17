@@ -52,7 +52,7 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     XQALaunchParam<KVCacheBuffer> const& launchParams, void* xqa_q_input_ptr, Data_type QDataType,
     KvCacheDataType cache_type, int32_t batch_beam_size, KVCacheBuffer const& kv_cache_buffer,
     KVCacheBuffer const& kv_cache_block_scales_buffer, int32_t const* cu_seqlens, int32_t const* cu_kv_seqlens,
-    float const* rotary_inv_freq_buf, int multiProcessorCount)
+    int2 const* tokens_info, float const* rotary_inv_freq_buf, int multiProcessorCount)
 {
     QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms;
     memset(&preprocessingParms, 0, sizeof(preprocessingParms));
@@ -79,6 +79,7 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     preprocessingParms.seq_lens = params.spec_decoding_generation_lengths;
     preprocessingParms.cache_seq_lens = params.sequence_lengths;
     preprocessingParms.cu_seq_lens = cu_seqlens;
+    preprocessingParms.tokens_info = tokens_info;
     preprocessingParms.rotary_embedding_inv_freq = rotary_inv_freq_buf;
     preprocessingParms.rotary_coef_cache_buffer = params.rotary_cos_sin;
     preprocessingParms.qkv_scale_orig_quant = params.kv_scale_orig_quant;
@@ -361,6 +362,7 @@ void XqaDispatcher::runImpl(
         BuildDecoderInfoParams<T> decoder_params{};
         decoder_params.seqQOffsets = launchParams.cu_seq_lens;
         decoder_params.seqKVOffsets = launchParams.cu_kv_seq_lens;
+        decoder_params.tokensInfo = launchParams.tokens_info;
         decoder_params.seqQLengths = params.spec_decoding_generation_lengths;
         decoder_params.seqKVLengths = params.cross_attention ? params.encoder_input_lengths : params.sequence_lengths;
         decoder_params.batchSize = static_cast<int>(batch_beam_size);
@@ -384,11 +386,13 @@ void XqaDispatcher::runImpl(
         // Use the nullptr for cu_seqlens when it is not computed.
         int const* cu_seqlens{nullptr};
         int const* cu_kv_seqlens{nullptr};
+        int2 const* tokens_info{nullptr};
         if (decoder_params.isBuildDecoderInfoKernelNeeded())
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             cu_seqlens = launchParams.cu_seq_lens;
             cu_kv_seqlens = launchParams.cu_kv_seq_lens;
+            tokens_info = launchParams.tokens_info;
             invokeBuildDecoderInfo(decoder_params, params.stream);
             sync_check_cuda_error(params.stream);
         }
@@ -400,7 +404,7 @@ void XqaDispatcher::runImpl(
 
         auto preprocessingParms = makeQKVPreprocessingParams<T, KVCacheBuffer>(params, launchParams, xqa_q_input_ptr,
             mQDataType, cache_type, batch_beam_size, kv_cache_buffer, kv_cache_block_scales_buffer, cu_seqlens,
-            cu_kv_seqlens, rotary_inv_freq_buf, mMultiProcessorCount);
+            cu_kv_seqlens, tokens_info, rotary_inv_freq_buf, mMultiProcessorCount);
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, params.stream);
         sync_check_cuda_error(params.stream);
@@ -512,7 +516,11 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mJITWarmupMaxNumRequests = params.trtllm_gen_jit_warmup_max_num_requests;
         tllmRunnerParams.mJITWarmupMaxSeqLenQ = params.trtllm_gen_jit_warmup_max_seq_len_q;
         tllmRunnerParams.mJITWarmupMaxSeqLenKv = params.trtllm_gen_jit_warmup_max_seq_len_kv;
-        tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
+        // Variable per-request generation q-lens (ragged): the padded product over-counts
+        // the Q tokens, so pass the actual total. Uniform runs keep the padded product.
+        tllmRunnerParams.mSumOfSeqLensQ = params.spec_decoding_is_generation_length_variable
+            ? params.total_num_input_tokens
+            : int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
         // The chunked attention size.

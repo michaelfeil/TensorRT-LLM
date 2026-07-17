@@ -295,6 +295,31 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                         pin_memory=prefer_pinned())
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
+        # Ragged generation is captured by CUDA graphs, so these addresses
+        # must remain stable across capture and replay. Runtime preparation
+        # updates only the active prefixes in place.
+        self._ragged_gen_q_lens_cuda = self.get_empty(
+            buffers,
+            (self.max_num_requests, ),
+            cache_name="ragged_gen_q_lens_cuda",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        self.gen_cu_q_seqlens = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            cache_name="ragged_gen_cu_q_seqlens",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        if self.spec_decoding_generation_lengths is None:
+            self.spec_decoding_generation_lengths = self.get_empty(
+                buffers,
+                (self.max_num_requests, ),
+                cache_name="spec_decoding_generation_lengths",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
 
         if self.workspace is None:
             self.workspace = torch.empty(
@@ -1906,6 +1931,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
 
+        # Validation only for ragged generation
+        if (not metadata.is_ragged_gen and metadata.num_generations > 0
+                and fused_q.shape[0] % metadata.num_generations != 0):
+            raise RuntimeError(
+                "MLA generation received a ragged token span but "
+                "is_ragged_gen is False; gen_cu_q_seqlens would not be "
+                f"passed. num_tokens={fused_q.shape[0]}, "
+                f"num_generations={metadata.num_generations}, "
+                f"seq_lens={metadata.seq_lens.tolist() if metadata.seq_lens is not None else None}"
+            )
+
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
             q_pe,
@@ -1945,4 +1981,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.qk_rope_head_dim,
             self.v_head_dim,
             self.rope_append,
+            # Token-unit cumulative q-seqlens for heterogeneous (ragged)
+            # per-request generation q-lens; None for uniform lengths.
+            metadata.gen_cu_q_seqlens if metadata.is_ragged_gen else None,
         )

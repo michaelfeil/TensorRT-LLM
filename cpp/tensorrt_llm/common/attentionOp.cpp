@@ -1131,14 +1131,16 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mBatchSize = batch_beam;
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
-        // This should be set to numDraftTokens + 1.
-        tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
+        tllmRunnerParams.mMaxSeqLenQ
+            = params.gen_cu_q_seqlens != nullptr ? generation_params.input_seq_length : params.acc_q_len / batch_beam;
         tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
         tllmRunnerParams.mJITWarmup = generation_params.trtllm_gen_jit_warmup;
         tllmRunnerParams.mJITWarmupMaxNumRequests = mMaxNumRequests;
         tllmRunnerParams.mJITWarmupMaxSeqLenQ = mMaxContextLength;
         tllmRunnerParams.mJITWarmupMaxSeqLenKv = mMaxSeqLen;
-        tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
+        tllmRunnerParams.mSumOfSeqLensQ
+            = params.gen_cu_q_seqlens != nullptr ? params.acc_q_len : int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
+        tllmRunnerParams.cumSeqLensQPtr = params.gen_cu_q_seqlens;
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
