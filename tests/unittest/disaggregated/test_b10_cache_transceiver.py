@@ -22,6 +22,7 @@ import time
 import types
 from concurrent.futures import Future
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -2652,6 +2653,120 @@ def test_b10_desc_view_from_arrays_rejects_malformed_side_channel():
             (np.array([1, 9], dtype=np.int64), np.ones(2, dtype=np.int64), 0),
             (np.array([2], dtype=np.int64), np.ones(1, dtype=np.int64), 0),
         )
+
+
+def _make_b10_native_sender():
+    sender = native_transfer.Sender.__new__(native_transfer.Sender)
+    sender._agent = B10CacheTransferAgent
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    sender._send_failed_result_to_receiver = Mock()
+    sender._save_peer_req_info = Mock()
+    request = native_transfer.RecvReqInfo(
+        sender_req_id=1,
+        instance_name="decode",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=42,
+    )
+    return sender, request
+
+
+def test_b10_request_without_prefill_session_fails_immediately():
+    sender, request = _make_b10_native_sender()
+
+    sender._respond_with_kv(b"", [native_transfer.MessageType.REQUEST_DATA, request.to_bytes()])
+
+    sender._send_failed_result_to_receiver.assert_called_once_with(request)
+    sender._save_peer_req_info.assert_not_called()
+
+
+def test_b10_request_after_session_creation_is_dispatched_by_send():
+    sender, request = _make_b10_native_sender()
+    pending_requests = {}
+    sender._save_peer_req_info.side_effect = lambda info: pending_requests.update(
+        {info.instance_rank: info}
+    )
+    sender._get_req_info = lambda _rid: pending_requests
+    sender.dispatch_task = Mock()
+
+    session = native_transfer.TxSession.__new__(native_transfer.TxSession)
+    session._sender = sender
+    session._base_args = types.SimpleNamespace(
+        params=types.SimpleNamespace(disagg_request_id=request.unique_rid),
+        prompt_len=None,
+        beam_width=1,
+    )
+    session.request_id = request.unique_rid
+    session.receiver_ready = False
+    session.kv_tasks = []
+    session.aux_task = None
+    session.lock = threading.Lock()
+    session._exception = None
+    session._terminal_status = None
+    sender._sessions[request.unique_rid] = lambda: session
+
+    sender._respond_with_kv(b"", [native_transfer.MessageType.REQUEST_DATA, request.to_bytes()])
+    session.send(Mock())
+
+    sender._send_failed_result_to_receiver.assert_not_called()
+    sender.dispatch_task.assert_called_once()
+    assert sender.dispatch_task.call_args.args[0] is session.kv_tasks[0]
+    assert sender.dispatch_task.call_args.args[1] == {request.instance_rank: request}
+
+
+def test_b10_request_for_cancelled_prefill_session_fails_immediately():
+    sender, request = _make_b10_native_sender()
+    session = types.SimpleNamespace(
+        lock=threading.Lock(),
+        kv_tasks=[Mock()],
+        status=native_transfer.SessionStatus.CANCELLED,
+    )
+    sender._sessions[request.unique_rid] = lambda: session
+    sender._build_kv_write_meta = Mock()
+
+    sender._respond_with_kv(b"", [native_transfer.MessageType.REQUEST_DATA, request.to_bytes()])
+
+    sender._send_failed_result_to_receiver.assert_called_once_with(request)
+    sender._save_peer_req_info.assert_called_once_with(request)
+    sender._build_kv_write_meta.assert_not_called()
+
+
+def test_b10_queued_request_fails_if_prefill_session_closes():
+    sender = native_transfer.Sender.__new__(native_transfer.Sender)
+    sender._agent = B10CacheTransferAgent
+    sender._instance_rank = 3
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
+    task = Mock()
+    write_meta = native_transfer.WriteMeta(
+        task=task,
+        expected_transfers=1,
+        peer_name="decode0",
+        peer_rank=0,
+        peer_endpoint="tcp://decode",
+        unique_rid=42,
+        src_ptrs=np.array([], dtype=np.int64),
+        dst_ptrs=np.array([], dtype=np.int64),
+        sizes=np.array([], dtype=np.int64),
+        slice_id=0,
+    )
+
+    sender._deliver_kv_to_agent(write_meta)
+
+    task.fail.assert_called_once()
+    dealer.send.assert_called_once_with(
+        [
+            native_transfer.MessageType.KV_AGENT_RESULT,
+            b"3",
+            b"42",
+            b"0",
+            b"True",
+            native_transfer.AgentResult.FAILED.value.encode("ascii"),
+        ]
+    )
 
 
 def test_native_sender_side_channel_seam_passes_writemeta_arrays(monkeypatch):

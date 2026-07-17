@@ -554,6 +554,18 @@ class Sender(SenderBase):
             )
             logger.error(msg)
             write_meta.task.fail(RuntimeError(msg))
+            if getattr(self._agent, "fail_request_without_active_send_session", False):
+                assert write_meta.slice_id is not None
+                self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+                    [
+                        MessageType.KV_AGENT_RESULT,
+                        str(self._instance_rank).encode("ascii"),
+                        str(write_meta.unique_rid).encode("ascii"),
+                        str(write_meta.slice_id).encode("ascii"),
+                        b"True",  # Ensure the receiver resolves its task future.
+                        AgentResult.FAILED.value.encode("ascii"),
+                    ]
+                )
             return
         assert write_meta.slice_id is not None
         task = session.kv_tasks[write_meta.slice_id]
@@ -581,7 +593,7 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                 [
                     MessageType.KV_AGENT_RESULT,
                     str(self._instance_rank).encode("ascii"),
@@ -1061,20 +1073,30 @@ class Sender(SenderBase):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock serializes _enqueue calls from both paths.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        fail_inactive_session = getattr(
+            self._agent, "fail_request_without_active_send_session", False
+        )
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
-            if session is None:
+            if session is None and not fail_inactive_session:
                 self._save_peer_req_info(info)
                 return
+        if session is None:
+            self._send_failed_result_to_receiver(info)
+            return
+        send_failed_result = False
         with session.lock:
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)
-            # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
-            # Send it directly to unblock the receiver's TRANSFERRING task future;
-            # CANCEL_SESSION alone would leave it stuck indefinitely.
-            if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
-                self._send_failed_result_to_receiver(info)
-                return
+            # B10 requires an active session. Other agents need a direct reply
+            # only when no worker task remains to notify the receiver.
+            if session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED) and (
+                fail_inactive_session or not tasks
+            ):
+                send_failed_result = True
+        if send_failed_result:
+            self._send_failed_result_to_receiver(info)
+            return
         for task in tasks:
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(info.instance_rank)

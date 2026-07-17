@@ -568,6 +568,11 @@ else `TRTLLM_B10_UCXX_TRANSFER_TIMEOUT_S`, else 60 s. One end-to-end deadline
 READY, DATA, and RESULT. Idle persistent
 endpoints do not consume it while waiting for the next bootstrap control.
 
+B10 supports context-first scheduling only. Session registration on every TP
+rank is fenced before the prefill response is published. If decode then sends
+`REQUEST_DATA` without an active prefill `TxSession`, the sender returns
+`KV_AGENT_RESULT=FAILED` immediately.
+
 Timeout cleanup is request-scoped and must not mark the worker unhealthy. B10
 uses non-cancelling await wrappers (`_await_with_timeout(...,
 cancel_on_timeout=False)` in `async_utils.py`) so a timeout returns failure

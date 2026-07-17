@@ -67,6 +67,7 @@ class B10CacheTransferAgent(BaseTransferAgent):
     """
 
     supports_request_sync_message_metadata = True
+    fail_request_without_active_send_session = True
 
     def __init__(
         self,
