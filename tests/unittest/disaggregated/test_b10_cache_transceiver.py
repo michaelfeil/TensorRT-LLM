@@ -674,6 +674,17 @@ def test_b10_status_without_timeout_ids_keeps_success_path():
     assert session.close_calls == 1
 
 
+def test_b10_prepare_context_requests_skips_consensus_without_waiters():
+    transceiver = B10CacheTransceiver.__new__(B10CacheTransceiver)
+    transceiver._send_sessions = {}
+    transceiver._wait_reqs = {}
+    transceiver._ctx_consensus = Mock()
+
+    transceiver.prepare_context_requests([])
+
+    transceiver._ctx_consensus.assert_not_called()
+
+
 def test_b10_context_timeout_ids_wait_for_agent_writes_to_drain():
     request = _make_b10_timeout_request()
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS

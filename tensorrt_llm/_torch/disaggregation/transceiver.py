@@ -869,6 +869,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 self._wait_reqs[rid] = req
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
 
+        # _wait_reqs tracks generation-first requests waiting for peer info.
+        if not self._wait_reqs:
+            return
+
         # Check which waiting requests have peer info locally, then allgather
         # consensus so all TP/PP ranks agree before promoting.
         # Without consensus, background peer info arriving at different times on
