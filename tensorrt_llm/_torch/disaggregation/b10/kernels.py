@@ -499,9 +499,8 @@ def _scatter_cuda_buffers_to_vram_destination_order(
     if fragment_count == 0:
         return False
     # Every caller enforces single-device fragments before a plan is built:
-    # the request-level recv gate (_request_level_recv_scatter_chunk_indices
-    # in recv.py), the send gather gate (_send_gather_device_for_chunk via
-    # _single_cuda_device_for_spans), and the warmup constructions.
+    # the request-level recv gate in recv.py, CopyEngine's send-gather gate,
+    # and the warmup constructions.
     device_id = int(plan.device_ids[0])
     device = torch.device("cuda", device_id)
     use_aligned_kernel = _use_aligned_destination_scatter_plan(plan)
@@ -643,11 +642,9 @@ def _gather_vram_spans_to_pinned_staging(
     plan = _gather_plan_for_vram_spans(descs, spans, staging_base_ptr=staging_buffer.data_ptr())
     if plan.fragment_count == 0:
         return False
-    # Single-device sources are enforced by the send gather gate
-    # (SendPipeline._send_gather_device_for_chunk via
-    # RecvPipeline._single_cuda_device_for_spans)
-    # and by the warmup construction, mirroring the request-level scatter
-    # plan contract in _scatter_cuda_buffers_to_vram_destination_order.
+    # CopyEngine's send-gather gate and the warmup construction enforce
+    # single-device sources, matching the request-level scatter contract in
+    # _scatter_cuda_buffers_to_vram_destination_order.
     device_id = int(plan.device_ids[0])
     # The per-span loop pinned the thread's CUDA device via _make_buffer_view
     # (torch.cuda.set_device per span view); the kernel path must do the same

@@ -12,36 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Endpoint slot and generation lifecycle for the B10 UCXX transfer agent.
+"""Persistent send-endpoint slots and their generation lifecycle.
 
-`EndpointPool` is the endpoint collaborator constructed by
-`B10CacheTransferAgent.__init__`.
-
-Constructor-injected:
-
-- ``core`` (`_AgentCore`; uses ``core.loop`` for thread-safe slot retirement)
-- ``ucxx`` (UCXX module used to create endpoints)
-- ``tag_domain`` (local half of the pair tag domain)
-- ``endpoint_pool_size`` (slots per remote)
-- ``raise_if_cancel_requested`` (module-level send.py helper; injected
-  reference)
-
-Own state:
-
-- ``_remote_agents`` (remote name -> B10AgentDescriptor). Lives here rather
-  than on the core because peer descriptors and their endpoint slots must
-  stay coherent: a descriptor change invalidates the remote's slots.
-- ``_remote_slots`` (remote name -> list of _EndpointSlot; slot
-  ``endpoint``/``generation`` fields are mutated through the entries)
+Peer descriptors and slots live together so a descriptor change can retire
+the peer's endpoints atomically. One slot serializes a complete WRITE and each
+new endpoint advances its generation, isolating stale message tags.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from functools import partial
+from typing import Any
 
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
     _abort_endpoint_background,
-    _await_with_timeout,
+    _await_detached_with_timeout,
     _TransferDeadline,
 )
 from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
@@ -66,13 +51,11 @@ class EndpointPool:
         ucxx: Any,
         tag_domain: int,
         endpoint_pool_size: int,
-        raise_if_cancel_requested: Callable[[_TransferAbortHandle], None],
     ):
         self._core = core
         self._ucxx = ucxx
         self._tag_domain = tag_domain
         self._endpoint_pool_size = endpoint_pool_size
-        self._raise_if_cancel_requested = raise_if_cancel_requested
         self._remote_agents: dict[str, B10AgentDescriptor] = {}
         self._remote_slots: dict[str, list[_EndpointSlot]] = {}
 
@@ -93,28 +76,33 @@ class EndpointPool:
             endpoint_generation=slot.generation,
             tag_domain=_pair_tag_domain(self._tag_domain, plan.remote.tag_domain, slot_index),
         )
-        self._arm_send_abort_handle(abort_handle, lease)
+        self._bind_send_abort_handle(abort_handle, lease)
         return lease
 
-    def _arm_send_abort_handle(
+    def _bind_send_abort_handle(
         self,
         abort_handle: _TransferAbortHandle,
         lease: _SendEndpointLease,
         *,
         abort_endpoint: bool = True,
     ) -> None:
-        abort_handle.set_endpoint(
-            lease.endpoint,
-            lambda: self._core.loop.call_soon_threadsafe(
+        def retire_endpoint() -> None:
+            self._core.loop.call_soon_threadsafe(
                 self._retire_endpoint_slot,
                 lease.remote_name,
                 lease.slot_index,
                 lease.slot,
                 lease.endpoint,
-            ),
-            lambda: _abort_endpoint_background(lease.endpoint) if abort_endpoint else None,
+            )
+
+        abort_endpoint_callback = (
+            partial(_abort_endpoint_background, lease.endpoint) if abort_endpoint else None
         )
-        self._raise_if_cancel_requested(abort_handle)
+        abort_handle.bind_endpoint(
+            lease.endpoint,
+            retire_endpoint,
+            abort_endpoint_callback,
+        )
 
     def _retire_send_endpoint(
         self,
@@ -125,7 +113,7 @@ class EndpointPool:
         self._retire_endpoint_slot(lease.remote_name, lease.slot_index, lease.slot, lease.endpoint)
         if abort_endpoint:
             _abort_endpoint_background(lease.endpoint)
-        abort_handle.clear_endpoint(lease.endpoint)
+        abort_handle.unbind_endpoint(lease.endpoint)
 
     async def _refresh_stale_send_endpoint(
         self,
@@ -160,11 +148,10 @@ class EndpointPool:
             except TypeError as exc:
                 if "connect_timeout" not in str(exc):
                     raise
-                slot.endpoint = await _await_with_timeout(
+                slot.endpoint = await _await_detached_with_timeout(
                     self._ucxx.create_endpoint(remote.host, remote.port),
                     timeout_s,
                     on_late_result=_abort_endpoint_background,
-                    cancel_on_timeout=False,
                 )
         return slot.endpoint
 

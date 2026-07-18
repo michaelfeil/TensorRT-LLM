@@ -12,33 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared live state for the B10 UCXX transfer agent.
+"""State and buffer-ownership operations shared by both B10 pipelines.
 
-`_AgentCore` is a plain object constructed by
-`B10CacheTransferAgent.__init__` and handed to every collaborator. It owns
-the state both pipelines (and the agent shell) share:
-
-- ``config``: the resolved `B10AgentConfig`
-- ``loop``: the agent asyncio event loop
-- ``transfer_ids``: `B10TransferIdAllocator`
-- ``tag_registry``: `B10TagRegistry`
-- ``staging_buffer_pool`` / ``staging_buffer_slots``: pinned staging pool and
-  its concurrency permits (the staging-slot helper methods live here)
-- ``recv_scratch_buffer_pool``: CUDA scratch pool (recv fill; timing logs)
-- ``cuda_copy_streams``: per-device copy streams
-- ``max_in_flight_ops`` / ``sync_cuda_before_transfer`` /
-  ``transfer_timeout_s``: config-derived knobs both pipelines read
-- ``shutdown``: agent shutdown flag, set by the shell's ``shutdown()`` and
-  read by the recv pipeline's endpoint listener loop
+``_AgentCore`` owns the event loop, identity registries, staging and scratch
+pools, CUDA copy streams, and resolved runtime limits. Buffer permit helpers
+live here so send and receive share one ownership contract.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import time
+from typing import Any, Callable, Hashable
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
+    _acquire_with_timeout,
     _await_with_timeout,
     _TransferDeadline,
 )
@@ -47,10 +36,16 @@ from tensorrt_llm._torch.disaggregation.b10.memory import _BufferView
 from tensorrt_llm._torch.disaggregation.b10.pools import (
     _CudaCopyStreamPool,
     _CudaScratchBufferPool,
+    _format_staging_pool_state,
     _NoStagingBufferAvailableError,
     _PinnedStagingBufferPool,
+    _QuarantinedBufferViews,
 )
-from tensorrt_llm._torch.disaggregation.b10.protocol import B10TagRegistry, B10TransferIdAllocator
+from tensorrt_llm._torch.disaggregation.b10.protocol import (
+    B10TagRegistry,
+    B10TransferIdAllocator,
+    _transfer_message_tags,
+)
 
 
 class _AgentCore:
@@ -74,18 +69,47 @@ class _AgentCore:
         self.staging_buffer_slots = staging_buffer_slots
         self.recv_scratch_buffer_pool = recv_scratch_buffer_pool
         self.cuda_copy_streams = cuda_copy_streams
+        self._staging_quarantine_ttl_s = config.tag_quarantine_ttl_s
+        self._quarantined_staging_views: list[_QuarantinedBufferViews] = []
         self.max_in_flight_ops = config.max_in_flight_ops
         self.sync_cuda_before_transfer = config.sync_cuda_before_transfer
         self.transfer_timeout_s = config.transfer_timeout_s
         self.shutdown = False
 
+    def _reserve_message_tags(
+        self,
+        owner: Hashable,
+        transfer_id: int,
+        endpoint_generation: int,
+        tag_domain: int,
+        wire_chunk_count: int,
+    ) -> None:
+        self.tag_registry.reserve(
+            owner,
+            _transfer_message_tags(transfer_id, endpoint_generation, tag_domain, wire_chunk_count),
+        )
+
     async def _acquire_staging_buffer(self, size: int, deadline: _TransferDeadline) -> _BufferView:
+        return await self._acquire_pooled_buffer(
+            self.staging_buffer_slots,
+            lambda: self.staging_buffer_pool.acquire(size),
+            deadline,
+        )
+
+    @staticmethod
+    async def _acquire_pooled_buffer(
+        slots: asyncio.BoundedSemaphore,
+        acquire: Callable[[], _BufferView],
+        deadline: _TransferDeadline,
+    ) -> _BufferView:
+        """Checkout a pooled buffer and transfer its capacity permit."""
+
         while True:
-            await _await_with_timeout(self.staging_buffer_slots.acquire(), deadline.remaining_s())
+            await _acquire_with_timeout(slots, deadline.remaining_s())
             try:
-                return self.staging_buffer_pool.acquire(size)
+                return acquire()
             except _NoStagingBufferAvailableError:
-                self.staging_buffer_slots.release()
+                slots.release()
                 # A permit was free but no buffer was ready (transient while
                 # failed transfers hold buffers in quarantine). Back off and
                 # retry; remaining_s() raises TimeoutError once the transfer
@@ -93,7 +117,7 @@ class _AgentCore:
                 deadline.remaining_s()
                 await asyncio.sleep(0.001)
             except Exception:
-                self.staging_buffer_slots.release()
+                slots.release()
                 raise
 
     async def _release_staging_slot_after_event(self, event: Any) -> None:
@@ -123,6 +147,36 @@ class _AgentCore:
     def _release_staging_buffers(self, views: list[_BufferView]) -> None:
         self.staging_buffer_pool.release(views)
         self._release_staging_slots_for_views(views)
+
+    def _prune_quarantined_staging_buffers(self) -> None:
+        now = time.monotonic()
+        self._quarantined_staging_views = [
+            entry
+            for entry in self._quarantined_staging_views
+            if now - entry.quarantined_at < self._staging_quarantine_ttl_s
+            or any(
+                view.ready_event is not None and not view.ready_event.query()
+                for view in entry.views
+            )
+        ]
+
+    def _quarantine_staging_buffers(
+        self, transfer_id: int, views: list[_BufferView], direction: str
+    ) -> None:
+        self._prune_quarantined_staging_buffers()
+        if not views:
+            return
+        self.staging_buffer_pool.quarantine(views)
+        self._release_staging_slots_for_views(views)
+        self._quarantined_staging_views.append(
+            _QuarantinedBufferViews(views=views, quarantined_at=time.monotonic())
+        )
+        logger.warning(
+            f"B10 {direction} transfer {transfer_id} quarantined staging buffers: "
+            f"count={len(views)} "
+            f"active_quarantines={len(self._quarantined_staging_views)} "
+            f"{_format_staging_pool_state(self.staging_buffer_pool)}"
+        )
 
     @staticmethod
     def _event_ready_for_slot_release(event: Any, label: str) -> bool:

@@ -14,8 +14,10 @@
 # limitations under the License.
 """Transfer tracing and timing logs for the B10 UCXX transfer agent.
 
-`TransferTrace` is the tracing collaborator constructed by
-`B10CacheTransferAgent.__init__`.
+`TransferTracer` is the tracing collaborator constructed by
+`B10CacheTransferAgent.__init__`. Each active transfer owns a short-lived
+`TransferTrace`, which keeps timing state out of the send and receive
+pipelines.
 
 Constructor-injected:
 
@@ -23,12 +25,12 @@ Constructor-injected:
   snapshots read from ``core.staging_buffer_pool`` /
   ``core.recv_scratch_buffer_pool``)
 - ``trace_transfer_level`` (trace level string from B10AgentConfig)
-- ``request_id_from_sync_message`` (agent-shell helper; injected reference)
 """
 
 from __future__ import annotations
 
 import time
+from types import TracebackType
 from typing import Callable, Optional
 
 from tensorrt_llm import logger
@@ -38,75 +40,134 @@ from tensorrt_llm._torch.disaggregation.b10.pools import (
     _format_cuda_scratch_pool_state,
     _format_staging_pool_state,
 )
+from tensorrt_llm._torch.disaggregation.b10.protocol import _request_id_from_sync_message
 from tensorrt_llm._torch.disaggregation.b10.state import _SendTransferPlan
 
 
-class _TraceSpan:
-    """Times a `with` block into a timings dict via TransferTrace._add_elapsed_ms."""
+class _TraceTimer:
+    """Measure either a `with` block or an explicitly stopped interval."""
 
-    __slots__ = ("_trace", "_timings", "_key", "_start_s")
+    __slots__ = ("_trace", "_names", "_record_on_error", "_start_s")
 
-    def __init__(self, trace: TransferTrace, timings: dict[str, float], key: str):
+    def __init__(
+        self,
+        trace: TransferTrace,
+        names: tuple[str, ...],
+        *,
+        record_on_error: bool = False,
+    ) -> None:
         self._trace = trace
-        self._timings = timings
-        self._key = key
+        self._names = names
+        self._record_on_error = record_on_error
+        self._start_s = time.perf_counter() if trace.enabled else None
 
-    def __enter__(self):
-        self._start_s = time.perf_counter()
+    def __enter__(self) -> _TraceTimer:
         return self
 
-    def __exit__(self, exc_type, exc, tb):
-        # Match the manual pattern: no timing is recorded when the
-        # operation raises.
-        if exc_type is None:
-            self._trace._add_elapsed_ms(self._timings, self._key, self._start_s)
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        _exc: Optional[BaseException],
+        _traceback: Optional[TracebackType],
+    ) -> bool:
+        if exc_type is None or self._record_on_error:
+            self.stop()
+        else:
+            self._start_s = None
         return False
+
+    def stop(self) -> None:
+        if self._start_s is None:
+            return
+        self._trace._add_elapsed(self._names, self._start_s)
+        self._start_s = None
 
 
 class TransferTrace:
+    """Timing state owned by one send or receive transfer."""
+
+    __slots__ = ("_tracer", "_side", "transfer_id", "_started_s", "_values")
+
+    def __init__(self, tracer: TransferTracer, side: str, transfer_id: int) -> None:
+        self._tracer = tracer
+        self._side = side
+        self.transfer_id = transfer_id
+        self._started_s = time.perf_counter() if tracer.timings_enabled else None
+        self._values: dict[str, float] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self._started_s is not None
+
+    def measure(self, *names: str) -> _TraceTimer:
+        """Measure a successfully completed block."""
+        return _TraceTimer(self, names)
+
+    def measure_attempt(self, *names: str) -> _TraceTimer:
+        """Measure a block whether it completes or raises."""
+        return _TraceTimer(self, names, record_on_error=True)
+
+    def timer(self, *names: str) -> _TraceTimer:
+        return _TraceTimer(self, names)
+
+    def increment(self, name: str, value: int = 1) -> None:
+        if self.enabled:
+            self._values[name] = self._values.get(name, 0.0) + value
+
+    def set(self, name: str, value: int) -> None:
+        if self.enabled:
+            self._values[name] = float(value)
+
+    def debug(self, message: Callable[[], str]) -> None:
+        if self._tracer.debug_enabled:
+            logger.info(f"B10 {self._side} transfer {self.transfer_id} {message()}")
+
+    def _add_elapsed(self, names: tuple[str, ...], start_s: float) -> None:
+        elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+        for name in names:
+            self._values[name] = self._values.get(name, 0.0) + elapsed_ms
+
+    def _value(self, name: str) -> float:
+        return self._values.get(name, 0.0)
+
+    def _total_ms(self) -> float:
+        assert self._started_s is not None
+        return (time.perf_counter() - self._started_s) * 1000.0
+
+
+class TransferTracer:
     def __init__(
         self,
         core: _AgentCore,
         *,
         trace_transfer_level: str,
-        request_id_from_sync_message: Callable[[Optional[str]], Optional[int]],
-    ):
+    ) -> None:
         self._core = core
         self._trace_transfer_level = trace_transfer_level
-        self._request_id_from_sync_message = request_id_from_sync_message
 
-    def _transfer_trace_level(self) -> str:
+    @property
+    def level(self) -> str:
         return self._trace_transfer_level
 
-    def _trace_timings_enabled(self) -> bool:
-        return self._transfer_trace_level() != _TRACE_LEVEL_NONE
+    @property
+    def timings_enabled(self) -> bool:
+        return self.level != _TRACE_LEVEL_NONE
 
-    def _trace_debug_enabled(self) -> bool:
-        return self._transfer_trace_level() == _TRACE_LEVEL_DEBUG
+    @property
+    def debug_enabled(self) -> bool:
+        return self.level == _TRACE_LEVEL_DEBUG
 
-    def _trace_transfer(self, message: Callable[[], str]) -> None:
-        if self._trace_debug_enabled():
+    def debug(self, message: Callable[[], str]) -> None:
+        if self.debug_enabled:
             logger.info(message())
 
-    @staticmethod
-    def _elapsed_ms(start_s: float) -> float:
-        return (time.perf_counter() - start_s) * 1000.0
+    def start(self, side: str, transfer_id: int) -> TransferTrace:
+        return TransferTrace(self, side, transfer_id)
 
-    def _add_elapsed_ms(self, timings: dict[str, float], key: str, start_s: float) -> None:
-        if not self._trace_timings_enabled():
-            return
-        timings[key] = timings.get(key, 0.0) + self._elapsed_ms(start_s)
-
-    def span(self, timings: dict[str, float], key: str) -> _TraceSpan:
-        """Context manager recording the block's wall time under `key`."""
-        return _TraceSpan(self, timings, key)
-
-    def _log_recv_transfer_timings(
+    def log_recv(
         self,
-        transfer_id: int,
+        trace: TransferTrace,
         status: str,
-        timings: dict[str, float],
-        total_start_s: float,
         *,
         request_id: Optional[int] = None,
         desc_count: int,
@@ -117,69 +178,68 @@ class TransferTrace:
         span_count: int,
         recv_in_flight: int,
     ) -> None:
-        if not self._trace_timings_enabled():
+        if not trace.enabled:
             return
         logger.info(
-            f"B10 recv transfer {transfer_id} timings: status={status} "
+            f"B10 recv transfer {trace.transfer_id} timings: status={status} "
             f"request_id={request_id} "
-            f"total_ms={self._elapsed_ms(total_start_s):.3f} "
-            f"ready_send_ms={timings.get('ready_send_ms', 0.0):.3f} "
-            f"data_phase_wall_ms={timings.get('data_phase_wall_ms', 0.0):.3f} "
-            f"staging_acquire_ms={timings.get('staging_acquire_ms', 0.0):.3f} "
-            f"recv_scratch_acquire_ms={timings.get('recv_scratch_acquire_ms', 0.0):.3f} "
-            f"ucxx_recv_ms={timings.get('ucxx_recv_ms', 0.0):.3f} "
-            f"dst_copy_ms={timings.get('dst_copy_ms', 0.0):.3f} "
-            f"h2scratch_ms={timings.get('h2scratch_ms', 0.0):.3f} "
-            f"request_scatter_ms={timings.get('request_scatter_ms', 0.0):.3f} "
-            f"cuda_event_record_ms={timings.get('cuda_event_record_ms', 0.0):.3f} "
-            f"staging_release_ms={timings.get('staging_release_ms', 0.0):.3f} "
-            f"scratch_release_ms={timings.get('scratch_release_ms', 0.0):.3f} "
-            f"copy_event_wait_ms={timings.get('copy_event_wait_ms', 0.0):.3f} "
+            f"total_ms={trace._total_ms():.3f} "
+            f"ready_send_ms={trace._value('ready_send'):.3f} "
+            f"data_phase_wall_ms={trace._value('data_phase_wall'):.3f} "
+            f"staging_acquire_ms={trace._value('staging_acquire'):.3f} "
+            f"recv_scratch_acquire_ms={trace._value('recv_scratch_acquire'):.3f} "
+            f"ucxx_recv_ms={trace._value('ucxx_recv'):.3f} "
+            f"dst_copy_ms={trace._value('dst_copy'):.3f} "
+            f"h2scratch_ms={trace._value('h2scratch'):.3f} "
+            f"request_scatter_ms={trace._value('request_scatter'):.3f} "
+            f"cuda_event_record_ms={trace._value('cuda_event_record'):.3f} "
+            f"staging_release_ms={trace._value('staging_release'):.3f} "
+            f"scratch_release_ms={trace._value('scratch_release'):.3f} "
+            f"copy_event_wait_ms={trace._value('copy_event_wait'):.3f} "
             f"request_scatter_recovery_sync_ms="
-            f"{timings.get('request_scatter_recovery_sync_ms', 0.0):.3f} "
-            f"result_send_ms={timings.get('result_send_ms', 0.0):.3f} "
+            f"{trace._value('request_scatter_recovery_sync'):.3f} "
+            f"result_send_ms={trace._value('result_send'):.3f} "
             f"descs={desc_count} data_chunks={wire_chunk_count} "
             f"spans={span_count} total_bytes={total_bytes} "
             f"max_data_chunk_size={max_wire_chunk_size} copy_events={copy_events} "
-            f"request_scatter_chunks={int(timings.get('request_scatter_chunks', 0.0))} "
-            f"request_scatter_fragments={int(timings.get('request_scatter_fragments', 0.0))} "
-            f"request_scatter_kernels={int(timings.get('request_scatter_kernels', 0.0))} "
+            f"request_scatter_chunks={int(trace._value('request_scatter_chunks'))} "
+            f"request_scatter_fragments={int(trace._value('request_scatter_fragments'))} "
+            f"request_scatter_kernels={int(trace._value('request_scatter_kernels'))} "
             f"request_scatter_aligned_kernels="
-            f"{int(timings.get('request_scatter_aligned_kernels', 0.0))} "
+            f"{int(trace._value('request_scatter_aligned_kernels'))} "
             f"recv_in_flight={recv_in_flight} "
             f"{_format_staging_pool_state(self._core.staging_buffer_pool)} "
             f"{_format_cuda_scratch_pool_state(self._core.recv_scratch_buffer_pool)}"
         )
 
-    def _log_send_transfer_timings(
+    def log_send(
         self,
+        trace: TransferTrace,
         plan: _SendTransferPlan,
         status: str,
-        timings: dict[str, float],
-        total_start_s: float,
         *,
         span_count: int,
         send_in_flight: int,
     ) -> None:
-        if not self._trace_timings_enabled():
+        if not trace.enabled:
             return
         logger.info(
             f"B10 send transfer {plan.transfer_id} timings: status={status} "
-            f"request_id={self._request_id_from_sync_message(plan.sync_message)} "
-            f"total_ms={self._elapsed_ms(total_start_s):.3f} "
-            f"plan_build_ms={timings.get('plan_build_ms', 0.0):.3f} "
-            f"admission_wait_ms={timings.get('admission_wait_ms', 0.0):.3f} "
-            f"slot_lock_wait_ms={timings.get('slot_lock_wait_ms', 0.0):.3f} "
-            f"lease_ms={timings.get('lease_ms', 0.0):.3f} "
-            f"control_ready_ms={timings.get('control_ready_ms', 0.0):.3f} "
-            f"data_phase_wall_ms={timings.get('data_phase_wall_ms', 0.0):.3f} "
-            f"staging_acquire_ms={timings.get('staging_acquire_ms', 0.0):.3f} "
-            f"src_copy_ms={timings.get('src_copy_ms', 0.0):.3f} "
-            f"cuda_event_record_ms={timings.get('cuda_event_record_ms', 0.0):.3f} "
-            f"copy_event_wait_ms={timings.get('copy_event_wait_ms', 0.0):.3f} "
-            f"ucxx_send_ms={timings.get('ucxx_send_ms', 0.0):.3f} "
-            f"staging_release_ms={timings.get('staging_release_ms', 0.0):.3f} "
-            f"result_recv_ms={timings.get('result_recv_ms', 0.0):.3f} "
+            f"request_id={_request_id_from_sync_message(plan.sync_message)} "
+            f"total_ms={trace._total_ms():.3f} "
+            f"plan_build_ms={trace._value('plan_build'):.3f} "
+            f"admission_wait_ms={trace._value('admission_wait'):.3f} "
+            f"slot_lock_wait_ms={trace._value('slot_lock_wait'):.3f} "
+            f"lease_ms={trace._value('lease'):.3f} "
+            f"control_ready_ms={trace._value('control_ready'):.3f} "
+            f"data_phase_wall_ms={trace._value('data_phase_wall'):.3f} "
+            f"staging_acquire_ms={trace._value('staging_acquire'):.3f} "
+            f"src_copy_ms={trace._value('src_copy'):.3f} "
+            f"cuda_event_record_ms={trace._value('cuda_event_record'):.3f} "
+            f"copy_event_wait_ms={trace._value('copy_event_wait'):.3f} "
+            f"ucxx_send_ms={trace._value('ucxx_send'):.3f} "
+            f"staging_release_ms={trace._value('staging_release'):.3f} "
+            f"result_recv_ms={trace._value('result_recv'):.3f} "
             f"descs={plan.desc_count} data_chunks={plan.wire_chunk_count} "
             f"spans={span_count} src_spans={plan.src_span_count} "
             f"dst_spans={plan.dst_span_count} "

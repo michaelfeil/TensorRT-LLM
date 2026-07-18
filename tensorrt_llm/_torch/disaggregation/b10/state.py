@@ -32,10 +32,16 @@ _DEFAULT_CANCEL_DRAIN_TIMEOUT_S = 1.0
 
 
 class _EndpointSlot:
+    """Persistent endpoint state for one serialized send lane.
+
+    The send pipeline holds ``transfer_lock`` for the complete
+    control/READY/DATA/RESULT exchange.
+    """
+
     def __init__(self):
         self.endpoint: Optional[Any] = None
         self.generation: int = 0
-        self.lock = asyncio.Lock()
+        self.transfer_lock = asyncio.Lock()
 
 
 @dataclass(frozen=True)
@@ -69,7 +75,9 @@ class _SendTransferPlan:
     sync_message: Optional[str] = None
 
 
-class _StagingCheckoutTracker:
+class _BufferCheckoutTracker:
+    """Tracks checked-out views until normal or terminal cleanup owns them."""
+
     def __init__(self):
         self._views: list[b10_memory._BufferView] = []
 
@@ -88,55 +96,80 @@ class _StagingCheckoutTracker:
         return views
 
 
+@dataclass(frozen=True)
+class _EndpointAbortBinding:
+    endpoint: Any
+    retire: Callable[[], None]
+    abort: Optional[Callable[[], None]]
+
+
 class _TransferAbortHandle:
     def __init__(self):
         self._lock = threading.Lock()
-        self._endpoint: Optional[Any] = None
-        self._retire: Optional[Callable[[], None]] = None
-        self._abort: Optional[Callable[[], None]] = None
+        self._endpoint_binding: Optional[_EndpointAbortBinding] = None
+        self._task_binding: Optional[tuple[asyncio.AbstractEventLoop, asyncio.Task]] = None
         self._cancel_requested = False
-        self._abort_called = False
 
-    def set_endpoint(
-        self, endpoint: Any, retire: Callable[[], None], abort: Optional[Callable[[], None]] = None
-    ) -> None:
+    def bind_current_task(self) -> None:
+        """Bind cancellation to the current transfer task until it finishes.
+
+        ``abort()`` consumes the binding before cancelling the task, so a
+        repeated timeout or cancel cannot interrupt the task's cleanup.
+        """
+
+        task = asyncio.current_task()
+        assert task is not None
+        binding = (asyncio.get_running_loop(), task)
         with self._lock:
             cancel_requested = self._cancel_requested
-            self._endpoint = endpoint
-            self._retire = retire
-            self._abort = abort
-            should_abort = cancel_requested and abort is not None and not self._abort_called
-            if should_abort:
-                self._abort_called = True
+            if not cancel_requested:
+                assert self._task_binding is None
+                self._task_binding = binding
         if cancel_requested:
-            retire()
-            if should_abort:
-                abort()
+            raise asyncio.CancelledError
+        task.add_done_callback(self._clear_task_binding)
 
-    def clear_endpoint(self, endpoint: Any) -> None:
+    def _clear_task_binding(self, task: asyncio.Task) -> None:
         with self._lock:
-            if self._endpoint is endpoint:
-                self._endpoint = None
-                self._retire = None
-                self._abort = None
+            if self._task_binding is not None and self._task_binding[1] is task:
+                self._task_binding = None
+
+    def bind_endpoint(
+        self,
+        endpoint: Any,
+        retire_endpoint: Callable[[], None],
+        abort_endpoint: Optional[Callable[[], None]] = None,
+    ) -> None:
+        binding = _EndpointAbortBinding(endpoint, retire_endpoint, abort_endpoint)
+        with self._lock:
+            cancel_requested = self._cancel_requested
+            if not cancel_requested:
+                self._endpoint_binding = binding
+        if cancel_requested:
+            retire_endpoint()
+            if abort_endpoint is not None:
+                abort_endpoint()
+
+    def unbind_endpoint(self, endpoint: Any) -> None:
+        with self._lock:
+            binding = self._endpoint_binding
+            if binding is not None and binding.endpoint is endpoint:
+                self._endpoint_binding = None
 
     def abort(self) -> None:
         with self._lock:
             self._cancel_requested = True
-            endpoint = self._endpoint
-            retire = self._retire
-            abort = self._abort
-            should_abort = endpoint is not None and abort is not None and not self._abort_called
-            if should_abort:
-                self._abort_called = True
-        if retire is not None:
-            retire()
-        if should_abort:
-            abort()
-
-    def is_cancel_requested(self) -> bool:
-        with self._lock:
-            return self._cancel_requested
+            task_binding = self._task_binding
+            self._task_binding = None
+            endpoint_binding = self._endpoint_binding
+            self._endpoint_binding = None
+        if endpoint_binding is not None:
+            endpoint_binding.retire()
+            if endpoint_binding.abort is not None:
+                endpoint_binding.abort()
+        if task_binding is not None:
+            loop, task = task_binding
+            loop.call_soon_threadsafe(task.cancel)
 
 
 class B10TransferStatus(TransferStatus):

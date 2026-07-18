@@ -12,58 +12,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Send side of the B10 UCXX transfer agent: outgoing WRITEs.
+"""Send side of the B10 UCXX transfer agent.
 
-`SendPipeline` is the send collaborator constructed by
-`B10CacheTransferAgent.__init__`.
-
-Constructor-injected:
-
-- ``core`` (`_AgentCore`: loop, transfer ids, tag registry, staging pool
-  and its acquire/release helpers, copy streams, config-derived knobs)
-- ``endpoints`` (`EndpointPool`: slot lookup, leasing, retirement, stale
-  refresh, abort arming; peer descriptor registry)
-- ``trace`` (`TransferTrace`: transfer traces and send timing logs)
-- ``validate_send_source`` / ``send_admission_limit`` /
-  ``send_admission_bypass_bytes`` (send knobs from B10AgentConfig; the
-  admission semaphore is built here from the limit)
-- ``run_limited`` / ``reserve_message_tags`` /
-  ``request_id_from_sync_message`` (agent-shell helpers; injected
-  references)
-- ``copy_chunk_between_staging_and_descs`` /
-  ``quarantine_staging_buffers`` / ``single_cuda_device_for_spans``
-  (recv-pipeline helpers shared with the send path; injected so the two
-  pipelines never hold each other)
-
-Own state:
-
-- ``_source_ready_events`` guarded by ``_source_ready_events_lock``
-  (request id -> recorded CUDA events gating VRAM sends)
-- ``_send_admission`` (``None`` when admission gating is disabled)
+``SendPipeline`` plans and executes outgoing WRITEs over a leased persistent
+endpoint. A transfer owns its admission permit, endpoint slot, staging views,
+and tags until its single terminal cleanup boundary. See DESIGN.md "Anatomy
+of a WRITE" and "Timeout and failure handling".
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
-import time
-from typing import Any, Callable, Hashable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import numpy as np
 import torch
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.b10 import memory as b10_memory
 from tensorrt_llm._torch.disaggregation.b10 import net as b10_net
 from tensorrt_llm._torch.disaggregation.b10 import protocol as b10_protocol
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
-    _await_with_timeout,
+    _acquire_with_timeout,
+    _await_detached_with_timeout,
     _is_retryable_endpoint_error,
+    _lock_with_timeout,
+    _run_limited,
     _TransferDeadline,
 )
+from tensorrt_llm._torch.disaggregation.b10.copy_engine import _CopyEngine
 from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
 from tensorrt_llm._torch.disaggregation.b10.endpoints import EndpointPool
-from tensorrt_llm._torch.disaggregation.b10.kernels import _scatter_kernels_available, _span_view
+from tensorrt_llm._torch.disaggregation.b10.kernels import _span_view
 from tensorrt_llm._torch.disaggregation.b10.memory import (
     _BufferView,
     _DescArrayView,
@@ -81,7 +62,6 @@ from tensorrt_llm._torch.disaggregation.b10.planning import (
     _validate_matching_desc_sizes,
 )
 from tensorrt_llm._torch.disaggregation.b10.pools import (
-    _DEFAULT_SEND_GATHER_MIN_SPANS,
     _format_staging_pool_state,
     _record_cuda_copy_events,
 )
@@ -94,20 +74,21 @@ from tensorrt_llm._torch.disaggregation.b10.protocol import (
     _data_tag,
     _ready_tag,
     _recv_reply,
+    _request_id_from_sync_message,
     _result_tag,
     _send_obj,
 )
 from tensorrt_llm._torch.disaggregation.b10.state import (
     B10TransferStatus,
+    _BufferCheckoutTracker,
     _CompletedTransferStatus,
     _FailedTransferStatus,
     _SendEndpointLease,
     _SendTransferPlan,
     _SourceReadyEvents,
-    _StagingCheckoutTracker,
     _TransferAbortHandle,
 )
-from tensorrt_llm._torch.disaggregation.b10.timings import TransferTrace
+from tensorrt_llm._torch.disaggregation.b10.timings import TransferTrace, TransferTracer
 from tensorrt_llm._torch.disaggregation.base.agent import TransferRequest, TransferStatus
 
 
@@ -121,45 +102,49 @@ def _enum_name(value: Any) -> str:
     return text.split(":", maxsplit=1)[0].strip("<> ")
 
 
-def _raise_if_cancel_requested(abort_handle: _TransferAbortHandle) -> None:
-    # CancelledError is a BaseException: cancellation deliberately bypasses
-    # the per-chunk `except Exception` warning blocks and reaches the
-    # transfer-level failure funnel without error-log noise.
-    if abort_handle.is_cancel_requested():
-        raise asyncio.CancelledError
+@dataclass(slots=True)
+class _SendTransfer:
+    """Mutable state owned by one outgoing WRITE."""
+
+    plan: _SendTransferPlan
+    deadline: _TransferDeadline
+    abort_handle: _TransferAbortHandle
+    cleanup_event: Optional[threading.Event]
+    source_ready_events: Optional[_SourceReadyEvents]
+    trace: TransferTrace
+    lease: Optional[_SendEndpointLease] = None
+    staging_tracker: _BufferCheckoutTracker = field(default_factory=_BufferCheckoutTracker)
+    status: str = "unknown"
+    admission_acquired: bool = False
+    span_count: int = 0
+    send_in_flight: int = 0
+    tag_owner: tuple[str, int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.tag_owner = ("send", self.plan.transfer_id)
 
 
 class SendPipeline:
     def __init__(
         self,
         core: _AgentCore,
+        copies: _CopyEngine,
         endpoints: EndpointPool,
-        trace: TransferTrace,
+        tracer: TransferTracer,
         *,
         validate_send_source: bool,
         send_admission_limit: int,
         send_admission_bypass_bytes: int,
-        run_limited: Callable[..., Any],
-        reserve_message_tags: Callable[..., None],
-        request_id_from_sync_message: Callable[[Optional[str]], Optional[int]],
-        copy_chunk_between_staging_and_descs: Callable[..., Any],
-        quarantine_staging_buffers: Callable[..., None],
-        single_cuda_device_for_spans: Callable[..., Optional[torch.device]],
     ):
         self._core = core
+        self._copies = copies
         self._endpoints = endpoints
-        self._trace = trace
+        self._tracer = tracer
         self._validate_send_source = validate_send_source
         self._send_admission = (
             asyncio.Semaphore(send_admission_limit) if send_admission_limit > 0 else None
         )
         self._send_admission_bypass_bytes = send_admission_bypass_bytes
-        self._run_limited = run_limited
-        self._reserve_message_tags = reserve_message_tags
-        self._request_id_from_sync_message = request_id_from_sync_message
-        self._copy_chunk_between_staging_and_descs = copy_chunk_between_staging_and_descs
-        self._quarantine_staging_buffers = quarantine_staging_buffers
-        self._single_cuda_device_for_spans = single_cuda_device_for_spans
         self._source_ready_events: dict[int, _SourceReadyEvents] = {}
         self._source_ready_events_lock = threading.Lock()
 
@@ -213,7 +198,7 @@ class SendPipeline:
             return _CompletedTransferStatus()
         src_type = _enum_name(request.src_descs.type)
         dst_type = _enum_name(request.dst_descs.type)
-        request_id = self._request_id_from_sync_message(request.sync_message)
+        request_id = _request_id_from_sync_message(request.sync_message)
         source_ready_events = None
         if src_type == "VRAM":
             if request_id is None:
@@ -225,7 +210,7 @@ class SendPipeline:
                 )
         transfer_id = self._core.transfer_ids.allocate()
         desc_count, total_bytes, max_desc_size = _memory_desc_stats(src_descs)
-        self._trace._trace_transfer(
+        self._tracer.debug(
             lambda: f"B10 transfer {transfer_id} submitted: "
             f"remote={request.remote_name} "
             f"src_type={src_type} "
@@ -294,41 +279,7 @@ class SendPipeline:
                 torch.cuda.synchronize(buffer.device)
             elif not buffer.is_cuda:
                 buffer = buffer.numpy()
-        await _await_with_timeout(
-            endpoint.send(buffer, tag=tag), deadline.remaining_s(), cancel_on_timeout=False
-        )
-
-    def _send_gather_device_for_chunk(
-        self,
-        descs: _DescArrayView,
-        memory_type: str,
-        staging_buffer: Any,
-        spans: b10_memory._SpanArrays,
-    ) -> Optional[torch.device]:
-        """Device for the send-side single-kernel gather, or None for the loop.
-
-        Eligible when the chunk's sources are VRAM spans on one CUDA device,
-        the chunk is fragmented enough for per-span dispatch overhead to
-        matter, and the staging buffer is a pinned host tensor (UVA
-        device-addressable, so the gather kernel stores into it directly).
-        Sources are read-only, so unlike the recv scratch path no overlap
-        check is needed.
-        """
-        if memory_type != "VRAM":
-            return None
-        if len(spans) < _DEFAULT_SEND_GATHER_MIN_SPANS:
-            return None
-        if (
-            not isinstance(staging_buffer, torch.Tensor)
-            or staging_buffer.device.type != "cpu"
-            or not staging_buffer.is_pinned()
-        ):
-            return None
-        if not _scatter_kernels_available():
-            # Triton missing/broken: route to the per-span copy loop (which
-            # is what HEAD ran) instead of failing the send.
-            return None
-        return self._single_cuda_device_for_spans(descs, spans)
+        await _await_detached_with_timeout(endpoint.send(buffer, tag=tag), deadline.remaining_s())
 
     def _build_send_transfer_plan(
         self,
@@ -433,64 +384,57 @@ class SendPipeline:
 
     async def _send_control_and_wait_ready(
         self,
-        plan: _SendTransferPlan,
+        ctx: _SendTransfer,
         lease: _SendEndpointLease,
-        deadline: _TransferDeadline,
     ) -> None:
+        plan = ctx.plan
         ready_tag = _ready_tag(plan.transfer_id, lease.endpoint_generation, lease.tag_domain)
         result_tag = _result_tag(plan.transfer_id, lease.endpoint_generation, lease.tag_domain)
         await _send_obj(
             lease.endpoint,
             self._make_send_control(plan, lease),
             _BOOTSTRAP_CONTROL_TAG,
-            deadline.remaining_s(),
+            ctx.deadline.remaining_s(),
         )
-        self._trace._trace_transfer(
-            lambda: f"B10 send transfer {plan.transfer_id} control sent: "
-            f"ready_tag={ready_tag} result_tag={result_tag}"
-        )
+        ctx.trace.debug(lambda: f"control sent: ready_tag={ready_tag} result_tag={result_tag}")
         await _recv_reply(
-            lease.endpoint, plan.transfer_id, ready_tag, "READY", deadline.remaining_s()
+            lease.endpoint, plan.transfer_id, ready_tag, "READY", ctx.deadline.remaining_s()
         )
-        self._trace._trace_transfer(lambda: f"B10 send transfer {plan.transfer_id} READY received")
+        ctx.trace.debug(lambda: "READY received")
 
     async def _send_control_and_wait_ready_with_retry(
         self,
-        plan: _SendTransferPlan,
+        ctx: _SendTransfer,
         lease: _SendEndpointLease,
-        deadline: _TransferDeadline,
-        abort_handle: _TransferAbortHandle,
-        timings: dict[str, float],
-        tag_owner: Hashable,
     ) -> _SendEndpointLease:
+        plan = ctx.plan
+
         async def timed_control_ready(current_lease: _SendEndpointLease) -> None:
-            control_ready_start_s = time.perf_counter()
             reserved_tags = False
-            try:
-                self._reserve_message_tags(
-                    tag_owner,
-                    plan.transfer_id,
-                    current_lease.endpoint_generation,
-                    current_lease.tag_domain,
-                    plan.wire_chunk_count,
-                )
-                reserved_tags = True
-                await self._send_control_and_wait_ready(plan, current_lease, deadline)
-            except Exception:
-                if reserved_tags:
-                    self._core.tag_registry.quarantine(tag_owner)
-                raise
-            finally:
-                self._trace._add_elapsed_ms(timings, "control_ready_ms", control_ready_start_s)
+            with ctx.trace.measure_attempt("control_ready"):
+                try:
+                    self._core._reserve_message_tags(
+                        ctx.tag_owner,
+                        plan.transfer_id,
+                        current_lease.endpoint_generation,
+                        current_lease.tag_domain,
+                        plan.wire_chunk_count,
+                    )
+                    reserved_tags = True
+                    await self._send_control_and_wait_ready(ctx, current_lease)
+                except Exception:
+                    if reserved_tags:
+                        self._core.tag_registry.quarantine(ctx.tag_owner)
+                    raise
 
         async def refresh_and_ready(current_lease: _SendEndpointLease) -> _SendEndpointLease:
             refreshed_lease = await self._endpoints._refresh_stale_send_endpoint(
-                plan, current_lease, deadline, abort_handle
+                plan, current_lease, ctx.deadline, ctx.abort_handle
             )
             try:
                 await timed_control_ready(refreshed_lease)
             except BaseException:
-                self._endpoints._retire_send_endpoint(refreshed_lease, abort_handle)
+                self._endpoints._retire_send_endpoint(refreshed_lease, ctx.abort_handle)
                 raise
             return refreshed_lease
 
@@ -518,24 +462,18 @@ class SendPipeline:
             lease = await refresh_and_ready(lease)
         return lease
 
-    async def _send_transfer_chunks(
-        self,
-        plan: _SendTransferPlan,
-        lease: _SendEndpointLease,
-        deadline: _TransferDeadline,
-        staging_tracker: _StagingCheckoutTracker,
-        abort_handle: _TransferAbortHandle,
-        timings: dict[str, float],
-        counts: dict[str, int],
-        source_ready_events: Optional[_SourceReadyEvents],
-    ) -> None:
+    async def _send_transfer_chunks(self, ctx: _SendTransfer) -> None:
+        plan = ctx.plan
+        lease = ctx.lease
+        assert lease is not None
         source_ready_waited_keys: set[tuple[str, int]] = set()
 
         async def send_one(chunk: _TransferChunk, idx: int) -> None:
-            _raise_if_cancel_requested(abort_handle)
             try:
-                with self._trace.span(timings, "staging_acquire_ms"):
-                    staging_view = await self._core._acquire_staging_buffer(chunk.size, deadline)
+                with ctx.trace.measure("staging_acquire"):
+                    staging_view = await self._core._acquire_staging_buffer(
+                        chunk.size, ctx.deadline
+                    )
             except Exception as exc:
                 logger.warning(
                     f"B10 send transfer {plan.transfer_id} failed to acquire "
@@ -546,11 +484,10 @@ class SendPipeline:
                     f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
                 )
                 raise
-            staging_tracker.track(staging_view)
-            _raise_if_cancel_requested(abort_handle)
+            ctx.staging_tracker.track(staging_view)
             data_tag = _data_tag(plan.transfer_id, idx, lease.endpoint_generation, lease.tag_domain)
             try:
-                with self._trace.span(timings, "src_copy_ms"):
+                with ctx.trace.measure("src_copy"):
                     # Holds the gather kernel's metadata tensors (and any span
                     # views) until the copy events recorded on the copy stream
                     # are awaited below; on failure the refs drop early, which
@@ -558,7 +495,7 @@ class SendPipeline:
                     # CachingHostAllocator events backstop (see
                     # _upload_scatter_metadata_adhoc).
                     copy_lifetime_refs: list[_BufferView] = []
-                    span_count, copy_devices = self._copy_chunk_between_staging_and_descs(
+                    span_count, copy_devices = self._copies.copy_chunk(
                         plan.src_descs,
                         chunk,
                         plan.src_type,
@@ -566,29 +503,29 @@ class SendPipeline:
                         copy_from_staging=False,
                         lifetime_refs=copy_lifetime_refs,
                         staging_view=staging_view,
-                        source_ready_events=source_ready_events,
+                        source_ready_events=ctx.source_ready_events,
                         source_ready_waited_keys=source_ready_waited_keys,
                     )
-                    counts["spans"] += span_count
-                with self._trace.span(timings, "cuda_event_record_ms"):
+                    ctx.span_count += span_count
+                with ctx.trace.measure("cuda_event_record"):
                     copy_events = _record_cuda_copy_events(
                         copy_devices, self._core.cuda_copy_streams.stream_for
                     )
                 if copy_events:
-                    with self._trace.span(timings, "copy_event_wait_ms"):
-                        await self._core._wait_copy_events_async(copy_events, deadline)
+                    with ctx.trace.measure("copy_event_wait"):
+                        await self._core._wait_copy_events_async(copy_events, ctx.deadline)
                 copy_lifetime_refs.clear()
-                _raise_if_cancel_requested(abort_handle)
 
                 # The wire send: everything above staged this chunk into
                 # pinned host memory; this ships it to the peer.
-                with self._trace.span(timings, "ucxx_send_ms"):
-                    await self._send_buffer(lease.endpoint, staging_view.buffer, data_tag, deadline)
+                with ctx.trace.measure("ucxx_send"):
+                    await self._send_buffer(
+                        lease.endpoint, staging_view.buffer, data_tag, ctx.deadline
+                    )
 
-                _raise_if_cancel_requested(abort_handle)
-                with self._trace.span(timings, "staging_release_ms"):
+                with ctx.trace.measure("staging_release"):
                     self._core._release_staging_buffers([staging_view])
-                staging_tracker.untrack(staging_view)
+                ctx.staging_tracker.untrack(staging_view)
             except Exception as exc:
                 logger.warning(
                     f"B10 send transfer {plan.transfer_id} chunk failed: "
@@ -601,20 +538,19 @@ class SendPipeline:
 
         send_pool_buffers = self._core.staging_buffer_pool.num_buffers
         send_in_flight = max(1, min(self._core.max_in_flight_ops, send_pool_buffers))
-        counts["send_in_flight"] = send_in_flight
-        data_phase_start_s = time.perf_counter()
-        self._endpoints._arm_send_abort_handle(abort_handle, lease, abort_endpoint=False)
-        await self._run_limited(
-            [
-                (lambda chunk=chunk, idx=idx: send_one(chunk, idx))
-                for idx, chunk in enumerate(plan.transfer_chunks)
-            ],
-            transfer_id=plan.transfer_id,
-            phase="send DATA",
-            max_in_flight=send_in_flight,
-        )
-        self._trace._add_elapsed_ms(timings, "data_phase_wall_ms", data_phase_start_s)
-        self._trace._trace_transfer(lambda: f"B10 send transfer {plan.transfer_id} DATA complete")
+        ctx.send_in_flight = send_in_flight
+        self._endpoints._bind_send_abort_handle(ctx.abort_handle, lease, abort_endpoint=False)
+        with ctx.trace.measure("data_phase_wall"):
+            await _run_limited(
+                [
+                    (lambda chunk=chunk, idx=idx: send_one(chunk, idx))
+                    for idx, chunk in enumerate(plan.transfer_chunks)
+                ],
+                transfer_id=plan.transfer_id,
+                phase="send DATA",
+                max_in_flight=send_in_flight,
+            )
+        ctx.trace.debug(lambda: "DATA complete")
 
     async def _submit_write(
         self,
@@ -629,141 +565,132 @@ class SendPipeline:
         sync_message: Optional[str] = None,
         source_ready_events: Optional[_SourceReadyEvents] = None,
     ) -> bool:
-        # Failure funnel: nothing in this body releases resources on error.
-        # The BaseException handler in the data phase sweeps every staging
-        # view still checked out (staging_tracker.take_all) into quarantine
-        # and retires the endpoint lease; the outer finally settles the
-        # admission permit and releases (success) or quarantines (failure)
-        # the transfer's message tags. See DESIGN.md "Timeout and failure
-        # handling".
-        lease: Optional[_SendEndpointLease] = None
-        send_total_start_s = time.perf_counter()
-        send_timings: dict[str, float] = {}
-        send_counts = {"spans": 0, "send_in_flight": 0}
-        send_status = "unknown"
-        send_admission_acquired = False
+        trace = self._tracer.start("send", transfer_id)
         tag_owner = ("send", transfer_id)
         try:
-            with self._trace.span(send_timings, "plan_build_ms"):
+            abort_handle.bind_current_task()
+            with trace.measure("plan_build"):
                 plan = self._build_send_transfer_plan(
                     remote_name, transfer_id, src_type, src_descs, dst_type, dst_descs, sync_message
                 )
                 if self._validate_send_source:
                     self._validate_send_source_residency(plan)
-            deadline = _TransferDeadline(self._core.transfer_timeout_s)
-            if (
-                self._send_admission is not None
-                and plan.total_bytes >= self._send_admission_bypass_bytes
-            ):
-                with self._trace.span(send_timings, "admission_wait_ms"):
-                    await _await_with_timeout(
-                        self._send_admission.acquire(), deadline.remaining_s()
-                    )
-                    send_admission_acquired = True
-            slot_index, slot = self._endpoints._get_endpoint_slot(remote_name, transfer_id)
-            slot_lock_wait_start_s = time.perf_counter()
-            async with slot.lock:
-                self._trace._add_elapsed_ms(
-                    send_timings, "slot_lock_wait_ms", slot_lock_wait_start_s
-                )
-                with self._trace.span(send_timings, "lease_ms"):
-                    lease = await self._endpoints._lease_send_endpoint(
-                        plan, slot_index, slot, deadline, abort_handle
-                    )
-                self._trace._trace_transfer(
-                    lambda: f"B10 send transfer {transfer_id} begin: "
-                    f"remote={remote_name} remote_host={plan.remote.host} "
-                    f"remote_port={plan.remote.port} slot_index={slot_index} "
-                    f"endpoint_generation={lease.endpoint_generation} "
-                    f"tag_domain={lease.tag_domain} src_type={src_type} "
-                    f"dst_type={dst_type} descs={plan.desc_count} "
-                    f"data_chunks={plan.wire_chunk_count} "
-                    f"total_bytes={plan.total_bytes} "
-                    f"max_desc_size={plan.max_desc_size} "
-                    f"max_data_chunk_size={plan.max_wire_chunk_size} "
-                    f"desc_order={plan.desc_order_strategy} "
-                    f"src_spans={plan.src_span_count} "
-                    f"dst_spans={plan.dst_span_count} "
-                    f"max_in_flight_ops={self._core.max_in_flight_ops}"
-                )
-                staging_tracker = _StagingCheckoutTracker()
-                try:
-                    lease = await self._send_control_and_wait_ready_with_retry(
-                        plan, lease, deadline, abort_handle, send_timings, tag_owner
-                    )
-                    _raise_if_cancel_requested(abort_handle)
-                    await self._send_transfer_chunks(
-                        plan,
-                        lease,
-                        deadline,
-                        staging_tracker,
-                        abort_handle,
-                        send_timings,
-                        send_counts,
-                        source_ready_events,
-                    )
-                    _raise_if_cancel_requested(abort_handle)
-                    with self._trace.span(send_timings, "result_recv_ms"):
-                        await _recv_reply(
-                            lease.endpoint,
-                            transfer_id,
-                            _result_tag(transfer_id, lease.endpoint_generation, lease.tag_domain),
-                            "RESULT",
-                            deadline.remaining_s(),
-                        )
-                    _raise_if_cancel_requested(abort_handle)
-                    self._trace._trace_transfer(
-                        lambda: f"B10 send transfer {transfer_id} RESULT received: ok=True"
-                    )
-                    send_status = "success"
-                    return True
-                except BaseException as exc:
-                    cancelled = isinstance(exc, asyncio.CancelledError)
-                    send_status = "cancelled" if cancelled else "failed"
-                    checked_out_views = staging_tracker.take_all()
-                    self._quarantine_staging_buffers(transfer_id, checked_out_views, "send")
-                    failure_detail = (
-                        ""
-                        if cancelled
-                        else f"max_desc_size={plan.max_desc_size} "
-                        f"max_data_chunk_size={plan.max_wire_chunk_size} "
-                    )
-                    error_detail = "" if cancelled else f" error={type(exc).__name__}: {exc}"
-                    logger.warning(
-                        f"B10 send transfer {transfer_id} {send_status}: "
-                        f"remote={remote_name} slot_index={slot_index} "
-                        f"endpoint_generation={lease.endpoint_generation} "
-                        f"descs={plan.desc_count} "
-                        f"data_chunks={plan.wire_chunk_count} "
-                        f"total_bytes={plan.total_bytes} "
-                        f"{failure_detail}"
-                        f"checked_out_staging_buffers="
-                        f"{len(checked_out_views)}"
-                        f"{error_detail}"
-                    )
-                    self._endpoints._retire_send_endpoint(
-                        lease,
-                        abort_handle,
-                        abort_endpoint=(not cancelled and not isinstance(exc, TimeoutError)),
-                    )
-                    raise
-                finally:
-                    self._trace._log_send_transfer_timings(
-                        plan,
-                        send_status,
-                        send_timings,
-                        send_total_start_s,
-                        span_count=send_counts["spans"],
-                        send_in_flight=send_counts["send_in_flight"],
-                    )
-        finally:
-            if send_admission_acquired:
-                self._send_admission.release()
-            if send_status == "success":
-                self._core.tag_registry.release(tag_owner)
-            elif send_status in ("failed", "cancelled"):
-                self._core.tag_registry.quarantine(tag_owner)
-            if lease is not None:
-                abort_handle.clear_endpoint(lease.endpoint)
+        except BaseException:
+            self._core.tag_registry.quarantine(tag_owner)
             if cleanup_event is not None:
                 cleanup_event.set()
+            raise
+
+        ctx = _SendTransfer(
+            plan=plan,
+            deadline=_TransferDeadline(self._core.transfer_timeout_s),
+            abort_handle=abort_handle,
+            cleanup_event=cleanup_event,
+            source_ready_events=source_ready_events,
+            trace=trace,
+        )
+        try:
+            await self._execute_write(ctx)
+            ctx.status = "success"
+            return True
+        except BaseException as exc:
+            self._fail_write(ctx, exc)
+            raise
+        finally:
+            self._finish_write(ctx)
+
+    async def _execute_write(self, ctx: _SendTransfer) -> None:
+        plan = ctx.plan
+        if (
+            self._send_admission is not None
+            and plan.total_bytes >= self._send_admission_bypass_bytes
+        ):
+            with ctx.trace.measure("admission_wait"):
+                await _acquire_with_timeout(self._send_admission, ctx.deadline.remaining_s())
+                ctx.admission_acquired = True
+
+        slot_index, slot = self._endpoints._get_endpoint_slot(plan.remote_name, plan.transfer_id)
+        slot_lock_wait = ctx.trace.timer("slot_lock_wait")
+        async with _lock_with_timeout(slot.transfer_lock, ctx.deadline.remaining_s()):
+            slot_lock_wait.stop()
+            with ctx.trace.measure("lease"):
+                ctx.lease = await self._endpoints._lease_send_endpoint(
+                    plan, slot_index, slot, ctx.deadline, ctx.abort_handle
+                )
+            lease = ctx.lease
+            ctx.trace.debug(
+                lambda: f"begin: "
+                f"remote={plan.remote_name} remote_host={plan.remote.host} "
+                f"remote_port={plan.remote.port} slot_index={slot_index} "
+                f"endpoint_generation={lease.endpoint_generation} "
+                f"tag_domain={lease.tag_domain} src_type={plan.src_type} "
+                f"dst_type={plan.dst_type} descs={plan.desc_count} "
+                f"data_chunks={plan.wire_chunk_count} total_bytes={plan.total_bytes} "
+                f"max_desc_size={plan.max_desc_size} "
+                f"max_data_chunk_size={plan.max_wire_chunk_size} "
+                f"desc_order={plan.desc_order_strategy} "
+                f"src_spans={plan.src_span_count} dst_spans={plan.dst_span_count} "
+                f"max_in_flight_ops={self._core.max_in_flight_ops}"
+            )
+            ctx.lease = await self._send_control_and_wait_ready_with_retry(ctx, lease)
+            await self._send_transfer_chunks(ctx)
+            lease = ctx.lease
+            with ctx.trace.measure("result_recv"):
+                await _recv_reply(
+                    lease.endpoint,
+                    plan.transfer_id,
+                    _result_tag(plan.transfer_id, lease.endpoint_generation, lease.tag_domain),
+                    "RESULT",
+                    ctx.deadline.remaining_s(),
+                )
+            ctx.trace.debug(lambda: "RESULT received: ok=True")
+
+    def _fail_write(self, ctx: _SendTransfer, exc: BaseException) -> None:
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        ctx.status = "cancelled" if cancelled else "failed"
+        checked_out_views = ctx.staging_tracker.take_all()
+        self._core._quarantine_staging_buffers(ctx.plan.transfer_id, checked_out_views, "send")
+        lease = ctx.lease
+        if lease is None:
+            return
+        plan = ctx.plan
+        failure_detail = (
+            ""
+            if cancelled
+            else f"max_desc_size={plan.max_desc_size} "
+            f"max_data_chunk_size={plan.max_wire_chunk_size} "
+        )
+        error_detail = "" if cancelled else f" error={type(exc).__name__}: {exc}"
+        logger.warning(
+            f"B10 send transfer {plan.transfer_id} {ctx.status}: "
+            f"remote={plan.remote_name} slot_index={lease.slot_index} "
+            f"endpoint_generation={lease.endpoint_generation} "
+            f"descs={plan.desc_count} data_chunks={plan.wire_chunk_count} "
+            f"total_bytes={plan.total_bytes} {failure_detail}"
+            f"checked_out_staging_buffers={len(checked_out_views)}"
+            f"{error_detail}"
+        )
+        self._endpoints._retire_send_endpoint(
+            lease,
+            ctx.abort_handle,
+            abort_endpoint=(not cancelled and not isinstance(exc, TimeoutError)),
+        )
+
+    def _finish_write(self, ctx: _SendTransfer) -> None:
+        if ctx.admission_acquired:
+            self._send_admission.release()
+        if ctx.status == "success":
+            self._core.tag_registry.release(ctx.tag_owner)
+        elif ctx.status in ("failed", "cancelled"):
+            self._core.tag_registry.quarantine(ctx.tag_owner)
+        if ctx.lease is not None:
+            ctx.abort_handle.unbind_endpoint(ctx.lease.endpoint)
+        self._tracer.log_send(
+            ctx.trace,
+            ctx.plan,
+            ctx.status,
+            span_count=ctx.span_count,
+            send_in_flight=ctx.send_in_flight,
+        )
+        if ctx.cleanup_event is not None:
+            ctx.cleanup_event.set()

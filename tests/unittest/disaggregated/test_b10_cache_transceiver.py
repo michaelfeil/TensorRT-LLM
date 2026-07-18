@@ -29,7 +29,9 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.disaggregation.b10.agent as b10_agent
+import tensorrt_llm._torch.disaggregation.b10.async_utils as b10_async_utils
 import tensorrt_llm._torch.disaggregation.b10.config as b10_config
+import tensorrt_llm._torch.disaggregation.b10.copy_engine as b10_copy_engine
 import tensorrt_llm._torch.disaggregation.b10.kernels as b10_kernels
 import tensorrt_llm._torch.disaggregation.b10.memory as b10_memory
 import tensorrt_llm._torch.disaggregation.b10.net as b10_net
@@ -38,6 +40,7 @@ import tensorrt_llm._torch.disaggregation.b10.pools as b10_pools
 import tensorrt_llm._torch.disaggregation.b10.protocol as b10_protocol
 import tensorrt_llm._torch.disaggregation.b10.recv as b10_recv
 import tensorrt_llm._torch.disaggregation.b10.send as b10_send
+import tensorrt_llm._torch.disaggregation.b10.timings as b10_timings
 import tensorrt_llm._torch.disaggregation.b10.transceiver as b10_transceiver
 import tensorrt_llm._torch.disaggregation.base.agent as base_agent
 import tensorrt_llm._torch.disaggregation.native.transfer as native_transfer
@@ -67,7 +70,9 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 
-def _make_uninitialized_b10_agent() -> B10CacheTransferAgent:
+def _make_uninitialized_b10_agent(
+    *, loop: asyncio.AbstractEventLoop | None = None
+) -> B10CacheTransferAgent:
     class FakePool:
         def __init__(self, *, num_buffers=4, buffer_size=4):
             self.num_buffers = num_buffers
@@ -83,6 +88,7 @@ def _make_uninitialized_b10_agent() -> B10CacheTransferAgent:
 
     agent = B10CacheTransferAgent.__new__(B10CacheTransferAgent)
     core = b10_agent._AgentCore.__new__(b10_agent._AgentCore)
+    core.loop = loop or Mock()
     core.transfer_timeout_s = None
     core.max_in_flight_ops = 64
     core.tag_registry = b10_protocol.B10TagRegistry(
@@ -91,6 +97,8 @@ def _make_uninitialized_b10_agent() -> B10CacheTransferAgent:
     core.sync_cuda_before_transfer = False
     core.staging_buffer_pool = FakePool()
     core.staging_buffer_slots = asyncio.BoundedSemaphore(4)
+    core._staging_quarantine_ttl_s = b10_protocol._DEFAULT_TAG_QUARANTINE_TTL_S
+    core._quarantined_staging_views = []
     core.recv_scratch_buffer_pool = FakePool()
     core.cuda_copy_streams = b10_pools._CudaCopyStreamPool()
     agent._core = core
@@ -99,45 +107,324 @@ def _make_uninitialized_b10_agent() -> B10CacheTransferAgent:
         ucxx=None,
         tag_domain=1,
         endpoint_pool_size=1,
-        raise_if_cancel_requested=b10_send._raise_if_cancel_requested,
     )
-    agent._trace = b10_agent.TransferTrace(
+    agent._tracer = b10_agent.TransferTracer(
         core,
         trace_transfer_level=b10_config._TRACE_LEVEL_NONE,
-        request_id_from_sync_message=agent._request_id_from_sync_message,
     )
-    # Production wiring (agent.__init__): RecvPipeline first, SendPipeline
-    # injecting the recv helpers, send gather late-bound through the agent.
+    agent._copies = b10_copy_engine._CopyEngine(core)
     agent._recv = b10_agent.RecvPipeline(
         core,
-        agent._trace,
-        staging_quarantine_ttl_s=b10_protocol._DEFAULT_TAG_QUARANTINE_TTL_S,
-        run_limited=agent._run_limited,
-        reserve_message_tags=agent._reserve_message_tags,
-        request_id_from_sync_message=agent._request_id_from_sync_message,
-        send_gather_device_for_chunk=(
-            lambda *args: agent._send._send_gather_device_for_chunk(*args)
-        ),
+        agent._copies,
+        agent._tracer,
     )
     agent._send = b10_agent.SendPipeline(
         core,
+        agent._copies,
         agent._endpoints,
-        agent._trace,
+        agent._tracer,
         validate_send_source=False,
         send_admission_limit=0,
         send_admission_bypass_bytes=0,
-        run_limited=agent._run_limited,
-        reserve_message_tags=agent._reserve_message_tags,
-        request_id_from_sync_message=agent._request_id_from_sync_message,
-        copy_chunk_between_staging_and_descs=(agent._recv._copy_chunk_between_staging_and_descs),
-        quarantine_staging_buffers=agent._recv._quarantine_staging_buffers,
-        single_cuda_device_for_spans=agent._recv._single_cuda_device_for_spans,
     )
     agent._tag_domain = 1
     # Deterministic regardless of local CUDA availability: tests that
     # exercise the scratch paths set the device explicitly.
     agent._recv._recv_scratch_device = None
     return agent
+
+
+@pytest.mark.asyncio
+async def test_b10_lock_with_timeout_scopes_ownership():
+    lock = asyncio.Lock()
+
+    with pytest.raises(RuntimeError, match="body failed"):
+        async with b10_async_utils._lock_with_timeout(lock, 1.0):
+            assert lock.locked()
+            raise RuntimeError("body failed")
+    assert not lock.locked()
+
+    await lock.acquire()
+    try:
+        with pytest.raises(TimeoutError):
+            async with b10_async_utils._lock_with_timeout(lock, 0.001):
+                pytest.fail("timed-out waiter must not enter the block")
+        assert lock.locked()
+    finally:
+        lock.release()
+
+
+@pytest.mark.asyncio
+async def test_b10_interrupted_acquire_releases_late_ownership():
+    # Model acquisition completing after its caller has stopped waiting.
+    class LateLock(asyncio.Lock):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.finish = asyncio.Event()
+            self.released = asyncio.Event()
+
+        async def acquire(self) -> bool:
+            self.started.set()
+            try:
+                await self.finish.wait()
+            except asyncio.CancelledError:
+                await self.finish.wait()
+            return await super().acquire()
+
+        def release(self) -> None:
+            super().release()
+            self.released.set()
+
+    lock = LateLock()
+    waiter = asyncio.create_task(b10_async_utils._acquire_with_timeout(lock, 60.0))
+    await lock.started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    lock.finish.set()
+    await asyncio.wait_for(lock.released.wait(), 1.0)
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_b10_detached_wait_does_not_cancel_native_work():
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    completed = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def native_work():
+        started.set()
+        try:
+            await finish.wait()
+            completed.set()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    waiter = asyncio.create_task(b10_async_utils._await_detached_with_timeout(native_work(), None))
+    await started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert not cancelled.is_set()
+    finish.set()
+    await asyncio.wait_for(completed.wait(), 1.0)
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_b10_send_cancel_wakes_backpressure_wait():
+    abort_handle = _TransferAbortHandle()
+    lock = asyncio.Lock()
+    await lock.acquire()
+    waiting = asyncio.Event()
+
+    async def wait_for_lock():
+        abort_handle.bind_current_task()
+        waiting.set()
+        async with b10_async_utils._lock_with_timeout(lock, 60.0):
+            pytest.fail("cancelled send must not acquire the lock")
+
+    task = asyncio.create_task(wait_for_lock())
+    await waiting.wait()
+    abort_handle.abort()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert lock.locked()
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_b10_send_cancel_before_task_start():
+    abort_handle = _TransferAbortHandle()
+    abort_handle.abort()
+
+    with pytest.raises(asyncio.CancelledError):
+        abort_handle.bind_current_task()
+
+
+@pytest.mark.asyncio
+async def test_b10_repeated_send_cancel_does_not_interrupt_cleanup():
+    abort_handle = _TransferAbortHandle()
+    transfer_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def transfer():
+        try:
+            abort_handle.bind_current_task()
+            transfer_started.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await cleanup_release.wait()
+            raise
+
+    task = asyncio.create_task(transfer())
+    await transfer_started.wait()
+    abort_handle.abort()
+    await cleanup_started.wait()
+
+    abort_handle.abort()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize("abort_before_arm", [False, True])
+def test_b10_send_cancel_consumes_endpoint_callbacks(abort_before_arm):
+    abort_handle = _TransferAbortHandle()
+    retired = []
+    aborted = []
+    if abort_before_arm:
+        abort_handle.abort()
+
+    abort_handle.bind_endpoint(object(), lambda: retired.append(True), lambda: aborted.append(True))
+    abort_handle.abort()
+    abort_handle.abort()
+
+    assert retired == [True]
+    assert aborted == [True]
+
+
+@pytest.mark.asyncio
+async def test_b10_recv_cancel_wakes_backpressure_wait():
+    agent = _make_uninitialized_b10_agent(loop=asyncio.get_running_loop())
+    lock = asyncio.Lock()
+    await lock.acquire()
+    waiting = asyncio.Event()
+
+    async def wait_for_lock():
+        with agent._recv._requests.track_task(123):
+            waiting.set()
+            async with b10_async_utils._lock_with_timeout(lock, 60.0):
+                pytest.fail("cancelled receive must not acquire the lock")
+
+    task = asyncio.create_task(wait_for_lock())
+    await waiting.wait()
+    agent.cancel_recv_request(123)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert lock.locked()
+    activity = agent._recv._requests.new_activity(123)
+    with pytest.raises(asyncio.CancelledError):
+        activity.start_copy()
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_b10_repeated_recv_cancel_does_not_interrupt_cleanup():
+    agent = _make_uninitialized_b10_agent(loop=asyncio.get_running_loop())
+    transfer_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def transfer():
+        with agent._recv._requests.track_task(123):
+            try:
+                transfer_started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await cleanup_release.wait()
+                raise
+
+    task = asyncio.create_task(transfer())
+    await transfer_started.wait()
+    agent.cancel_recv_request(123)
+    await cleanup_started.wait()
+
+    agent.cancel_recv_request(123)
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_b10_recv_request_activity_owns_both_counts():
+    agent = _make_uninitialized_b10_agent(loop=asyncio.get_running_loop())
+    activity = agent._recv._requests.new_activity(123)
+
+    activity.start_transfer()
+    activity.start_copy()
+    assert agent.has_active_recv_request(123)
+    assert agent.has_active_recv_copy_request(123)
+
+    activity.finish()
+    assert not agent.has_active_recv_request(123)
+    assert not agent.has_active_recv_copy_request(123)
+
+
+@pytest.mark.asyncio
+async def test_b10_run_limited_cancels_and_drains_siblings_on_failure():
+    sibling_started = asyncio.Event()
+    sibling_finished = asyncio.Event()
+
+    async def sibling():
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_finished.set()
+
+    async def fail():
+        await sibling_started.wait()
+        raise RuntimeError("worker failed")
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        await b10_async_utils._run_limited([sibling, fail], max_in_flight=2)
+    assert sibling_finished.is_set()
+
+
+def test_b10_transfer_trace_records_completed_and_failed_attempts(monkeypatch):
+    clock = iter((0.0, 1.0, 3.0, 4.0, 7.0, 8.0, 13.0, 15.0))
+    monkeypatch.setattr(b10_timings.time, "perf_counter", lambda: next(clock))
+    trace = b10_timings.TransferTracer(
+        Mock(), trace_transfer_level=b10_config._TRACE_LEVEL_INFO
+    ).start("send", 1)
+
+    with trace.measure("completed"):
+        pass
+    with pytest.raises(RuntimeError):
+        with trace.measure("failed"):
+            raise RuntimeError
+    with pytest.raises(RuntimeError):
+        with trace.measure_attempt("failed_attempt"):
+            raise RuntimeError
+    timer = trace.timer("first", "second")
+    timer.stop()
+    timer.stop()
+
+    assert trace._value("completed") == 2_000.0
+    assert trace._value("failed") == 0.0
+    assert trace._value("failed_attempt") == 1_000.0
+    assert trace._value("first") == trace._value("second") == 2_000.0
+
+
+def test_b10_disabled_transfer_trace_does_not_read_clock(monkeypatch):
+    perf_counter = Mock(side_effect=AssertionError("disabled tracing read the clock"))
+    monkeypatch.setattr(b10_timings.time, "perf_counter", perf_counter)
+    trace = b10_timings.TransferTracer(
+        Mock(), trace_transfer_level=b10_config._TRACE_LEVEL_NONE
+    ).start("send", 1)
+
+    with trace.measure("ignored"):
+        pass
+    trace.timer("ignored").stop()
+
+    perf_counter.assert_not_called()
 
 
 def test_b10_runtime_is_python_style():
@@ -700,7 +987,7 @@ def test_b10_status_timeout_retires_endpoint_without_cancelling_future():
     retire_calls = []
     future = Future()
     abort_handle = _TransferAbortHandle()
-    abort_handle.set_endpoint(object(), lambda: retire_calls.append(True))
+    abort_handle.bind_endpoint(object(), lambda: retire_calls.append(True))
     status = B10TransferStatus(
         future,
         transfer_id,
@@ -722,7 +1009,7 @@ def test_b10_status_cancel_quarantines_tags_without_cancelling_future():
     future = Future()
     abort_handle = _TransferAbortHandle()
     retire_calls = []
-    abort_handle.set_endpoint(object(), lambda: retire_calls.append(True))
+    abort_handle.bind_endpoint(object(), lambda: retire_calls.append(True))
     status = B10TransferStatus(
         future,
         allocator.allocate(),
@@ -808,7 +1095,7 @@ def test_b10_sender_waits_on_source_ready_event_without_current_stream():
         stream_for=lambda device: fake_copy_stream
     )
 
-    copy_stream = agent._recv._copy_stream_for_device(
+    copy_stream = agent._copies._copy_stream_for_device(
         fake_device,
         {},
         wait_current_stream=True,
@@ -873,37 +1160,35 @@ def test_b10_sender_rejects_vram_request_without_source_ready_event():
     assert not status.wait()
 
 
-def test_b10_recv_scratch_slot_waits_when_event_query_fails():
-    async def run_test():
-        agent = _make_uninitialized_b10_agent()
-        agent._recv._recv_scratch_buffer_slots = asyncio.BoundedSemaphore(1)
-        await agent._recv._recv_scratch_buffer_slots.acquire()
+@pytest.mark.asyncio
+async def test_b10_recv_scratch_slot_waits_when_event_query_fails():
+    agent = _make_uninitialized_b10_agent()
+    agent._recv._recv_scratch_buffer_slots = asyncio.BoundedSemaphore(1)
+    await agent._recv._recv_scratch_buffer_slots.acquire()
 
-        class QueryFailingEvent:
-            def __init__(self):
-                self.synchronized = False
+    class QueryFailingEvent:
+        def __init__(self):
+            self.synchronized = False
 
-            def query(self):
-                raise RuntimeError("query failed")
+        def query(self):
+            raise RuntimeError("query failed")
 
-            def synchronize(self):
-                self.synchronized = True
+        def synchronize(self):
+            self.synchronized = True
 
-        event = QueryFailingEvent()
-        view = b10_memory._BufferView(
-            buffer=None,
-            owner=object(),
-            pool=agent._core.recv_scratch_buffer_pool,
-            ready_event=event,
-        )
+    event = QueryFailingEvent()
+    view = b10_memory._BufferView(
+        buffer=None,
+        owner=object(),
+        pool=agent._core.recv_scratch_buffer_pool,
+        ready_event=event,
+    )
 
-        agent._recv._release_recv_scratch_slots_for_views([view])
+    agent._recv._release_recv_scratch_slots_for_views([view])
 
-        await asyncio.wait_for(agent._recv._recv_scratch_buffer_slots.acquire(), timeout=0.5)
-        assert event.synchronized
-        agent._recv._recv_scratch_buffer_slots.release()
-
-    asyncio.run(run_test())
+    await asyncio.wait_for(agent._recv._recv_scratch_buffer_slots.acquire(), timeout=0.5)
+    assert event.synchronized
+    agent._recv._recv_scratch_buffer_slots.release()
 
 
 def test_b10_request_scatter_selection_requires_fragmentation_and_capacity():
@@ -2194,42 +2479,36 @@ def test_b10_send_gather_validates_staging_and_empty_spans(monkeypatch):
 def test_b10_send_gather_gating_routes_by_eligibility(monkeypatch):
     agent = _make_uninitialized_b10_agent()
     monkeypatch.setattr(torch, "Tensor", _FakeScatterCudaTensor)
-    monkeypatch.setattr(b10_send, "_scatter_kernels_available", lambda: True)
+    monkeypatch.setattr(b10_copy_engine, "_scatter_kernels_available", lambda: True)
     min_spans = b10_pools._DEFAULT_SEND_GATHER_MIN_SPANS
     descs, spans = _gather_span_case([8] * min_spans)
     staging = _FakePinnedStagingTensor()
 
-    assert agent._send._send_gather_device_for_chunk(descs, "VRAM", staging, spans) == torch.device(
+    assert agent._copies.send_gather_device(descs, "VRAM", staging, spans) == torch.device(
         "cuda", 0
     )
     # Triton missing/broken routes otherwise-eligible chunks to the loop.
-    monkeypatch.setattr(b10_send, "_scatter_kernels_available", lambda: False)
-    assert agent._send._send_gather_device_for_chunk(descs, "VRAM", staging, spans) is None
-    monkeypatch.setattr(b10_send, "_scatter_kernels_available", lambda: True)
-    assert agent._send._send_gather_device_for_chunk(descs, "DRAM", staging, spans) is None
+    monkeypatch.setattr(b10_copy_engine, "_scatter_kernels_available", lambda: False)
+    assert agent._copies.send_gather_device(descs, "VRAM", staging, spans) is None
+    monkeypatch.setattr(b10_copy_engine, "_scatter_kernels_available", lambda: True)
+    assert agent._copies.send_gather_device(descs, "DRAM", staging, spans) is None
     short_descs, short_spans = _gather_span_case([8] * (min_spans - 1))
+    assert agent._copies.send_gather_device(short_descs, "VRAM", staging, short_spans) is None
+    assert agent._copies.send_gather_device(descs, "VRAM", object(), spans) is None
     assert (
-        agent._send._send_gather_device_for_chunk(short_descs, "VRAM", staging, short_spans) is None
-    )
-    assert agent._send._send_gather_device_for_chunk(descs, "VRAM", object(), spans) is None
-    assert (
-        agent._send._send_gather_device_for_chunk(
+        agent._copies.send_gather_device(
             descs, "VRAM", _FakePinnedStagingTensor(pinned=False), spans
         )
         is None
     )
     assert (
-        agent._send._send_gather_device_for_chunk(
-            descs, "VRAM", _FakePinnedStagingTensor(cuda=True), spans
-        )
+        agent._copies.send_gather_device(descs, "VRAM", _FakePinnedStagingTensor(cuda=True), spans)
         is None
     )
     mixed_descs, mixed_spans = _gather_span_case(
         [8] * min_spans, device_ids=[idx % 2 for idx in range(min_spans)]
     )
-    assert (
-        agent._send._send_gather_device_for_chunk(mixed_descs, "VRAM", staging, mixed_spans) is None
-    )
+    assert agent._copies.send_gather_device(mixed_descs, "VRAM", staging, mixed_spans) is None
 
 
 def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
@@ -2247,7 +2526,7 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
     agent = _make_uninitialized_b10_agent()
     agent._core.cuda_copy_streams = types.SimpleNamespace(stream_for=lambda dev: fake_copy_stream)
     monkeypatch.setattr(torch, "Tensor", _FakeScatterCudaTensor)
-    monkeypatch.setattr(b10_send, "_scatter_kernels_available", lambda: True)
+    monkeypatch.setattr(b10_copy_engine, "_scatter_kernels_available", lambda: True)
 
     class _FakeCudaEvent:
         def __init__(self):
@@ -2292,7 +2571,7 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
         span_buffers[span.chunk_offset] = buffer
         return b10_memory._BufferView(buffer, buffer)
 
-    monkeypatch.setattr(b10_recv, "_span_view", fake_span_view)
+    monkeypatch.setattr(b10_copy_engine, "_span_view", fake_span_view)
 
     class _FakeStagingSlice:
         def __init__(self, start, stop):
@@ -2316,7 +2595,7 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
 
     gather_calls = []
     monkeypatch.setattr(
-        b10_recv,
+        b10_copy_engine,
         "_gather_vram_spans_to_pinned_staging",
         lambda *args, **kwargs: gather_calls.append((args, kwargs)) or True,
     )
@@ -2329,7 +2608,7 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
     staging = _FakeLoopStagingTensor()
     staging_view = b10_memory._BufferView(staging, staging)
     lifetime_refs = []
-    span_count, copy_devices = agent._recv._copy_chunk_between_staging_and_descs(
+    span_count, copy_devices = agent._copies.copy_chunk(
         descs,
         chunk,
         "VRAM",
@@ -2361,7 +2640,7 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
     chunk = b10_memory._TransferChunk(start=0, count=len(descs), size=sum(d.size for d in descs))
     staging = _FakeLoopStagingTensor()
     lifetime_refs = []
-    span_count, copy_devices = agent._recv._copy_chunk_between_staging_and_descs(
+    span_count, copy_devices = agent._copies.copy_chunk(
         descs,
         chunk,
         "VRAM",
@@ -2388,7 +2667,7 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
     descs, spans = _gather_span_case([8] * min_spans)
     chunk = b10_memory._TransferChunk(start=0, count=len(descs), size=sum(d.size for d in descs))
     staging = _FakeLoopStagingTensor()
-    span_count, copy_devices = agent._recv._copy_chunk_between_staging_and_descs(
+    span_count, copy_devices = agent._copies.copy_chunk(
         descs, chunk, "VRAM", staging, copy_from_staging=True
     )
     assert gather_calls == []
@@ -2410,7 +2689,7 @@ def test_b10_prune_quarantined_views_waits_for_pending_ready_event():
             return self.ready
 
     agent = _make_uninitialized_b10_agent()
-    agent._recv._staging_quarantine_ttl_s = 0.0  # every entry is past the TTL
+    agent._core._staging_quarantine_ttl_s = 0.0  # every entry is past the TTL
     event = _FakeReadyEvent()
     quarantined_at = time.monotonic() - 1.0
     pending = b10_pools._QuarantinedBufferViews(
@@ -2420,17 +2699,17 @@ def test_b10_prune_quarantined_views_waits_for_pending_ready_event():
     eventless = b10_pools._QuarantinedBufferViews(
         views=[b10_memory._BufferView(object(), object())], quarantined_at=quarantined_at
     )
-    agent._recv._quarantined_buffer_views = [pending, eventless]
+    agent._core._quarantined_staging_views = [pending, eventless]
 
     # The un-fired gather-kernel event keeps its entry alive past the TTL
     # (the kernel may still be pending on a wedged stream); entries without
     # events keep the plain TTL behavior.
-    agent._recv._prune_quarantined_buffer_views()
-    assert agent._recv._quarantined_buffer_views == [pending]
+    agent._core._prune_quarantined_staging_buffers()
+    assert agent._core._quarantined_staging_views == [pending]
 
     event.ready = True
-    agent._recv._prune_quarantined_buffer_views()
-    assert agent._recv._quarantined_buffer_views == []
+    agent._core._prune_quarantined_staging_buffers()
+    assert agent._core._quarantined_staging_views == []
 
 
 def test_b10_send_gather_byte_kernel_tripwire_warns_once(monkeypatch):

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from typing import Any, Callable, Hashable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -25,6 +25,7 @@ import torch
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.b10 import net as b10_net
 from tensorrt_llm._torch.disaggregation.b10.config import B10AgentConfig
+from tensorrt_llm._torch.disaggregation.b10.copy_engine import _CopyEngine
 from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
 from tensorrt_llm._torch.disaggregation.b10.endpoints import EndpointPool
 from tensorrt_llm._torch.disaggregation.b10.kernels import (
@@ -44,11 +45,10 @@ from tensorrt_llm._torch.disaggregation.b10.protocol import (
     B10AgentDescriptor,
     B10TagRegistry,
     B10TransferIdAllocator,
-    _transfer_message_tags,
 )
 from tensorrt_llm._torch.disaggregation.b10.recv import RecvPipeline
-from tensorrt_llm._torch.disaggregation.b10.send import SendPipeline, _raise_if_cancel_requested
-from tensorrt_llm._torch.disaggregation.b10.timings import TransferTrace
+from tensorrt_llm._torch.disaggregation.b10.send import SendPipeline
+from tensorrt_llm._torch.disaggregation.b10.timings import TransferTracer
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -147,40 +147,25 @@ class B10CacheTransferAgent(BaseTransferAgent):
             ucxx=self._ucxx,
             tag_domain=self._tag_domain,
             endpoint_pool_size=cfg.endpoint_pool_size,
-            raise_if_cancel_requested=_raise_if_cancel_requested,
         )
-        self._trace = TransferTrace(
+        self._tracer = TransferTracer(
             self._core,
             trace_transfer_level=cfg.trace_transfer_level,
-            request_id_from_sync_message=self._request_id_from_sync_message,
         )
-        # RecvPipeline is constructed first: SendPipeline injects three of
-        # its helpers. The send-side gather gate flows the other way, so it
-        # is closed over ``self`` and late-binds to ``self._send``.
+        self._copies = _CopyEngine(self._core)
         self._recv = RecvPipeline(
             self._core,
-            self._trace,
-            staging_quarantine_ttl_s=quarantine_ttl_s,
-            run_limited=self._run_limited,
-            reserve_message_tags=self._reserve_message_tags,
-            request_id_from_sync_message=self._request_id_from_sync_message,
-            send_gather_device_for_chunk=(
-                lambda *args: self._send._send_gather_device_for_chunk(*args)
-            ),
+            self._copies,
+            self._tracer,
         )
         self._send = SendPipeline(
             self._core,
+            self._copies,
             self._endpoints,
-            self._trace,
+            self._tracer,
             validate_send_source=cfg.validate_send_source,
             send_admission_limit=cfg.send_admission_limit,
             send_admission_bypass_bytes=cfg.send_admission_bypass_bytes,
-            run_limited=self._run_limited,
-            reserve_message_tags=self._reserve_message_tags,
-            request_id_from_sync_message=self._request_id_from_sync_message,
-            copy_chunk_between_staging_and_descs=(self._recv._copy_chunk_between_staging_and_descs),
-            quarantine_staging_buffers=self._recv._quarantine_staging_buffers,
-            single_cuda_device_for_spans=(self._recv._single_cuda_device_for_spans),
         )
         self._warm_scatter_kernels_at_startup()
         self._listener = None
@@ -211,7 +196,7 @@ class B10CacheTransferAgent(BaseTransferAgent):
             f"send_admission_bypass_bytes={cfg.send_admission_bypass_bytes} "
             f"tag_space_size={tag_space} "
             f"tag_quarantine_ttl_s={quarantine_ttl_s} "
-            f"trace_transfers={self._trace._trace_transfer_level} "
+            f"trace_transfers={self._tracer.level} "
             f"validate_send_source={cfg.validate_send_source} "
             f"ucx_net_devices={os.getenv('UCX_NET_DEVICES', '')} "
             f"{_format_staging_pool_state(self._core.staging_buffer_pool)} "
@@ -236,16 +221,16 @@ class B10CacheTransferAgent(BaseTransferAgent):
         return self._send.submit_transfer_requests_with_desc_arrays(request, src_arrays, dst_arrays)
 
     def record_source_ready_event(self, request_id: int, *, stream: Optional[Any] = None) -> None:
-        return self._send.record_source_ready_event(request_id, stream=stream)
+        self._send.record_source_ready_event(request_id, stream=stream)
 
     def discard_source_ready_event(self, request_id: int) -> None:
-        return self._send.discard_source_ready_event(request_id)
+        self._send.discard_source_ready_event(request_id)
 
     # Recv surface the transceiver's timeout recovery and the native
     # Receiver drive: permanent thin delegators to the recv pipeline.
 
     def cancel_recv_request(self, request_id: int) -> None:
-        return self._recv.cancel_recv_request(request_id)
+        self._recv.cancel_recv_request(request_id)
 
     def has_active_recv_request(self, request_id: int) -> bool:
         return self._recv.has_active_recv_request(request_id)
@@ -258,13 +243,13 @@ class B10CacheTransferAgent(BaseTransferAgent):
         # (see the RecvPipeline method for the listener contract), so this
         # plain delegator must exist exactly when the recv pipeline
         # supports it.
-        return self._recv.set_incoming_write_listener(listener)
+        self._recv.set_incoming_write_listener(listener)
 
     def register_memory(self, descs: RegMemoryDescs) -> None:
-        return None
+        pass
 
     def deregister_memory(self, descs: RegMemoryDescs) -> None:
-        return None
+        pass
 
     def load_remote_agent(self, name: str, agent_desc: bytes) -> None:
         descriptor = B10AgentDescriptor.from_bytes(agent_desc)
@@ -291,100 +276,6 @@ class B10CacheTransferAgent(BaseTransferAgent):
 
     def check_remote_descs(self, name: str, memory_descs: MemoryDescs) -> bool:
         return name in self._endpoints._remote_agents
-
-    @staticmethod
-    def _request_id_from_sync_message(sync_message: Optional[str]) -> Optional[int]:
-        if not sync_message:
-            return None
-        try:
-            return int(sync_message)
-        except (TypeError, ValueError):
-            return None
-
-    async def _run_limited(
-        self,
-        coroutine_factories: list[Callable[[], Any]],
-        *,
-        transfer_id: Optional[int] = None,
-        phase: str = "transfer",
-        max_in_flight: Optional[int] = None,
-    ) -> None:
-        total = len(coroutine_factories)
-        max_running = max(1, max_in_flight or self._core.max_in_flight_ops)
-        next_index = 0
-        running: set[asyncio.Task] = set()
-
-        def start_available_tasks() -> None:
-            nonlocal next_index
-            while next_index < total and len(running) < max_running:
-                running.add(asyncio.create_task(coroutine_factories[next_index]()))
-                next_index += 1
-            if running:
-                self._trace._trace_transfer(
-                    lambda: f"B10 {phase} transfer {transfer_id} window active: "
-                    f"started={next_index} completed={next_index - len(running)} "
-                    f"total={total} active={len(running)} "
-                    f"max_in_flight_ops={max_running}"
-                )
-
-        async def cancel_and_drain(tasks: list[asyncio.Task]) -> None:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        async def drain_tasks(tasks: list[asyncio.Task]) -> None:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        start_available_tasks()
-        while running:
-            try:
-                done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-            except asyncio.CancelledError:
-                logger.warning(
-                    f"B10 {phase} transfer {transfer_id} batch cancelled: "
-                    f"started={next_index} active={len(running)} total={total}"
-                )
-                await cancel_and_drain(list(running))
-                raise
-
-            try:
-                for task in done:
-                    await task
-            except asyncio.CancelledError:
-                logger.warning(
-                    f"B10 {phase} transfer {transfer_id} batch cancelled: "
-                    f"started={next_index} active={len(running)} total={total}"
-                )
-                await cancel_and_drain(list(running))
-                await drain_tasks(list(done))
-                raise
-            except Exception as exc:
-                logger.warning(
-                    f"B10 {phase} transfer {transfer_id} batch failed: "
-                    f"started={next_index} active={len(running)} total={total} "
-                    f"error={type(exc).__name__}: {exc}"
-                )
-                await cancel_and_drain(list(running))
-                await drain_tasks(list(done))
-                raise
-            start_available_tasks()
-        self._trace._trace_transfer(
-            lambda: f"B10 {phase} transfer {transfer_id} window complete: total={total}"
-        )
-
-    def _reserve_message_tags(
-        self,
-        owner: Hashable,
-        transfer_id: int,
-        endpoint_generation: int,
-        tag_domain: int,
-        wire_chunk_count: int,
-    ) -> None:
-        self._core.tag_registry.reserve(
-            owner,
-            _transfer_message_tags(transfer_id, endpoint_generation, tag_domain, wire_chunk_count),
-        )
 
     def _warm_scatter_kernels_at_startup(self) -> None:
         # The absolute-kernel parity warmup covers the send gather (and the

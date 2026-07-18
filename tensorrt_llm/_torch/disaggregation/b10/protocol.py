@@ -52,6 +52,15 @@ _DEFAULT_TAG_SPACE_SIZE = 1 << _TRANSFER_ID_BITS
 _DEFAULT_TAG_QUARANTINE_TTL_S = 120.0
 
 
+def _request_id_from_sync_message(sync_message: Optional[str]) -> Optional[int]:
+    if not sync_message:
+        return None
+    try:
+        return int(sync_message)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class B10AgentDescriptor:
     name: str
@@ -351,14 +360,12 @@ async def _recv_reply(
 async def _send_obj(
     endpoint: Any, payload: dict[str, Any], tag: int, timeout_s: Optional[float]
 ) -> None:
-    await b10_async_utils._await_with_timeout(
-        endpoint.send_obj(_pack_message(payload), tag=tag), timeout_s, cancel_on_timeout=False
+    await b10_async_utils._await_detached_with_timeout(
+        endpoint.send_obj(_pack_message(payload), tag=tag), timeout_s
     )
 
 
 async def _recv_obj(endpoint: Any, tag: int, timeout_s: Optional[float]) -> dict[str, Any]:
     return _unpack_message(
-        await b10_async_utils._await_with_timeout(
-            endpoint.recv_obj(tag=tag), timeout_s, cancel_on_timeout=False
-        )
+        await b10_async_utils._await_detached_with_timeout(endpoint.recv_obj(tag=tag), timeout_s)
     )

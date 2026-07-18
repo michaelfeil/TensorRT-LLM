@@ -126,12 +126,13 @@ creates the existing NIXL agent.
 | File | Owns |
 |---|---|
 | `b10/transceiver.py` | V2 adapter: staging-pool derivation, source-KV readiness (`resume_request` + source-ready event), B10-specific timeout recovery |
-| `b10/agent.py` | composition shell: UCXX listener and the agent event-loop thread, agent config wiring and collaborator construction, in-flight chunk windowing (`_run_limited`), scatter-kernel warmup, shutdown |
-| `b10/core.py` | `_AgentCore`: shared live state (loop, transfer ids, tag registry, staging/scratch pools, copy streams, config knobs) and the staging-slot plumbing |
-| `b10/send.py` | send pipeline collaborator (`SendPipeline`): submit surface, send plan and control message build, source validation, staging gather, DATA sends, admission gating |
-| `b10/recv.py` | recv pipeline collaborator (`RecvPipeline`): incoming-write handler, packed control decode, staging-to-destination copies, recv scratch and request-level scatter routing, recv cancellation tombstones |
+| `b10/agent.py` | composition shell: UCXX listener and event-loop thread, collaborator construction, scatter-kernel warmup, shutdown |
+| `b10/core.py` | `_AgentCore`: shared live state and ownership of tag reservation, staging permits, and staging quarantine |
+| `b10/copy_engine.py` | local descriptor ↔ staging copies shared by send and receive, including copy-stream and gather selection |
+| `b10/send.py` | send pipeline collaborator (`SendPipeline`): submit surface, send plan and control message build, source validation, DATA sends, admission gating |
+| `b10/recv.py` | recv pipeline collaborator (`RecvPipeline`): incoming-write lifecycle, packed control decode, recv scratch/request-level scatter routing, request cancellation |
 | `b10/endpoints.py` | endpoint pool collaborator (`EndpointPool`): peer descriptor registry, slot leasing, generation retirement, stale-endpoint refresh, abort arming |
-| `b10/timings.py` | transfer tracing and per-transfer timing logs (`TransferTrace` collaborator) |
+| `b10/timings.py` | transfer-owned timing state and timing-log formatting (`TransferTracer` / `TransferTrace`) |
 | `b10/config.py` | `B10AgentConfig`: env-var parsing and agent defaults |
 | `b10/protocol.py` | agent descriptors, control/reply packing, transfer-ID allocation, tag derivation, tag registry |
 | `b10/memory.py` | array-backed container vocabulary: descriptor/span views and the scatter-plan/chunk/buffer-view types |
@@ -160,7 +161,8 @@ ones before it:
    ([Buffer ownership](#buffer-ownership)).
 5. **`core.py`** — `_AgentCore`, the shared-state hub every collaborator
    holds; staging-slot admission lives here.
-6. **`send.py`, then `recv.py`** — the two pipelines, one direction each
+6. **`copy_engine.py`**, then **`send.py` and `recv.py`** — shared local
+   movement followed by the two wire pipelines, one direction each
    ([Anatomy of a WRITE](#anatomy-of-a-write)), with `endpoints.py` on the
    way for slot leasing and generation retirement.
 7. **`agent.py`** — the composition shell that wires the collaborators,
@@ -209,6 +211,11 @@ Cross-cutting contracts the code assumes everywhere but states nowhere else:
   `TimeoutError` the moment the deadline passes — it never returns zero or
   a negative. Retry loops are therefore time-bounded by construction, not
   count-bounded.
+- **Locks are scoped; capacity permits are transferred.** Mutexes use
+  `_lock_with_timeout` so ownership matches an `async with` block. Semaphore
+  callers use `_acquire_with_timeout` and release the permit at its true
+  lifetime boundary (sometimes after a CUDA event). Both helpers release
+  acquisitions that complete after timeout or cancellation.
 - **Failure quarantines; success releases.** On failure, resources the peer
   might still act on (staging views, message tags, endpoint generations,
   transfer ids) are parked for a TTL instead of returned — see
@@ -367,7 +374,7 @@ copy per DATA chunk for mostly-contiguous KV. With 512 MiB buffers and ~1 MiB
 descriptors, about 512 descriptors fit per full DATA message.
 
 The receive side picks a copy strategy per chunk (`_should_use_recv_scratch`
-and `_copy_chunk_between_staging_and_descs` in `recv.py`; the scatter
+in `recv.py` and `_CopyEngine.copy_chunk` in `copy_engine.py`; the scatter
 kernels live in `kernels.py`):
 
 ```mermaid
@@ -400,8 +407,7 @@ phase.
 ## Reading the timing logs
 
 `TRTLLM_B10_UCXX_TRACE_TRANSFERS=info` emits one line per transfer per side
-(`_log_send_transfer_timings` / `_log_recv_transfer_timings` in
-`timings.py`).
+(`TransferTracer.log_send` / `TransferTracer.log_recv` in `timings.py`).
 Two rules prevent misreading them:
 
 - **Wall-clock fields** (`total_ms`, `data_phase_wall_ms`, `control_ready_ms`,
@@ -574,21 +580,31 @@ rank is fenced before the prefill response is published. If decode then sends
 `KV_AGENT_RESULT=FAILED` immediately.
 
 Timeout cleanup is request-scoped and must not mark the worker unhealthy. B10
-uses non-cancelling await wrappers (`_await_with_timeout(...,
-cancel_on_timeout=False)` in `async_utils.py`) so a timeout returns failure
-without attempting to cancel a UCXX request from another thread. Before DATA, an
-endpoint-creation/control timeout may abort a leased endpoint because no DATA
-buffer is exposed; after DATA starts, timeout retires the endpoint generation
-but avoids `Endpoint.abort()`.
+uses non-cancelling await wrappers (`_await_detached_with_timeout` in
+`async_utils.py`) so a timeout returns failure without attempting to cancel a
+UCXX request from another thread. Before DATA, an endpoint-creation/control
+timeout may abort a leased endpoint because no DATA buffer is exposed; after
+DATA starts, timeout retires the endpoint generation but avoids
+`Endpoint.abort()`.
+
+Each send coroutine binds once to its `_TransferAbortHandle`. A status timeout
+or cancellation consumes that binding and cancels the task on the agent loop,
+waking admission, endpoint-slot, staging, UCXX, or reply waits without polling.
+Consuming the binding first also prevents repeated cancellation from interrupting
+the cleanup triggered by that cancellation. The non-cancelling UCXX wrappers
+above keep any native operation detached until it completes, while checked-out
+staging remains quarantined.
 
 Decode timeout is conservative: B10 blocks future receives for that request
 ID (a TTL-expiring tombstone sized to outlive the sender's transfer deadline)
-and cancels the native receive session immediately. Generation status maps
-the executor's timed-out Python request IDs to B10 disaggregation IDs, then
-keeps the session registered until active receive/copy work has drained on
-every participating rank. It force-fails any lingering native KV and AUX
-tasks before closing the session. If a UCXX receive completes after
-cancellation, B10 checks the tombstone before issuing any destination copy.
+and cancels the request's active endpoint-handler tasks on the agent loop, so
+capacity and backpressure waits wake without polling. The pre-READY copy
+registration is atomic with the tombstone and remains active until destination
+copy events drain. Generation status maps the executor's timed-out Python
+request IDs to B10 disaggregation IDs, then keeps the session registered until
+active receive/copy work has drained on every participating rank. It force-fails
+any lingering native KV and AUX tasks before closing the session. Detached UCXX
+receives may finish afterward, but their staging buffers remain quarantined.
 
 Native transfer cancellation is part of the contract: `SendTaskBase`
 (`native/transfer.py`) tracks
@@ -661,7 +677,7 @@ new generation and tag set.
 |---|---|---|
 | `TRTLLM_B10_UCXX_PORT` | 0 | listener port |
 | `TRTLLM_B10_UCXX_ENDPOINT_POOL_SIZE` | 1 | endpoint slots per peer agent |
-| `TRTLLM_B10_UCXX_MAX_IN_FLIGHT_OPS` | 64 | active DATA chunk tasks per transfer (`_run_limited` in `agent.py`) |
+| `TRTLLM_B10_UCXX_MAX_IN_FLIGHT_OPS` | 64 | active DATA chunk tasks per transfer (`_run_limited` in `async_utils.py`) |
 | `TRTLLM_B10_UCXX_SEND_ADMISSION_LIMIT` | 3 | concurrent large sends per agent (0 disables); unbounded concurrency time-slices the copy stream, NIC, and staging pool so every transfer's latency balloons (v1 C++ uses send concurrency 1) |
 | `TRTLLM_B10_UCXX_SEND_ADMISSION_BYPASS_BYTES` | 536870912 | sends below this skip the admission gate, keeping small transfers ahead of FIFO head-of-line blocking |
 | `TRTLLM_B10_UCXX_TRANSFER_TIMEOUT_S` | 60 | internal deadline when `kv_transfer_timeout_ms` unset; <=0 disables |
@@ -797,7 +813,7 @@ hot path:
 - `_SpanArrays` — a chunk's contiguous spans (`starts`, `sizes`,
   `chunk_offsets`), the sole output of `_contiguous_desc_spans`. Consumed
   directly by the scatter/gather kernel metadata assembly and the routing
-  gates (`_single_cuda_device_for_spans`, `_use_aligned_scatter_kernel`,
+  gates (`_CopyEngine.single_cuda_device`, `_use_aligned_scatter_kernel`,
   `metadata_fits`).
 - `_DestinationScatterPlan` — destination-ordered copy fragments
   (`src_ptrs`, `dst_ptrs`, `sizes`, `device_ids`), feeding the
@@ -832,7 +848,7 @@ contract documented there), or per-section `copy_` into the preallocated
 per-scratch-buffer tensor pool (`_new_scatter_metadata`).
 
 **The exception.** Fallback and debug paths — the per-span copy loops in
-`_copy_chunk_between_staging_and_descs`, `_span_view`, and the env-gated
+`_CopyEngine.copy_chunk`, `_span_view`, and the env-gated
 `_validate_send_source_residency` — deliberately materialize objects via
 `__getitem__`. They are O(small spans) or opt-in, and keeping them
 object-shaped keeps the fallback code identical to its pre-array form.
