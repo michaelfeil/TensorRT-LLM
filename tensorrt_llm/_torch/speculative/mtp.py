@@ -140,7 +140,12 @@ class MTPHiddenStatesManager(BaseResourceManager):
         # allocate hidden state tensors
         for req in context_batch:
             if req.is_first_context_chunk:
-                slot_id = self.slot_manager.add_slot(req.request_id)
+                # A request resumed after an async KV-connector onboard
+                # re-enters scheduling with is_first_context_chunk=True;
+                # reuse its existing slot instead of double-allocating.
+                slot_id = self.slot_manager.get_slot(req.request_id)
+                if slot_id is None:
+                    slot_id = self.slot_manager.add_slot(req.request_id)
                 self._reset_relaxed_delta(slot_id)
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
@@ -311,7 +316,6 @@ class MTPSpecMetadata(SpecMetadata):
 
         # Baseten fast rejection sampling: sync extern tensors from store
         _prepare_fast_sampling_metadata(self)
-
 
 
 class MTPSampler(SpecSamplerBase):

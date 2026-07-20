@@ -152,7 +152,12 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.slot_ids = []
         for req in context_batch:
             if req.is_first_context_chunk:
-                slot_id = self.slot_manager.add_slot(req.request_id)
+                # A request resumed after an async KV-connector onboard
+                # re-enters scheduling with is_first_context_chunk=True;
+                # reuse its existing slot instead of double-allocating.
+                slot_id = self.slot_manager.get_slot(req.request_id)
+                if slot_id is None:
+                    slot_id = self.slot_manager.add_slot(req.request_id)
                 self.slot_ids.append(slot_id)
                 self._reset_relaxed_delta(slot_id)
         # reset the flag before model forward
