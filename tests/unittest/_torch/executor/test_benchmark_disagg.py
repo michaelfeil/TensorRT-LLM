@@ -542,6 +542,8 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
+        ex.async_transfer_manager = Mock()
+        ex.async_transfer_manager.has_any_inflight_requests.return_value = False
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
         ex._fill_admit_cap = 0
@@ -932,6 +934,8 @@ class TestFailFastDuringBenchmarkFill:
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
+        ex.async_transfer_manager = Mock()
+        ex.async_transfer_manager.has_any_inflight_requests.return_value = False
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
         ex._fill_admit_cap = 0
@@ -1078,6 +1082,8 @@ class TestFillPhaseEndToEnd:
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = self.TOTAL_REQUESTS
         ex.kv_cache_transceiver = _make_transceiver(transfer_complete=False)
+        ex.async_transfer_manager = Mock()
+        ex.async_transfer_manager.has_any_inflight_requests.return_value = False
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
         ex._fill_admit_cap = 0

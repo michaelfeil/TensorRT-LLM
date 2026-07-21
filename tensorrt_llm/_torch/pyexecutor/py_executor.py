@@ -2462,8 +2462,10 @@ class PyExecutor:
                     # with attention_dp), so a TP-scoped OR vote is sufficient.
                     # Using WORLD allreduce here serialized the disagg prefill
                     # host loop on every iter (nvbug/6280060).
-                    local_need_check = (num_fitting_reqs == 0 and
-                                        not fitting_disagg_gen_init_requests)
+                    local_need_check = (
+                        self.async_transfer_manager.has_any_inflight_requests()
+                        and num_fitting_reqs == 0
+                        and not fitting_disagg_gen_init_requests)
                     if self.dist.tp_size > 1:
                         any_need_check = self.dist.tp_allreduce(
                             int(local_need_check), op=ReduceOp.MAX)
@@ -3122,8 +3124,10 @@ class PyExecutor:
             # holding any individual rank. Use TP-scoped allreduce (matches
             # the C++ syncComm scope) instead of WORLD to avoid serializing
             # the disagg prefill host loop on every iter (nvbug/6280060).
-            local_need_check = (num_fitting_reqs == 0
-                                and not fitting_disagg_gen_init_requests)
+            local_need_check = (
+                self.async_transfer_manager.has_any_inflight_requests()
+                and num_fitting_reqs == 0
+                and not fitting_disagg_gen_init_requests)
             if self.dist.tp_size > 1:
                 any_need_check = self.dist.tp_allreduce(int(local_need_check),
                                                         op=ReduceOp.MAX)
