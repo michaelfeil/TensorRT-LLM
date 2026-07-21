@@ -253,7 +253,13 @@ def _register_fake():
           next_n,
           index_topk,
           pre_idx=None,
-          heuristic_scratch=None):
+          heuristic_scratch=None,
+          done_counter_scratch=None,
+          scratch=None,
+          is_prefill=False,
+          row_ends=None,
+          row_to_batch=None,
+          row_offsets=None):
         # In-place operation, no return value (void function)
         pass
 

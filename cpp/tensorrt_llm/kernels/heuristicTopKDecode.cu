@@ -49,16 +49,18 @@ using heuristic_topk::KernelSmemTplK;
 template <int TopK>
 __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float const* __restrict__ logits,
     int const* __restrict__ seqLens, int const* __restrict__ preIdx, float* __restrict__ scratchValues,
-    int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
+    int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount,
+    int const* __restrict__ rowEnds, int const* __restrict__ rowToBatch, int const* __restrict__ rowOffsets)
 {
     using SmemT = KernelSmemTplK<float, GvrParams<float, TopK>::kC, GvrParams<float, TopK>::kNumBins>;
 
     int const rowIdx = blockIdx.x;
-    int const seq_len = seqLens[rowIdx / next_n];
-    int const N = seq_len - next_n + (rowIdx % next_n) + 1;
+    int const batchIdx = rowToBatch == nullptr ? rowIdx / next_n : rowToBatch[rowIdx];
+    int const seq_len = seqLens[batchIdx];
+    int const N = rowEnds == nullptr ? seq_len - next_n + (rowIdx % next_n) + 1 : rowEnds[rowIdx];
 
     float const* __restrict__ input = logits + static_cast<int64_t>(rowIdx) * stride0;
-    int const* __restrict__ rowPreIdx = preIdx + static_cast<int64_t>(rowIdx / next_n) * preIdxStride;
+    int const* __restrict__ rowPreIdx = preIdx + static_cast<int64_t>(batchIdx) * preIdxStride;
     float* __restrict__ outputValues = scratchValues + static_cast<int64_t>(rowIdx) * topK;
     int* __restrict__ outputIndices = outIndices + static_cast<int64_t>(rowIdx) * topK;
 
@@ -86,7 +88,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
 
     // +1 accounts for the temporal shift: prev_topk indices were computed at
     // seq_len-1, but the current step has one additional KV token appended.
-    int const preIdxOffset = (rowIdx % next_n) + 1;
+    int const preIdxOffset = (rowOffsets == nullptr ? rowIdx % next_n : rowOffsets[rowIdx]) + 1;
     gvrTopKJob<TopK>(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
@@ -105,17 +107,19 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
 template <typename InputT, int TopK>
 __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernelDtype(InputT const* __restrict__ logits,
     int const* __restrict__ seqLens, int const* __restrict__ preIdx, InputT* __restrict__ scratchValues,
-    int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
+    int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount,
+    int const* __restrict__ rowEnds, int const* __restrict__ rowToBatch, int const* __restrict__ rowOffsets)
 {
     // dtype path uses fp32 keys[] in smem (down-conversion deferred to writeback).
     using SmemT = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
 
     int const rowIdx = blockIdx.x;
-    int const seq_len = seqLens[rowIdx / next_n];
-    int const N = seq_len - next_n + (rowIdx % next_n) + 1;
+    int const batchIdx = rowToBatch == nullptr ? rowIdx / next_n : rowToBatch[rowIdx];
+    int const seq_len = seqLens[batchIdx];
+    int const N = rowEnds == nullptr ? seq_len - next_n + (rowIdx % next_n) + 1 : rowEnds[rowIdx];
 
     InputT const* __restrict__ input = logits + static_cast<int64_t>(rowIdx) * stride0;
-    int const* __restrict__ rowPreIdx = preIdx + static_cast<int64_t>(rowIdx / next_n) * preIdxStride;
+    int const* __restrict__ rowPreIdx = preIdx + static_cast<int64_t>(batchIdx) * preIdxStride;
     InputT* __restrict__ outputValues = scratchValues + static_cast<int64_t>(rowIdx) * topK;
     int* __restrict__ outputIndices = outIndices + static_cast<int64_t>(rowIdx) * topK;
 
@@ -142,7 +146,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernelDtype(I
         return;
     }
 
-    int const preIdxOffset = (rowIdx % next_n) + 1;
+    int const preIdxOffset = (rowOffsets == nullptr ? rowIdx % next_n : rowOffsets[rowIdx]) + 1;
     gvrTopKJobDtype<InputT, TopK>(
         input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -152,24 +156,24 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernelDtype(I
 
 // Explicit instantiations — 6 (dtype × K) combos. Launchers dispatch on
 // runtime topK via switch, so all 6 must be available at link time.
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 512>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 1024>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 2048>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 512>(__nv_bfloat16 const*, int const*,
+    int const*, __nv_bfloat16*, int*, int, int, int, int, int, int const*, int const*, int const*);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 1024>(__nv_bfloat16 const*, int const*,
+    int const*, __nv_bfloat16*, int*, int, int, int, int, int, int const*, int const*, int const*);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 2048>(__nv_bfloat16 const*, int const*,
+    int const*, __nv_bfloat16*, int*, int, int, int, int, int, int const*, int const*, int const*);
 template __global__ void heuristicTopKMultiRowKernelDtype<__half, 512>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int);
+    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int const*, int const*, int const*);
 template __global__ void heuristicTopKMultiRowKernelDtype<__half, 1024>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int);
+    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int const*, int const*, int const*);
 template __global__ void heuristicTopKMultiRowKernelDtype<__half, 2048>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int);
+    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int const*, int const*, int const*);
 template __global__ void heuristicTopKMultiRowKernel<512>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int);
+    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int const*, int const*, int const*);
 template __global__ void heuristicTopKMultiRowKernel<1024>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int);
+    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int const*, int const*, int const*);
 template __global__ void heuristicTopKMultiRowKernel<2048>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int);
+    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int const*, int const*, int const*);
 
 // Dispatch on topK at runtime — each TopK-instantiation gets its own smem
 // size (driven by GvrParams<InputT, TopK>::kC/kNumBins) and own kfn pointer
@@ -184,7 +188,7 @@ template __global__ void heuristicTopKMultiRowKernel<2048>(
 template <typename InputT>
 void launchHeuristicTopKDecodeImpl(InputT const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     InputT* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
-    cudaStream_t stream)
+    cudaStream_t stream, int const* rowEnds, int const* rowToBatch, int const* rowOffsets)
 {
     TLLM_CHECK_WITH_INFO(
         topK == 512 || topK == 1024 || topK == 2048, "heuristicTopKDecode requires topK ∈ {512, 1024, 2048}");
@@ -224,7 +228,7 @@ void launchHeuristicTopKDecodeImpl(InputT const* logits, int const* seqLens, int
         config.attrs = attrs;
 
         cudaLaunchKernelEx(&config, kfn, logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK,
-            preIdxStride, preIdxCount);
+            preIdxStride, preIdxCount, rowEnds, rowToBatch, rowOffsets);
     };
 
     switch (topK)
@@ -240,26 +244,26 @@ void launchHeuristicTopKDecodeImpl(InputT const* logits, int const* seqLens, int
 
 void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     float* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
-    cudaStream_t stream)
+    cudaStream_t stream, int const* rowEnds, int const* rowToBatch, int const* rowOffsets)
 {
     launchHeuristicTopKDecodeImpl<float>(logits, seqLens, preIdx, outIndices, scratchValues, stride0, next_n, topK,
-        preIdxStride, preIdxCount, numRows, stream);
+        preIdxStride, preIdxCount, numRows, stream, rowEnds, rowToBatch, rowOffsets);
 }
 
 void launchHeuristicTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     __nv_bfloat16* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
-    cudaStream_t stream)
+    cudaStream_t stream, int const* rowEnds, int const* rowToBatch, int const* rowOffsets)
 {
     launchHeuristicTopKDecodeImpl<__nv_bfloat16>(logits, seqLens, preIdx, outIndices, scratchValues, stride0, next_n,
-        topK, preIdxStride, preIdxCount, numRows, stream);
+        topK, preIdxStride, preIdxCount, numRows, stream, rowEnds, rowToBatch, rowOffsets);
 }
 
 void launchHeuristicTopKDecode(__half const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     __half* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
-    cudaStream_t stream)
+    cudaStream_t stream, int const* rowEnds, int const* rowToBatch, int const* rowOffsets)
 {
     launchHeuristicTopKDecodeImpl<__half>(logits, seqLens, preIdx, outIndices, scratchValues, stride0, next_n, topK,
-        preIdxStride, preIdxCount, numRows, stream);
+        preIdxStride, preIdxCount, numRows, stream, rowEnds, rowToBatch, rowOffsets);
 }
 
 } // namespace kernels

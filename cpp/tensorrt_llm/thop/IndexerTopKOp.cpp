@@ -39,7 +39,8 @@ namespace torch_ext
 void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
     int64_t next_n, int64_t index_topk, std::optional<th::Tensor> const& pre_idx,
     std::optional<th::Tensor> const& heuristic_scratch, std::optional<th::Tensor> const& done_counter_scratch,
-    std::optional<th::Tensor> const& scratch, bool is_prefill)
+    std::optional<th::Tensor> const& scratch, bool is_prefill, std::optional<th::Tensor> const& row_ends,
+    std::optional<th::Tensor> const& row_to_batch, std::optional<th::Tensor> const& row_offsets)
 {
 
     TORCH_CHECK(logits.is_cuda() && seq_lens.is_cuda() && indices.is_cuda(),
@@ -53,14 +54,42 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     auto const inputSize = logits.sizes();
     auto const numRows64 = inputSize[0];
     auto const numColumns64 = inputSize[1];
-    TORCH_CHECK(
-        seq_lens.size(0) * next_n == numRows64, "seq_lens length multiplied by next_n must equal logits.size(0)");
+    bool const isRagged = row_ends.has_value();
+    TORCH_CHECK(isRagged == row_to_batch.has_value() && isRagged == row_offsets.has_value(),
+        "row_ends, row_to_batch, and row_offsets must be provided together");
+    if (!isRagged)
+    {
+        TORCH_CHECK(
+            seq_lens.size(0) * next_n == numRows64, "seq_lens length multiplied by next_n must equal logits.size(0)");
+    }
     TORCH_CHECK(indices.size(0) == numRows64, "indices first dimension must match logits.size(0)");
     TORCH_CHECK(indices.size(1) >= index_topk, "indices second dimension must be at least index_topk");
     TORCH_CHECK(seq_lens.is_contiguous(), "seq_lens must be contiguous");
     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
 
     TORCH_CHECK(next_n > 0, "next_n must be greater than 0");
+
+    int32_t const* rowEndsPtr = nullptr;
+    int32_t const* rowToBatchPtr = nullptr;
+    int32_t const* rowOffsetsPtr = nullptr;
+    if (isRagged)
+    {
+        auto const& rowEndsTensor = row_ends.value();
+        auto const& rowToBatchTensor = row_to_batch.value();
+        auto const& rowOffsetsTensor = row_offsets.value();
+        for (auto const* tensor : {&rowEndsTensor, &rowToBatchTensor, &rowOffsetsTensor})
+        {
+            TORCH_CHECK(tensor->is_cuda(), "ragged row metadata must be CUDA tensors");
+            TORCH_CHECK(tensor->device() == logits.device(), "ragged row metadata must be on the logits device");
+            TORCH_CHECK(tensor->scalar_type() == at::ScalarType::Int, "ragged row metadata must have int32 dtype");
+            TORCH_CHECK(tensor->dim() == 1 && tensor->size(0) == numRows64,
+                "ragged row metadata must be 1D with one entry per logits row");
+            TORCH_CHECK(tensor->is_contiguous(), "ragged row metadata must be contiguous");
+        }
+        rowEndsPtr = rowEndsTensor.data_ptr<int32_t>();
+        rowToBatchPtr = rowToBatchTensor.data_ptr<int32_t>();
+        rowOffsetsPtr = rowOffsetsTensor.data_ptr<int32_t>();
+    }
 
     int32_t num_rows = static_cast<int32_t>(numRows64);
     int32_t num_columns = static_cast<int32_t>(numColumns64);
@@ -80,8 +109,8 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         TORCH_CHECK(preIdxTensor.device() == logits.device(), "pre_idx must be on the same device as logits");
         TORCH_CHECK(preIdxTensor.is_contiguous(), "pre_idx must be contiguous");
         TORCH_CHECK(preIdxTensor.dim() == 2, "pre_idx must be a 2D Tensor");
-        TORCH_CHECK(preIdxTensor.size(0) * next_n == numRows64,
-            "pre_idx first dimension must equal logits.size(0)/next_n (one hint row per batch element)");
+        TORCH_CHECK(isRagged ? preIdxTensor.size(0) == seq_lens.size(0) : preIdxTensor.size(0) * next_n == numRows64,
+            "pre_idx must have one hint row per request");
         preIdxPtr = preIdxTensor.data_ptr<int32_t>();
         preIdxStride = static_cast<int32_t>(preIdxTensor.stride(0));
         preIdxCount = static_cast<int32_t>(preIdxTensor.size(1));
@@ -158,7 +187,8 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
             splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n),
             static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
-            static_cast<float*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill);
+            static_cast<float*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill,
+            rowEndsPtr, rowToBatchPtr, rowOffsetsPtr);
     }
     else if (logits_dtype == at::ScalarType::BFloat16)
     {
@@ -166,14 +196,15 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
             seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
             logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
             preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), stream, multiPassScratchPtr,
-            multiPassScratchBytes, is_prefill);
+            multiPassScratchBytes, is_prefill, rowEndsPtr, rowToBatchPtr, rowOffsetsPtr);
     }
     else // Half
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__half const*>(logits.data_ptr()), seq_lens.data_ptr<int32_t>(),
             indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1,
             static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
-            static_cast<__half*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill);
+            static_cast<__half*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill,
+            rowEndsPtr, rowToBatchPtr, rowOffsetsPtr);
     }
 }
 
@@ -232,7 +263,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
         "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, Tensor? done_counter_scratch=None, "
-        "Tensor? scratch=None, bool is_prefill=False) -> ()");
+        "Tensor? scratch=None, bool is_prefill=False, Tensor? row_ends=None, Tensor? row_to_batch=None, "
+        "Tensor? row_offsets=None) -> ()");
     m.def("indexer_topk_decode_scratch_bytes(int num_rows, int num_columns, int index_topk) -> int");
 }
 

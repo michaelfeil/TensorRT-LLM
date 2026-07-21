@@ -646,7 +646,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 template <int kNumThreadsPerBlock, bool multipleBlocksPerRow = false, bool mergeBlocks = false, typename InputT = float>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
     int* outIndices, int stride0, int stride1, int const topK, int next_n, float* outLogits = nullptr,
-    int const numBlocksToMerge = 0, int const* indices = nullptr)
+    int const numBlocksToMerge = 0, int const* indices = nullptr, int const* rowEnds = nullptr)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -659,8 +659,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
 
     // The range of logits within the row.
     int rowStart = 0;
-    int seq_len = seqLens[rowIdx / next_n];
-    int rowEnd = seq_len - next_n + (rowIdx % next_n) + 1;
+    int rowEnd = rowEnds == nullptr ? seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1 : rowEnds[rowIdx];
 
     // Local pointers to this block
     if constexpr (!multipleBlocksPerRow && !mergeBlocks)
@@ -851,7 +850,7 @@ __device__ __forceinline__ void radixLastBlockTrailer(int* gHist, RadixState& st
 template <int kThreads, int step, typename InputT = float>
 static __global__ __launch_bounds__(kThreads) void radixPassKernel(InputT const* logits, int const* seqLens,
     int* outIndices, int const* candBufIn, int* candBufOut, int* histograms, RadixState* state, int stride0, int next_n,
-    int topK)
+    int topK, int const* rowEnds)
 {
     int rowIdx = blockIdx.y;
     int blockInRow = blockIdx.x;
@@ -871,7 +870,8 @@ static __global__ __launch_bounds__(kThreads) void radixPassKernel(InputT const*
         // pre-initialised by a separate init kernel; the cudaMemsetAsync that
         // zeroes state+histograms together is enough. Pass-1 trailer below
         // writes st.candCount = seqLens[rowIdx] for pass 2 to consume.
-        int const rowEnd = seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1;
+        int const rowEnd
+            = rowEnds == nullptr ? seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1 : rowEnds[rowIdx];
         InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
         size_t threadRank = static_cast<size_t>(blockInRow) * kThreads + threadIdx.x;
         size_t numThreads = static_cast<size_t>(blocksPerRow) * kThreads;
@@ -960,7 +960,9 @@ static __global__ __launch_bounds__(kThreads) void radixPassKernel(InputT const*
     if (!isLast)
         return;
 
-    int const rowFullLen = (step == 1) ? (seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1) : 0;
+    int const rowFullLen = (step == 1)
+        ? (rowEnds == nullptr ? seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1 : rowEnds[rowIdx])
+        : 0;
     radixLastBlockTrailer<kThreads, step>(gHist, st, topK, rowFullLen);
 
     if constexpr (step == 3)
@@ -1047,7 +1049,8 @@ static size_t radixScratchBytes(int numRows, int numColumns)
 
 template <typename InputT>
 static void launchMultiPassRadix(void* scratch, InputT const* logits, int const* seqLens, int* outIndices, int numRows,
-    int numColumns, int topK, int stride0, int next_n, cudaLaunchAttribute const* attrs, cudaStream_t stream)
+    int numColumns, int topK, int stride0, int next_n, cudaLaunchAttribute const* attrs, cudaStream_t stream,
+    int const* rowEnds)
 {
     auto roundUp = [](size_t x) { return (x + 63) & ~size_t(63); };
     char* base = static_cast<char*>(scratch);
@@ -1088,7 +1091,7 @@ static void launchMultiPassRadix(void* scratch, InputT const* logits, int const*
         cfg.numAttrs = 1;
         cfg.attrs = const_cast<cudaLaunchAttribute*>(attrs);
         void* args[] = {(void*) &logits, (void*) &seqLens, (void*) &outIndices, (void*) &candIn, (void*) &candOut,
-            (void*) &histograms, (void*) &state, (void*) &stride0, (void*) &next_n, (void*) &topK};
+            (void*) &histograms, (void*) &state, (void*) &stride0, (void*) &next_n, (void*) &topK, (void*) &rowEnds};
         cudaLaunchKernelExC(&cfg, kernel, args);
     };
 
@@ -1157,7 +1160,8 @@ template <typename InputT>
 void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
     int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
-    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
+    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill, int const* rowEnds,
+    int const* rowToBatch, int const* rowOffsets)
 {
     // Split-work cutoff: matches main's 200k default. is_prefill forces
     // single-block via a 1<<30 threshold no shape can reach: prefill chunks are
@@ -1197,7 +1201,7 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     if (canUseHeuristic)
     {
         launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
-            preIdxStride, preIdxCount, numRows, stream);
+            preIdxStride, preIdxCount, numRows, stream, rowEnds, rowToBatch, rowOffsets);
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
@@ -1215,7 +1219,7 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
         config.numAttrs = 1;
         config.attrs = attrs;
         cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-            /*outLogits=*/nullptr, /*numBlocksToMerge=*/0, /*indices=*/nullptr);
+            /*outLogits=*/nullptr, /*numBlocksToMerge=*/0, /*indices=*/nullptr, rowEnds);
     }
     else
     {
@@ -1230,7 +1234,7 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
         radixAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         radixAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
         launchMultiPassRadix<InputT>(
-            scratch, logits, seqLens, indices, numRows, numColumns, topK, stride0, next_n, radixAttrs, stream);
+            scratch, logits, seqLens, indices, numRows, numColumns, topK, stride0, next_n, radixAttrs, stream, rowEnds);
     }
     sync_check_cuda_error(stream);
 }
@@ -1240,11 +1244,12 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
     int const* preIdx, int const preIdxStride, int const preIdxCount, float* heuristicScratch,
-    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
+    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill, int const* rowEnds,
+    int const* rowToBatch, int const* rowOffsets)
 {
     invokeIndexerTopKDecodeImpl<float>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
         stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch, scratchBytes,
-        is_prefill);
+        is_prefill, rowEnds, rowToBatch, rowOffsets);
 }
 
 size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
@@ -1255,21 +1260,23 @@ size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
     int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
-    __nv_bfloat16* heuristicScratch, cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
+    __nv_bfloat16* heuristicScratch, cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill,
+    int const* rowEnds, int const* rowToBatch, int const* rowOffsets)
 {
     invokeIndexerTopKDecodeImpl<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
         stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch,
-        scratchBytes, is_prefill);
+        scratchBytes, is_prefill, rowEnds, rowToBatch, rowOffsets);
 }
 
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
     int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch,
-    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
+    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill, int const* rowEnds,
+    int const* rowToBatch, int const* rowOffsets)
 {
     invokeIndexerTopKDecodeImpl<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
         stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch, scratchBytes,
-        is_prefill);
+        is_prefill, rowEnds, rowToBatch, rowOffsets);
 }
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,

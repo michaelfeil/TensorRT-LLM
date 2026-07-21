@@ -926,6 +926,75 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        max_expanded_tokens = self.max_num_sequences * (1 +
+                                                        self.max_draft_tokens)
+        self.indexer_row_ends = self.get_empty(
+            self.cuda_graph_buffers,
+            (max_expanded_tokens, ),
+            cache_name="indexer_row_ends",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.indexer_row_to_batch = self.get_empty(
+            self.cuda_graph_buffers,
+            (max_expanded_tokens, ),
+            cache_name="indexer_row_to_batch",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.indexer_row_offsets = self.get_empty(
+            self.cuda_graph_buffers,
+            (max_expanded_tokens, ),
+            cache_name="indexer_row_offsets",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
+    def _populate_packed_decode_metadata(
+            self, gen_indexer_kv_lens: torch.Tensor) -> None:
+        """Expand request metadata over only the real packed generation rows.
+
+        DeepGEMM's fallback for unsupported next_n values runs every query as a
+        next_n=1 row. Each such row needs its own causal KV end; repeating the
+        request's final KV length lets early queries see later draft tokens.
+        """
+        num_generations = self.num_generations
+        num_gen_tokens = self.num_tokens - self.num_ctx_tokens
+        if num_generations <= 0 or num_gen_tokens <= 0:
+            return
+
+        q_lens = self.seq_lens_cuda[self.num_contexts:self.num_seqs].to(
+            torch.int32)
+        request_rows = torch.arange(num_generations,
+                                    device=q_lens.device,
+                                    dtype=torch.int32)
+        row_to_batch = torch.repeat_interleave(request_rows,
+                                               q_lens,
+                                               output_size=num_gen_tokens)
+        q_starts = torch.cumsum(q_lens, dim=0, dtype=torch.int32) - q_lens
+        packed_rows = torch.arange(num_gen_tokens,
+                                   device=q_lens.device,
+                                   dtype=torch.int32)
+        row_offsets = packed_rows - q_starts[row_to_batch.long()]
+        row_ends = (gen_indexer_kv_lens[row_to_batch.long()] -
+                    q_lens[row_to_batch.long()] + row_offsets + 1)
+
+        self.indexer_row_to_batch[:num_gen_tokens].copy_(row_to_batch)
+        self.indexer_row_offsets[:num_gen_tokens].copy_(row_offsets)
+        self.indexer_row_ends[:num_gen_tokens].copy_(row_ends)
+        self.kv_lens_expanded_cuda[:num_gen_tokens].copy_(row_ends)
+
+        gen_block_table = self.indexer_k_cache_block_offsets[
+            self.num_contexts:self.num_seqs]
+        self.block_table_expanded[:num_gen_tokens].copy_(
+            gen_block_table.index_select(0, row_to_batch.long()))
+        self.block_table_expanded[:num_gen_tokens].clamp_(min=0)
+
+        context_lens = self.kv_lens_expanded_cuda[:num_gen_tokens].view(-1, 1)
+        scheduler_metadata = get_paged_mqa_logits_metadata(
+            context_lens, _DG_SCHEDULE_BLOCK_KV, self.num_sms)
+        self.scheduler_metadata_buffer_expanded.copy_(scheduler_metadata,
+                                                      non_blocking=True)
 
     # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
     # TODO: remove this function once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
@@ -1281,34 +1350,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
              and get_sm_version() >= 100)))
         if self.use_expanded_buffers_for_mtp:
-            # Expand kv_lens_cuda (only generation)
-            num_tokens = self.num_generations * (1 + self.max_draft_tokens)
             gen_kv_lens = self.get_indexer_kv_lens(
-                kv_lens[self.num_contexts:self.num_seqs])
-            gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
-                                               (1 + self.max_draft_tokens),
-                                               dim=0)
-            gen_kv_lens_expanded = gen_kv_lens_expanded.transpose(
-                0, 1).contiguous().flatten()
-            self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
-            self.kv_lens_expanded_cuda[:num_tokens].copy_(
-                self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
-
-            # Expand indexer_k_cache_block_offsets (only generation)
-            # host_indexer_k_cache_block_offsets already contains correct pool
-            # indices from _get_pool_block_indices() above.
-            if self.kv_cache_manager is not None and self.num_generations > 0:
-                max_len = self.host_indexer_k_cache_block_offsets.shape[1]
-                gen_block_tensor = self.host_indexer_k_cache_block_offsets[
-                    self.num_contexts:self.num_seqs, :max_len]
-                expanded_blocks = gen_block_tensor.repeat_interleave(
-                    1 + self.max_draft_tokens, dim=0)
-                self.host_block_table_expanded[:num_tokens, :max_len].copy_(
-                    expanded_blocks, non_blocking=True)
-                self.block_table_expanded[:num_tokens].copy_(
-                    self.host_block_table_expanded[:num_tokens],
-                    non_blocking=True)
-                self.block_table_expanded.clamp_(min=0)
+                self.kv_lens_cuda_runtime[self.num_contexts:self.num_seqs])
+            self._populate_packed_decode_metadata(gen_kv_lens)
 
         # CuTe DSL FP4 paged MQA logits kernel natively supports
         # next_n ∈ {1, 2, 3} only. For next_n ≥ 4 atom-split is mandatory.
@@ -1490,22 +1534,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                         scheduler_metadata_buffer_full_next_n,
                         non_blocking=True)
                 if self.use_expanded_buffers_for_mtp:
-                    num_draft_tokens = 1 + self.max_draft_tokens
-                    num_tokens = self.num_generations * num_draft_tokens
-                    kv_lens_expanded = torch.stack([gen_indexer_kv_lens] *
-                                                   num_draft_tokens,
-                                                   dim=0)
-                    self.kv_lens_expanded_cuda[:num_tokens] = \
-                        kv_lens_expanded.transpose(0, 1).contiguous().flatten()
-                    # New API requires 2D; each expanded token becomes a (1,) row.
-                    kv_lens_expanded_2d = self.kv_lens_expanded_cuda[:
-                                                                     num_tokens].view(
-                                                                         -1, 1)
-                    scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                        kv_lens_expanded_2d, _DG_SCHEDULE_BLOCK_KV,
-                        self.num_sms)
-                    self.scheduler_metadata_buffer_expanded.copy_(
-                        scheduler_metadata_buffer_expanded, non_blocking=True)
+                    self._populate_packed_decode_metadata(gen_indexer_kv_lens)
                 # DSL atom-split path: mirror the prepare()-time build so that
                 # overlap-scheduler / spec-dec runtime corrections to kv_lens_cuda
                 # propagate into kv_lens_expanded_cuda and the matching schedule.
@@ -1529,6 +1558,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                         scheduler_metadata_buffer_expanded, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
+    @maybe_compile(dynamic=True)
+    def _compute_req_idx_per_token(self, seq_lens, num_tokens):
+        seq_ends = torch.cumsum(seq_lens, dim=0, dtype=torch.int64)
+        token_pos = torch.arange(num_tokens,
+                                 device=seq_ends.device,
+                                 dtype=torch.int64)
+        req_idx = torch.searchsorted(seq_ends, token_pos, side='right')
+        return req_idx.to(torch.int32)
+
     def update_for_spec_dec(self):
         """Reset context/generation counters and refresh slot mappings for speculative decoding."""
         super().update_for_spec_dec()
@@ -1536,6 +1574,28 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.max_ctx_kv_len = 0
         self.num_ctx_cached_tokens = 0
         self.max_gen_seq_len = 1
+
+        # Rebuild req_idx_per_token for the current (mutated) token layout.
+        # The one-model MTP/Eagle3 draft loop mutates seq_lens after draft
+        # step 0 (draft_len+1 -> 1 token per request) and calls this method,
+        # but req_idx_per_token was built in prepare() for the pre-mutation
+        # verify layout. Its stale prefix maps every non-first token of the
+        # forward to request 0, so on draft steps i>=1:
+        #   - transform_local_topk_and_prepare_pool_view converts non-first
+        #     requests' topk index lists through request 0's block table,
+        #     making their draft attention read request 0's KV; and
+        #   - on_update_kv_lens computes indexer K-cache slot mappings that
+        #     write non-first requests' entries into request 0's cache.
+        # This mis-conditions draft tokens d2..dk for every request at a
+        # nonzero flat token offset (batch >= 2, or a gen request sharing the
+        # step with a prefill chunk), collapsing spec-decode acceptance at
+        # load. Rebuilding from the current seq_lens is a no-op whenever the
+        # layout is unchanged, and is CUDA-graph-safe (static shapes,
+        # device-side values).
+        if self.num_tokens > 0:
+            req_idx = self._compute_req_idx_per_token(
+                self.seq_lens_cuda[:self.num_seqs], self.num_tokens)
+            self.req_idx_per_token[:self.num_tokens].copy_(req_idx)
 
         # device
         self.on_update_kv_lens()
@@ -2041,15 +2101,11 @@ class Indexer(nn.Module):
                 metadata.scheduler_metadata_buffer_full_next_n.copy_(
                     scheduler_metadata_buffer_full_next_n, non_blocking=True)
         else:
-            num_tokens = metadata.num_generations * (1 +
-                                                     metadata.max_draft_tokens)
-            kv_lens_expanded_2d = metadata.kv_lens_expanded_cuda[:
-                                                                 num_tokens].view(
-                                                                     -1, 1)
-            scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                kv_lens_expanded_2d, _DG_SCHEDULE_BLOCK_KV, metadata.num_sms)
-            metadata.scheduler_metadata_buffer_expanded.copy_(
-                scheduler_metadata_buffer_expanded, non_blocking=True)
+            gen_seq_lens = metadata.get_indexer_kv_lens(
+                metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
+                                              num_generations])
+            metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
+            metadata._populate_packed_decode_metadata(gen_seq_lens)
 
         if metadata.expand_for_dsl and metadata.num_generations > 0 \
                 and metadata.dsl_expand_factor > 1:
@@ -2474,17 +2530,35 @@ class Indexer(nn.Module):
                                              num_generations]
             max_decode_len = gen_seq_lens.max().item()
             min_decode_len = gen_seq_lens.min().item()
-            assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
+            is_ragged_decode = bool(metadata.is_ragged_gen
+                                    and max_decode_len != min_decode_len)
+            if not is_ragged_decode:
+                assert max_decode_len == min_decode_len, \
+                    "max_decode_len != min_decode_len without ragged metadata"
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
                              ...]
             batch_size = num_generations
-            next_n = num_gen_tokens // num_generations
+            next_n = (1 if is_ragged_decode else num_gen_tokens //
+                      num_generations)
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
             # next_n == 1/2 on sm90, for other next_n, we need to flatten the q_decode tensor
             # and expand the corresponding metadata.
-            if not metadata.use_expanded_buffers_for_mtp or next_n == 1:
+            if is_ragged_decode:
+                if (self.use_cute_dsl_paged_mqa_logits
+                        or not metadata.use_expanded_buffers_for_mtp):
+                    raise RuntimeError(
+                        "Ragged DSA decode currently requires the DeepGEMM "
+                        "expanded next_n=1 path")
+                q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
+                context_lens = metadata.kv_lens_expanded_cuda[:
+                                                              num_gen_tokens].view(
+                                                                  -1, 1)
+                block_table = metadata.block_table_expanded[:num_gen_tokens]
+                scheduler_metadata_buffer = (
+                    metadata.scheduler_metadata_buffer_expanded)
+            elif not metadata.use_expanded_buffers_for_mtp or next_n == 1:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
                 # 2D context_lens slice from the pre-allocated buffer; matches
                 # q_decode's (batch, next_n) layout required by the new
@@ -2513,7 +2587,8 @@ class Indexer(nn.Module):
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
-            assert num_gen_tokens == batch_size * next_n
+            if not is_ragged_decode:
+                assert num_gen_tokens == batch_size * next_n
             weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
                                      num_gen_tokens, ...]
 
@@ -2647,7 +2722,8 @@ class Indexer(nn.Module):
                 # so we cap it at 256 for now and fall back to the CUDA C++
                 # indexer_topk_decode. This limit can be removed if GPU memory
                 # is not a bottleneck.
-                if (self.use_cute_dsl_topk and num_gen_tokens <= 256
+                if (not is_ragged_decode and self.use_cute_dsl_topk
+                        and num_gen_tokens <= 256
                         and (indexer_compress_ratio == 1 or next_n == 1)):
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode, gen_indexer_kv_lens_cuda
@@ -2656,6 +2732,13 @@ class Indexer(nn.Module):
                                             num_gen_tokens, :], self.index_topk,
                         next_n)
                 else:
+                    row_ends = (metadata.indexer_row_ends[:num_gen_tokens]
+                                if is_ragged_decode else None)
+                    row_to_batch = (
+                        metadata.indexer_row_to_batch[:num_gen_tokens]
+                        if is_ragged_decode else None)
+                    row_offsets = (metadata.indexer_row_offsets[:num_gen_tokens]
+                                   if is_ragged_decode else None)
                     torch.ops.trtllm.indexer_topk_decode(
                         logits_decode,
                         gen_indexer_kv_lens_cuda,
@@ -2664,19 +2747,28 @@ class Indexer(nn.Module):
                         next_n,
                         self.index_topk,
                         pre_idx=pre_idx,
-                        heuristic_scratch=heuristic_scratch)
+                        heuristic_scratch=heuristic_scratch,
+                        row_ends=row_ends,
+                        row_to_batch=row_to_batch,
+                        row_offsets=row_offsets)
             else:
                 # padded
                 positions = torch.arange(
                     max_seq_len, device=q_decode.device).unsqueeze(0).expand(
                         num_gen_tokens, -1)
-                row_indices = torch.arange(num_gen_tokens,
-                                           device=q_decode.device) // next_n
-                next_n_offset = torch.arange(num_gen_tokens,
-                                             device=q_decode.device) % next_n
-                index_end_pos = (
-                    metadata.kv_lens_cuda_runtime[num_contexts + row_indices] -
-                    next_n + next_n_offset).unsqueeze(1)
+                if is_ragged_decode:
+                    index_end_pos = (
+                        metadata.indexer_row_ends[:num_gen_tokens] -
+                        1).unsqueeze(1)
+                else:
+                    row_indices = torch.arange(num_gen_tokens,
+                                               device=q_decode.device) // next_n
+                    next_n_offset = torch.arange(
+                        num_gen_tokens, device=q_decode.device) % next_n
+                    index_end_pos = (
+                        metadata.kv_lens_cuda_runtime[num_contexts +
+                                                      row_indices] - next_n +
+                        next_n_offset).unsqueeze(1)
                 # index_end_pos: [B * N, 1]
                 mask = positions <= index_end_pos
                 # mask: [B * N, L]
@@ -2703,7 +2795,13 @@ class Indexer(nn.Module):
                     self.layer_idx]
                 decode_topk = topk_indices_buffer[
                     num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
-                last_mtp_topk = decode_topk[next_n - 1::next_n]
+                if is_ragged_decode:
+                    q_lens = metadata.seq_lens_cuda[num_contexts:num_contexts +
+                                                    num_generations]
+                    last_rows = torch.cumsum(q_lens, dim=0).long() - 1
+                    last_mtp_topk = decode_topk.index_select(0, last_rows)
+                else:
+                    last_mtp_topk = decode_topk[next_n - 1::next_n]
                 metadata.heuristic_prev_topk[
                     local_layer, :num_generations].copy_(last_mtp_topk)
 
@@ -2716,9 +2814,16 @@ class Indexer(nn.Module):
                 and metadata.in_mtp_draft_loop and not reuse_mtp_topk):
             rows = None
             if num_generations > 0:
-                next_n = num_gen_tokens // num_generations
-                rows = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                           num_gen_tokens][next_n - 1::next_n]
+                decode_rows = topk_indices_buffer[
+                    num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
+                if metadata.is_ragged_gen:
+                    q_lens = metadata.seq_lens_cuda[num_contexts:num_contexts +
+                                                    num_generations]
+                    last_rows = torch.cumsum(q_lens, dim=0).long() - 1
+                    rows = decode_rows.index_select(0, last_rows)
+                else:
+                    next_n = num_gen_tokens // num_generations
+                    rows = decode_rows[next_n - 1::next_n]
             if num_contexts > 0:
                 ctx_last = (torch.cumsum(
                     metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0)

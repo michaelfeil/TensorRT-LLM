@@ -35,19 +35,22 @@ inline constexpr int kHeuristicSize = 2048;
 ///        Required for CUDA Graph compatibility — must have a stable device address.
 void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     float* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
-    cudaStream_t stream);
+    cudaStream_t stream, int const* rowEnds = nullptr, int const* rowToBatch = nullptr,
+    int const* rowOffsets = nullptr);
 
 /// Launch heuristic TopK decode kernel — bf16 input.
 /// scratchValues is [numRows * topK] of bf16 (matches input dtype).
 void launchHeuristicTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     __nv_bfloat16* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
-    cudaStream_t stream);
+    cudaStream_t stream, int const* rowEnds = nullptr, int const* rowToBatch = nullptr,
+    int const* rowOffsets = nullptr);
 
 /// Launch heuristic TopK decode kernel — fp16 input.
 /// scratchValues is [numRows * topK] of fp16 (matches input dtype).
 void launchHeuristicTopKDecode(__half const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     __half* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
-    cudaStream_t stream);
+    cudaStream_t stream, int const* rowEnds = nullptr, int const* rowToBatch = nullptr,
+    int const* rowOffsets = nullptr);
 
 } // namespace kernels
 
