@@ -35,7 +35,10 @@ iteration on production incidents. The design is fault-tolerance-first
 through host staging: every receive lands in pinned host memory before
 touching a live destination buffer, so a failed or suspect transfer can be
 quarantined and its staging replaced without ever risking foreign bytes in
-the KV cache.
+the KV cache. The wire protocol rides UCX active messages on worker-address
+endpoints, which additionally makes transfers survive a NIC failure
+mid-flight: UCX transparently reroutes onto surviving rails (see "NIC fault
+tolerance").
 
 Beyond disaggregated serving, this transceiver is the intended backbone for
 a future B10 KV cache layer in which Baseten owns both the storage and the
@@ -111,7 +114,7 @@ flowchart LR
     end
     subgraph decode["Decode rank (receiver)"]
         GE["PyExecutor<br/>request_and_receive_async"] --> RX["RxSession.receive"]
-        RA["B10CacheTransferAgent<br/>listener: RecvPipeline._handle_incoming_write"] --> KV[("decode KV pool")]
+        RA["B10CacheTransferAgent<br/>AM dispatcher: RecvPipeline._handle_incoming_write"] --> KV[("decode KV pool")]
         RX -. "registers dst descriptors" .-> GE
     end
     SW <-. "ZMQ: REQUEST_DATA /<br/>KV_AGENT_RESULT / CANCEL_SESSION" .-> RX
@@ -127,7 +130,7 @@ creates the existing NIXL agent.
 | File | Owns |
 |---|---|
 | `b10/transceiver.py` | V2 adapter: staging-pool derivation, source-KV readiness (`resume_request` + source-ready event), B10-specific timeout recovery |
-| `b10/agent.py` | composition shell: UCXX listener and event-loop thread, collaborator construction, scatter-kernel warmup, shutdown |
+| `b10/agent.py` | composition shell: event-loop thread, AM dispatcher registration, collaborator construction, scatter-kernel warmup, shutdown |
 | `b10/core.py` | `_AgentCore`: shared live state and ownership of tag reservation, staging permits, and staging quarantine |
 | `b10/copy_engine.py` | local descriptor ↔ staging copies shared by send and receive, including copy-stream selection |
 | `b10/send.py` | send pipeline collaborator (`SendPipeline`): submit surface, send plan and control message build, source validation, DATA sends, admission gating |
@@ -141,7 +144,7 @@ creates the existing NIXL agent.
 | `b10/pools.py` | pinned staging pool, CUDA scratch pool, copy-stream pool, quarantine bookkeeping |
 | `b10/kernels.py` | Triton receive scatter kernels, kernel-metadata assembly and upload, local copy helpers, kernel warmups |
 | `b10/state.py` | transfer status, endpoint leases, abort handles, checkout tracking |
-| `b10/async_utils.py`, `b10/net.py` | timeout wrappers, endpoint abort helpers, retry classification, UCXX import and progress-mode default, listener address handling |
+| `b10/async_utils.py`, `b10/net.py` | timeout wrappers, endpoint abort helpers, retry classification, UCXX import and env defaults (progress mode, failover error-handling mode), advertised-address handling |
 | `disaggregation/transceiver.py`, `native/transfer.py` | generic V2 hooks: agent factory, request sync metadata, cancellation, status drain |
 | `pyexecutor/kv_cache_transceiver.py`, `llmapi/llm_args.py` | public runtime selection |
 
@@ -239,7 +242,7 @@ Five persistent threads per rank carry the whole transfer stack:
 
 | Thread | Created at | Runs |
 |---|---|---|
-| B10 agent asyncio loop | dedicated thread + `new_event_loop` in `agent.py` | all B10 work: UCXX listener handler, send/recv coroutines, plan build, pool acquisition, kernel-metadata assembly and launches, endpoint leasing/retirement, timing logs |
+| B10 agent asyncio loop | dedicated thread + `new_event_loop` in `agent.py` | all B10 work: AM dispatcher routing, send/recv coroutines, plan build, pool acquisition, kernel-metadata assembly and launches, endpoint leasing/retirement, timing logs |
 | native Sender delivery worker(s) | `Sender.__init__` (`native/transfer.py`) | dequeue `WriteMeta`s, submit to the agent, block on `TransferStatus.wait` per transfer; count = `TRTLLM_KV_TRANSFER_NUM_THREADS` (default 1) |
 | ZMQ listener ×2 | `ZMQMessenger.start_listener`, one per ROUTER (Sender's and Receiver's) | native-plane control: REQUEST_DATA, KV_AGENT_RESULT, CANCEL_SESSION |
 | UCXX progress thread | ucxx, `thread-polling` mode | C++ busy-poll of the UCX worker (the one deliberately spinning core; GIL-free except future-notifier handoffs to the agent loop) |
@@ -276,10 +279,12 @@ protocols, and we pick the best one that both support. This is intentionally
 aiming at supporting k8s rollouts. The current floor is `packed_descs`;
 senders refuse peers that do not advertise it.
 
-When `UCX_NET_DEVICES` is set, B10 resolves the first mappable UCX device
-entry to a Linux netdev and asks UCXX to advertise an address from that
-interface (`_advertised_ifname_from_ucx_net_devices` in `net.py`). Otherwise
-UCXX chooses the listener address.
+The descriptor's `host`/`port` are registration-plane identity only; data
+plane endpoints are created from the descriptor's UCX worker address blob.
+When `UCX_NET_DEVICES` is set, it selects the NICs the UCX worker binds —
+and therefore the rails the AM plane stripes over and fails over between —
+and B10 also resolves the first mappable device to a Linux netdev for the
+advertised host (`_advertised_ifname_from_ucx_net_devices` in `net.py`).
 
 The full path of one KV transfer, thread by thread. Two terms used below: a
 *write meta* (`WriteMeta` in `native/transfer.py`) is the sender-side work
@@ -371,7 +376,7 @@ B10 separates three granularities:
 | Term | Meaning |
 |---|---|
 | descriptor | original V2 memory descriptor (~1 MiB blocks typically) |
-| DATA chunk | wire message, descriptors coalesced up to the staging-buffer size |
+| DATA chunk | one DATA active message: a 32-byte in-band header + descriptors coalesced up to the staging-buffer size minus that header |
 | local span | contiguous pointer run inside one DATA chunk |
 
 Source-pointer ordering (`_reorder_desc_pairs_for_contiguity` and
@@ -509,6 +514,46 @@ Failures stay request-scoped by design: cleanup never marks the worker
 unhealthy, and V2's session/consensus machinery owns turning a forfeited
 transfer into a client-visible request failure.
 
+### NIC fault tolerance (failover)
+
+The containment doctrine above handles failures after they surface; the AM
+wire plane also makes one large failure class not surface at all. B10
+endpoints are created with `UCP_ERR_HANDLING_MODE_FAILOVER` (the agent
+defaults `UCXX_ERROR_HANDLING_MODE=failover`; `peer` opts out): when a
+NIC/lane dies mid-transfer, UCX reconfigures the endpoint onto the surviving
+rails and transparently restarts affected message fragments — the transfer
+completes with no application-visible error, and the b10 deadline keeps
+running as the only backstop if the degraded rails cannot finish in budget.
+
+Three structural choices make this possible:
+
+- **Active messages, not tag send/recv.** UCX's failover restart machinery
+  exists only for the eager AM protocol (fragment streams with
+  sequence-number dedup on the receiver); no tag protocol is
+  failover-eligible, which is why the wire plane moved to AM.
+- **Worker-address endpoints, not sockaddr.** UCX categorically refuses
+  failover on endpoints with a connection-manager lane — which every
+  listener/host:port endpoint carries for its lifetime. Endpoints are
+  therefore created from the worker address in the peer descriptor, and the
+  UCX listener is gone entirely.
+- **Multi-rail `UCX_NET_DEVICES`.** Failover needs somewhere to fail over
+  to; with a single rail configured, a NIC loss degrades to the peer-mode
+  behavior (endpoint failure -> containment doctrine).
+
+Failure semantics: a single-rail loss is invisible; an all-rails or peer
+failure surfaces exactly as before and exits through the containment funnel
+— no new failure states exist. The failover protocol is eager rather than
+rendezvous, which trades peak wire throughput for restartability; the
+rail/fragment tuning knobs (see "Runtime knobs") mitigate this, and the
+actual cost is deployment-shape-dependent — measure at production shape
+rather than quoting numbers from dev benches.
+
+Validated on two B200 pods (2 NDR rails, a NIC forced down mid-run via
+`ibportstate`): long host-path and VRAM-path WRITE runs — including one
+with eager striped across both rails — completed with zero failed
+transfers and full receiver-side byte verification, with the majority of
+each run finishing after the NIC died.
+
 ### How this differs from the v1 UCX transceiver
 
 Both designs stage payloads — v1's `CacheTransBufferManager`
@@ -571,7 +616,8 @@ Deadline source, in priority order: `kv_transfer_timeout_ms` when configured,
 else `TRTLLM_B10_UCXX_TRANSFER_TIMEOUT_S`, else 60 s. One end-to-end deadline
 (`_TransferDeadline` in `async_utils.py`) covers endpoint creation, control,
 READY, DATA, and RESULT. Idle persistent
-endpoints do not consume it while waiting for the next bootstrap control.
+endpoints consume nothing while waiting — inbound messages arrive through
+the worker-scoped AM callback, so no receive is ever posted ahead of time.
 
 B10 supports context-first scheduling only. Session registration on every TP
 rank is fenced before the prefill response is published. If decode then sends
@@ -613,7 +659,7 @@ in-flight B10 work drain in bounded time after a cancel.
 ### Control-plane hardening
 
 A transfer's success must never hinge on the native ZMQ plane staying
-healthy — a wedged peer listener once stranded already-completed transfers
+healthy — a wedged peer control plane once stranded already-completed transfers
 until the watchdog killed them. Two independent properties close the class:
 
 1. `ZMQMessenger` (`native/messenger.py`) sockets use unbounded send/recv
@@ -662,29 +708,31 @@ When a peer re-registers under the same logical name with a changed
 descriptor (`load_remote_agent` in `agent.py`), B10 aborts
 and drops the cached endpoints but does not reset the slots' generation
 counters; the next transfer creates a fresh endpoint under the next
-generation, so its tags can never collide with operations issued to the
-peer's previous incarnation. If a cached endpoint is
+generation, so stale messages from the peer's previous incarnation can
+never match its transfers. If a cached endpoint is
 stale before DATA begins, B10 retires the slot and retries control/READY
 once (`_refresh_stale_send_endpoint`). After DATA starts it does not retry, because the receiver may already
 have accepted part of the payload. Endpoint retirement must not block the B10
 event loop; timed-out generations are abandoned and future transfers use a
-new generation and tag set.
+new generation.
 
 ## Runtime knobs
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `TRTLLM_B10_UCXX_PORT` | 0 | listener port |
+| `TRTLLM_B10_UCXX_PORT` | 0 | registration-plane identity only; the AM plane has no UCX listener |
 | `TRTLLM_B10_UCXX_ENDPOINT_POOL_SIZE` | 1 | endpoint slots per peer agent |
 | `TRTLLM_B10_UCXX_MAX_IN_FLIGHT_OPS` | 64 | active DATA chunk tasks per transfer (`_run_limited` in `async_utils.py`) |
 | `TRTLLM_B10_UCXX_SEND_ADMISSION_LIMIT` | 3 | concurrent large sends per agent (0 disables); unbounded concurrency time-slices the copy stream, NIC, and staging pool so every transfer's latency balloons (v1 C++ uses send concurrency 1) |
 | `TRTLLM_B10_UCXX_SEND_ADMISSION_BYPASS_BYTES` | 536870912 | sends below this skip the admission gate, keeping small transfers ahead of FIFO head-of-line blocking |
 | `TRTLLM_B10_UCXX_TRANSFER_TIMEOUT_S` | 60 | internal deadline when `kv_transfer_timeout_ms` unset; <=0 disables |
-| `TRTLLM_B10_UCXX_AGENT_STARTUP_TIMEOUT_S` | 120 | budget for the agent's UCXX listener to come up at construction; UCXX context creation has been observed to take >90 s under node-wide init contention (8 ranks opening ~16 RC devices while weights load), so this must stay comfortably above that |
+| `TRTLLM_B10_UCXX_AGENT_STARTUP_TIMEOUT_S` | 120 | budget for the agent's UCXX context and AM plane to come up at construction; UCXX context creation has been observed to take >90 s under node-wide init contention (8 ranks opening ~16 RC devices while weights load), so this must stay comfortably above that |
 | `TRTLLM_B10_UCXX_TAG_SPACE_SIZE` | 2^32 | transfer-ID space |
-| `TRTLLM_B10_UCXX_TAG_QUARANTINE_TTL_S` | 120 | transfer-ID / tag / staging quarantine TTL |
+| `TRTLLM_B10_UCXX_TAG_QUARANTINE_TTL_S` | 120 | transfer-ID / staging quarantine TTL |
+| `UCXX_ERROR_HANDLING_MODE` | failover (agent default) | UCP endpoint error-handling mode for worker-address endpoints (read by the patched ucxx at endpoint creation). `failover` = a NIC/lane failure mid-transfer is transparently rerouted onto surviving rails; `peer` restores fail-the-endpoint behavior |
+| `UCX_MAX_EAGER_RAILS`, `UCX_RC_MLX5_SEG_SIZE` | UCX defaults (1, 8256) | failover-path throughput tuning: the failover-eligible AM protocol is eager (fragment-streamed), and the UCX defaults stripe one rail with ~8 KB fragments; striping all rails with larger segments materially improves it. Hardware-specific, so left to deployment config |
 | `UCXPY_PROGRESS_MODE` | thread-polling | ucxx progress mode, defaulted by the agent to match v1's busy-polling progress threads (ucxx's interrupt-driven default adds an epoll wake per rendezvous transition); costs one spinning core per rank process |
-| `UCXPY_ENABLE_PYTHON_FUTURE` | 1 (agent default) | without futures every awaited request busy-spins the event loop via wait_yield() (a sleep(0) loop) — continuously, since idle endpoints keep a bootstrap recv posted — burning a core and starving the executor of the GIL; with futures on, the progress thread's notifier resolves awaits and the loop sleeps when idle. Safe only because the agent binds ucxx's future notifier to its private loop at listener startup (`_bind_ucxx_python_future_notifier` in `net.py`): ucxx binds the notifier and its pre-created future pool to the loop captured at context creation, and ucxx's get_event_loop() silently invents a never-running loop on threads without one, so a context first touched off the agent loop makes every request await fail with "Future attached to a different loop" (the 2026-07-10 fleet-wide listener-handler failure; reproduced standalone and fixed by the startup rebind — stop notifier, clear futures pool, restart on the agent loop) |
+| `UCXPY_ENABLE_PYTHON_FUTURE` | 1 (agent default) | without futures every awaited request busy-spins the event loop via wait_yield() (a sleep(0) loop), burning a core and starving the executor of the GIL whenever transfers are in flight; with futures on, the progress thread's notifier resolves awaits and the loop sleeps when idle. Safe only because the agent binds ucxx's future notifier to its private loop at startup (`_bind_ucxx_python_future_notifier` in `net.py`): ucxx binds the notifier and its pre-created future pool to the loop captured at context creation, and ucxx's get_event_loop() silently invents a never-running loop on threads without one, so a context first touched off the agent loop makes every request await fail with "Future attached to a different loop" (the 2026-07-10 fleet-wide listener-handler failure; reproduced standalone and fixed by the startup rebind — stop notifier, clear futures pool, restart on the agent loop) |
 | `TRTLLM_B10_UCXX_STAGING_POOL_NUM_BUFFERS` | derived | pinned staging count, from the transfer token budget |
 | `TRTLLM_B10_UCXX_STAGING_POOL_BUFFER_SIZE_BYTES` | 536870912 | staging buffer size = max DATA chunk size; 512 MiB is the default because large chunks cut per-chunk event-loop wakes, which matters on GIL-contended receivers: moving 192 MiB -> 512 MiB took decode's receive pipeline from ~17 GB/s to wire rate in prod (each chunk arrival costs up to one 5 ms GIL switch interval). Receivers' staging/scratch buffers must be >= the sender's chunk size: when raising via env, roll receivers before senders; `RECV_SCRATCH_METADATA_MAX_SPANS` scales with buffer size automatically unless pinned by env |
 | `TRTLLM_B10_UCXX_RECV_SCRATCH_POOL_NUM_BUFFERS` | staging count | receive scratch count; 0 disables scratch |
@@ -699,10 +747,21 @@ B10's data plane is UCXX even though it is selected under `backend: UCX`;
 `DEFAULT` still normalizes to NIXL, so B10 requires explicit `backend: UCX`
 (selection logic in `pyexecutor/kv_cache_transceiver.py`).
 It requires the Python `ucxx` module at runtime (missing `ucxx` raises an
-actionable error); the release image builds UCXX Python from source via
+actionable error) — specifically the basetenlabs ucxx fork carrying the AM
+receiver-callback binding and the failover error-handling mode; the release
+image builds it from source at a pinned commit via
 `docker/common/install_ucxx_python.sh` so bindings use the image UCX rather
-than a wheel-provided `libucp.so`. B10 is treated as a Python-style
-transceiver for resource and cache-manager selection.
+than a wheel-provided `libucp.so`.
+
+The AM plane is a hard peer requirement: endpoints are created from the
+peer descriptor's UCX worker address, and a peer that does not advertise
+one (a pre-AM build) is rejected loudly rather than silently downgraded —
+mixed-version deployments across the tag/AM boundary are not supported.
+Because there is no listener/CM connection path anymore, `tcp` is no
+longer required in `UCX_TLS` (IB-only transport lists such as
+`rc_mlx5,ud_mlx5` are validated); the ZMQ registration plane is unaffected.
+B10 is treated as a Python-style transceiver for resource and
+cache-manager selection.
 
 ## Performance state
 
