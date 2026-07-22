@@ -35,7 +35,7 @@ import torch
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.b10 import memory as b10_memory
-from tensorrt_llm._torch.disaggregation.b10 import protocol as b10_protocol
+from tensorrt_llm._torch.disaggregation.b10.am import B10AmDispatcher
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
     _abort_endpoint_background,
     _await_detached_with_timeout,
@@ -74,16 +74,14 @@ from tensorrt_llm._torch.disaggregation.b10.pools import (
     _record_cuda_copy_events,
 )
 from tensorrt_llm._torch.disaggregation.b10.protocol import (
+    _AM_KIND_READY,
+    _AM_KIND_RESULT,
     _B10_PROTOCOL,
     _B10_PROTOCOL_VERSION,
-    _BOOTSTRAP_CONTROL_TAG,
     _DEFAULT_TAG_QUARANTINE_TTL_S,
-    _data_tag,
-    _ready_tag,
-    _recv_obj,
+    _am_send_message,
+    _AmHeader,
     _request_id_from_sync_message,
-    _result_tag,
-    _send_reply,
 )
 from tensorrt_llm._torch.disaggregation.b10.state import (
     _BufferCheckoutTracker,
@@ -269,12 +267,14 @@ class _RecvRequestActivity:
 class _RecvTransfer:
     """Mutable state shared by the phases of one incoming WRITE."""
 
-    endpoint: Any
     deadline: _TransferDeadline
     transfer_id: int
     request_id: Optional[int]
     endpoint_generation: int
-    tag_domain: int
+    # Sender's worker address from the control message; keys the cached
+    # reverse endpoint (`endpoint`, assigned right after validation) used
+    # for READY/RESULT.
+    src_worker_address: bytes
     dst_type: str
     dst_descs: _DescArrayView
     transfer_chunks: list[_TransferChunk]
@@ -303,10 +303,14 @@ class _RecvTransfer:
     request_level_scatter_chunk_indices: set[int] = field(default_factory=set)
     request_scatter_scratch_views: dict[int, _BufferView] = field(default_factory=dict)
     request_scatter_admission_marked: bool = False
-    ready_tag: int = field(init=False)
-    result_tag: int = field(init=False)
-    tag_owner: tuple[str, int, int] = field(init=False)
     chunk_dst_spans: list[b10_memory._SpanArrays] = field(default_factory=list)
+    # Reverse endpoint for READY/RESULT (assigned after validation).
+    endpoint: Any = None
+    # Per-chunk delivery futures fed by the AM dispatcher's data sink;
+    # `_receive_one` awaits its own index. Created when the sink registers
+    # (before READY, so no DATA can precede them).
+    am_chunks: dict[int, asyncio.Future] = field(default_factory=dict)
+    am_sink_registered: bool = False
 
     def __post_init__(self) -> None:
         self.dst_descs_have_overlap = _has_overlapping_descs(self.dst_descs)
@@ -314,9 +318,6 @@ class _RecvTransfer:
         self.wire_chunk_count, _, self.max_wire_chunk_size = _transfer_chunk_stats(
             self.transfer_chunks
         )
-        self.ready_tag = _ready_tag(self.transfer_id, self.endpoint_generation, self.tag_domain)
-        self.result_tag = _result_tag(self.transfer_id, self.endpoint_generation, self.tag_domain)
-        self.tag_owner = ("recv", id(self.endpoint), self.transfer_id)
 
 
 class RecvPipeline:
@@ -325,10 +326,21 @@ class RecvPipeline:
         core: _AgentCore,
         copies: _CopyEngine,
         tracer: TransferTracer,
+        dispatcher: B10AmDispatcher,
+        ucxx: Any,
     ):
         self._core = core
         self._copies = copies
         self._tracer = tracer
+        self._dispatcher = dispatcher
+        self._ucxx = ucxx
+        # Reverse (READY/RESULT) endpoints toward senders, keyed by the
+        # sender's worker address blob carried in each control message.
+        # Worker-address endpoints, same as the send side, so replies are
+        # failover-capable too. An entry is dropped when a reply send fails;
+        # the next transfer from that sender recreates it.
+        self._reply_endpoints: dict[bytes, Any] = {}
+        dispatcher.set_control_handler(self._on_am_control)
         self._incoming_write_listener: Optional[Callable[[int, bool], None]] = None
         self._recv_scratch_buffer_slots = asyncio.BoundedSemaphore(
             core.recv_scratch_buffer_pool.num_buffers
@@ -379,16 +391,6 @@ class RecvPipeline:
                 f"B10 incoming-write listener failed for request "
                 f"{request_id}: {type(exc).__name__}: {exc}"
             )
-
-    async def _recv_buffer(
-        self, endpoint: Any, buffer: Any, tag: int, deadline: _TransferDeadline
-    ) -> None:
-        if isinstance(buffer, torch.Tensor):
-            if buffer.is_cuda and self._core.sync_cuda_before_transfer:
-                torch.cuda.synchronize(buffer.device)
-            elif not buffer.is_cuda:
-                buffer = buffer.numpy()
-        await _await_detached_with_timeout(endpoint.recv(buffer, tag=tag), deadline.remaining_s())
 
     def _preallocate_recv_scratch_buffers(self) -> None:
         if self._core.recv_scratch_buffer_pool.num_buffers == 0:
@@ -538,28 +540,22 @@ class RecvPipeline:
         if len(self._retired_recv_scratch_views) >= self._core.recv_scratch_buffer_pool.num_buffers:
             self._recv_scratch_device = None
 
-    async def _on_endpoint(self, endpoint: Any) -> None:
-        transfer_id: Optional[int] = None
-        abort_endpoint = True
+    def _on_am_control(self, header: _AmHeader, control: dict[str, Any]) -> None:
+        """AM dispatcher control handler: runs on the agent loop; spawns one
+        incoming-write task per transfer (the AM analog of the per-endpoint
+        listener loop)."""
+        if self._core.shutdown:
+            return
+        self._core.loop.create_task(self._handle_incoming_write_safe(control))
+
+    async def _handle_incoming_write_safe(self, control: dict[str, Any]) -> None:
+        transfer_id = int(control.get("transfer_id", -1))
         try:
-            while not self._core.shutdown:
-                control = await _recv_obj(endpoint, _BOOTSTRAP_CONTROL_TAG, None)
-                transfer_id = int(control.get("transfer_id", -1))
-                await self._handle_incoming_write(endpoint, control)
-                transfer_id = None
-        except b10_protocol.B10TagCollisionError as exc:
-            if not self._core.shutdown:
-                logger.warning(
-                    f"B10 endpoint listener closed after tag collision: "
-                    f"transfer_id={transfer_id} "
-                    f"error={type(exc).__name__}: {exc} "
-                    f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
-                )
+            await self._handle_incoming_write(control)
         except TimeoutError as exc:
-            abort_endpoint = False
             if not self._core.shutdown:
                 logger.warning(
-                    f"B10 endpoint listener closed after transfer timeout: "
+                    f"B10 incoming write failed after transfer timeout: "
                     f"transfer_id={transfer_id} "
                     f"error={type(exc).__name__}: {exc} "
                     f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
@@ -567,16 +563,35 @@ class RecvPipeline:
         except Exception as exc:
             if not self._core.shutdown:
                 logger.warning(
-                    f"B10 endpoint listener closed: transfer_id={transfer_id} "
+                    f"B10 incoming write failed: transfer_id={transfer_id} "
                     f"error={type(exc).__name__}: {exc} "
                     f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
                 )
-        finally:
-            if abort_endpoint:
-                _abort_endpoint_background(endpoint)
 
-    async def _handle_incoming_write(self, endpoint: Any, control: dict[str, Any]) -> None:
-        ctx = self._validate_and_prepare(endpoint, control)
+    async def _get_reply_endpoint(self, src_worker_address: bytes, deadline: Any) -> Any:
+        endpoint = self._reply_endpoints.get(src_worker_address)
+        if endpoint is None:
+            address = self._ucxx.get_ucx_address_from_buffer(src_worker_address)
+            endpoint = await _await_detached_with_timeout(
+                self._ucxx.create_endpoint_from_worker_address(address),
+                deadline.remaining_s(),
+                on_late_result=_abort_endpoint_background,
+            )
+            self._reply_endpoints[src_worker_address] = endpoint
+        return endpoint
+
+    def _drop_reply_endpoint(self, src_worker_address: bytes, endpoint: Any) -> None:
+        if self._reply_endpoints.get(src_worker_address) is endpoint:
+            self._reply_endpoints.pop(src_worker_address, None)
+        _abort_endpoint_background(endpoint)
+
+    async def _handle_incoming_write(self, control: dict[str, Any]) -> None:
+        ctx = self._validate_and_prepare(control)
+        # Reverse endpoint for READY/RESULT, from the sender's worker address
+        # in the control message (self-contained; no registration-plane
+        # dependency). DATA needs no endpoint object at all — it arrives via
+        # the worker-scoped dispatcher.
+        ctx.endpoint = await self._get_reply_endpoint(ctx.src_worker_address, ctx.deadline)
         # No await separates tombstone validation from task registration, so
         # cancellation is caught by one or the other without a race window.
         with self._requests.track_task(ctx.request_id):
@@ -596,7 +611,7 @@ class RecvPipeline:
             finally:
                 self._finish_transfer(ctx)
 
-    def _validate_and_prepare(self, endpoint: Any, control: dict[str, Any]) -> _RecvTransfer:
+    def _validate_and_prepare(self, control: dict[str, Any]) -> _RecvTransfer:
         deadline = _TransferDeadline(self._core.transfer_timeout_s)
         if control.get("protocol") != _B10_PROTOCOL:
             raise ValueError(f"Unexpected B10 control protocol: {control.get('protocol')}")
@@ -608,16 +623,20 @@ class RecvPipeline:
         if request_id is not None and self._requests.is_cancelled(request_id):
             raise RuntimeError(f"B10 recv request {request_id} was already cancelled")
         endpoint_generation = int(control["endpoint_generation"])
-        tag_domain = int(control.get("tag_domain", 0))
+        src_worker_address = control.get("src_worker_address")
+        if not src_worker_address:
+            raise ValueError(
+                f"B10 control for transfer {transfer_id} carries no "
+                "src_worker_address (peer running a pre-AM build?)"
+            )
         dst_type = str(control["dst_type"])
         dst_descs = _dst_descs_from_control(control)
         ctx = _RecvTransfer(
-            endpoint=endpoint,
             deadline=deadline,
             transfer_id=transfer_id,
             request_id=request_id,
             endpoint_generation=endpoint_generation,
-            tag_domain=tag_domain,
+            src_worker_address=bytes(src_worker_address),
             dst_type=dst_type,
             dst_descs=dst_descs,
             transfer_chunks=_transfer_chunks_from_control(control, dst_descs),
@@ -628,7 +647,7 @@ class RecvPipeline:
         ctx.trace.debug(
             lambda: f"control received: "
             f"endpoint_generation={ctx.endpoint_generation} "
-            f"tag_domain={ctx.tag_domain} dst_type={ctx.dst_type} "
+            f"dst_type={ctx.dst_type} "
             f"descs={ctx.desc_count} data_chunks={ctx.wire_chunk_count} "
             f"total_bytes={ctx.total_bytes} max_desc_size={ctx.max_desc_size} "
             f"max_data_chunk_size={ctx.max_wire_chunk_size} "
@@ -678,15 +697,42 @@ class RecvPipeline:
                     ctx.request_scatter_scratch_views.clear()
                 raise
 
+    def _register_am_data_sink(self, ctx: _RecvTransfer) -> None:
+        """Route this transfer's DATA messages into per-chunk futures.
+
+        Registered before READY is sent, so no DATA can precede it (the
+        sender only ships DATA after READY). The sink runs on the agent loop
+        (dispatcher dispatch context); each future holds a zero-copy view
+        over the ucxx-allocated receive buffer, which the view keeps alive
+        until `_receive_one` copies it into pinned staging.
+        """
+        loop = self._core.loop
+        ctx.am_chunks = {idx: loop.create_future() for idx in range(ctx.wire_chunk_count)}
+
+        def sink(chunk_index: int, payload: Any) -> None:
+            future = ctx.am_chunks.get(chunk_index)
+            if future is None or future.done():
+                logger.warning(
+                    f"B10 recv transfer {ctx.transfer_id} dropped unexpected "
+                    f"DATA chunk_index={chunk_index} "
+                    f"(chunks={ctx.wire_chunk_count}, duplicate or out of range)"
+                )
+                return
+            future.set_result(payload)
+
+        self._dispatcher.register_data_sink(ctx.transfer_id, ctx.endpoint_generation, sink)
+        ctx.am_sink_registered = True
+
+    def _unregister_am_data_sink(self, ctx: _RecvTransfer) -> None:
+        if not ctx.am_sink_registered:
+            return
+        ctx.am_sink_registered = False
+        self._dispatcher.unregister_data_sink(ctx.transfer_id, ctx.endpoint_generation)
+        ctx.am_chunks.clear()
+
     async def _reserve_transfer_resources(self, ctx: _RecvTransfer) -> None:
         ctx.request_activity.start_transfer()
-        self._core._reserve_message_tags(
-            ctx.tag_owner,
-            ctx.transfer_id,
-            ctx.endpoint_generation,
-            ctx.tag_domain,
-            ctx.wire_chunk_count,
-        )
+        self._register_am_data_sink(ctx)
         ctx.chunk_dst_spans = [
             _contiguous_desc_spans(ctx.dst_descs, chunk) for chunk in ctx.transfer_chunks
         ]
@@ -724,26 +770,45 @@ class RecvPipeline:
         self._clear_request_scatter_admission(ctx)
         ctx.request_activity.start_copy()
 
-    async def _send_ready(self, ctx: _RecvTransfer) -> None:
-        with ctx.trace.measure("ready_send"):
-            await _send_reply(
+    async def _send_reply_am(self, ctx: _RecvTransfer, kind: int, payload: dict[str, Any]) -> None:
+        try:
+            await _am_send_message(
                 ctx.endpoint,
+                kind,
                 ctx.transfer_id,
-                ctx.ready_tag,
-                {"ok": True},
+                ctx.endpoint_generation,
+                {**payload, "transfer_id": ctx.transfer_id},
                 ctx.deadline.remaining_s(),
             )
-        ctx.trace.debug(
-            lambda: f"READY sent: ready_tag={ctx.ready_tag} result_tag={ctx.result_tag}"
-        )
+        except BaseException:
+            # A failed reply leaves the reverse endpoint in unknown state;
+            # drop it so the next transfer from this sender gets a fresh one.
+            self._drop_reply_endpoint(ctx.src_worker_address, ctx.endpoint)
+            raise
+
+    async def _send_ready(self, ctx: _RecvTransfer) -> None:
+        with ctx.trace.measure("ready_send"):
+            await self._send_reply_am(ctx, _AM_KIND_READY, {"ok": True})
+        ctx.trace.debug(lambda: "READY sent")
 
     def _fail_before_ready(self, ctx: _RecvTransfer, exc: BaseException) -> None:
         ctx.recv_status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
         self._release_recv_scratch_buffers(ctx.recv_scratch_tracker.take_all())
 
     async def _receive_one(self, ctx: _RecvTransfer, chunk: _TransferChunk, idx: int) -> None:
-        data_tag = _data_tag(ctx.transfer_id, idx, ctx.endpoint_generation, ctx.tag_domain)
         try:
+            # Wait for this chunk's AM delivery before taking a staging
+            # buffer, so staging is never held hostage to the network. The
+            # payload is a view over the ucxx-allocated host buffer.
+            with ctx.trace.measure("ucxx_recv"):
+                payload = await _await_detached_with_timeout(
+                    ctx.am_chunks[idx], ctx.deadline.remaining_s()
+                )
+            if len(payload) != chunk.size:
+                raise RuntimeError(
+                    f"B10 recv transfer {ctx.transfer_id} chunk {idx} size "
+                    f"mismatch: header/payload {len(payload)} B, plan {chunk.size} B"
+                )
             try:
                 with ctx.trace.measure("staging_acquire"):
                     staging_view = await self._core._acquire_staging_buffer(
@@ -765,8 +830,16 @@ class RecvPipeline:
             use_recv_scratch = use_request_level_chunk or self._should_use_recv_scratch(
                 ctx.dst_descs, ctx.dst_type, spans, descs_have_overlap=ctx.dst_descs_have_overlap
             )
-            with ctx.trace.measure("ucxx_recv"):
-                await self._recv_buffer(ctx.endpoint, staging_view.buffer, data_tag, ctx.deadline)
+            # Host-to-pinned-host copy out of the ucxx AM buffer; the copy
+            # engine's async H2D path requires pinned staging, which the
+            # ucxx eager buffer is not. Dropping the future's payload ref
+            # afterwards releases the ucxx buffer promptly.
+            with ctx.trace.measure("h2scratch"):
+                staging_view.buffer[: chunk.size].copy_(
+                    torch.frombuffer(payload, dtype=torch.uint8)
+                )
+            ctx.am_chunks.pop(idx, None)
+            del payload
             await ctx.received_chunks.put(
                 _ReceivedTransferChunk(
                     chunk=chunk,
@@ -780,7 +853,7 @@ class RecvPipeline:
             logger.warning(
                 f"B10 recv transfer {ctx.transfer_id} chunk failed: "
                 f"chunk_index={idx} chunk_size={chunk.size} "
-                f"data_chunks={ctx.wire_chunk_count} data_tag={data_tag} "
+                f"data_chunks={ctx.wire_chunk_count} "
                 f"error={type(exc).__name__}: {exc} "
                 f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
             )
@@ -881,11 +954,10 @@ class RecvPipeline:
                 if release_scratch:
                     self._release_recv_scratch_buffers([scratch_view])
                 ctx.recv_scratch_tracker.untrack(scratch_view)
-            data_tag = _data_tag(ctx.transfer_id, idx, ctx.endpoint_generation, ctx.tag_domain)
             logger.warning(
                 f"B10 recv transfer {ctx.transfer_id} chunk failed: "
                 f"chunk_index={idx} chunk_size={chunk.size} "
-                f"data_chunks={ctx.wire_chunk_count} data_tag={data_tag} "
+                f"data_chunks={ctx.wire_chunk_count} "
                 f"error={type(exc).__name__}: {exc} "
                 f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
             )
@@ -1040,13 +1112,7 @@ class RecvPipeline:
         with ctx.trace.measure("copy_event_wait"):
             await self._core._wait_copy_events_async(ctx.copy_events, ctx.deadline)
         with ctx.trace.measure("result_send"):
-            await _send_reply(
-                ctx.endpoint,
-                ctx.transfer_id,
-                ctx.result_tag,
-                {"ok": True},
-                ctx.deadline.remaining_s(),
-            )
+            await self._send_reply_am(ctx, _AM_KIND_RESULT, {"ok": True})
         ctx.trace.debug(lambda: "RESULT sent: ok=True")
         ctx.recv_status = "success"
 
@@ -1082,13 +1148,7 @@ class RecvPipeline:
             return
         # RESULT must not overtake destination copies.
         try:
-            await _send_reply(
-                ctx.endpoint,
-                ctx.transfer_id,
-                ctx.result_tag,
-                {"ok": False, "error": str(exc)},
-                ctx.deadline.remaining_s(),
-            )
+            await self._send_reply_am(ctx, _AM_KIND_RESULT, {"ok": False, "error": str(exc)})
         except Exception as reply_exc:
             logger.warning(
                 f"B10 failed to send failure RESULT for transfer {ctx.transfer_id}: {reply_exc}"
@@ -1097,10 +1157,9 @@ class RecvPipeline:
     def _finish_transfer(self, ctx: _RecvTransfer) -> None:
         ctx.request_activity.finish()
         self._clear_request_scatter_admission(ctx)
-        if ctx.recv_status == "success":
-            self._core.tag_registry.release(ctx.tag_owner)
-        elif ctx.recv_status in ("failed", "cancelled"):
-            self._core.tag_registry.quarantine(ctx.tag_owner)
+        # After this, a late DATA for this transfer has no sink and is
+        # dropped by the dispatcher as stale (the tag-quarantine analog).
+        self._unregister_am_data_sink(ctx)
         self._tracer.log_recv(
             ctx.trace,
             ctx.recv_status,

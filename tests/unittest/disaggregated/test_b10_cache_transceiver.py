@@ -113,16 +113,20 @@ def _make_uninitialized_b10_agent(
         trace_transfer_level=b10_config._TRACE_LEVEL_NONE,
     )
     agent._copies = b10_copy_engine._CopyEngine(core)
+    agent._dispatcher = b10_agent.B10AmDispatcher(core.loop)
     agent._recv = b10_agent.RecvPipeline(
         core,
         agent._copies,
         agent._tracer,
+        agent._dispatcher,
+        ucxx=None,
     )
     agent._send = b10_agent.SendPipeline(
         core,
         agent._copies,
         agent._endpoints,
         agent._tracer,
+        agent._dispatcher,
         validate_send_source=False,
         send_admission_limit=0,
         send_admission_bypass_bytes=0,
@@ -1641,13 +1645,16 @@ def _make_send_control_fixture():
         ),
     )
     lease = types.SimpleNamespace(endpoint_generation=2, tag_domain=5)
-    return plan, lease, dst_descs
+    # _make_send_control needs the pipeline's local worker address (carried
+    # in-control for the receiver's reverse READY/RESULT endpoint).
+    pipeline = types.SimpleNamespace(_get_local_worker_address=lambda: b"test-worker-address")
+    return pipeline, plan, lease, dst_descs
 
 
 def test_b10_send_control_packs_descs():
-    plan, lease, dst_descs = _make_send_control_fixture()
+    pipeline, plan, lease, dst_descs = _make_send_control_fixture()
 
-    control = b10_send.SendPipeline._make_send_control(plan, lease)
+    control = b10_send.SendPipeline._make_send_control(pipeline, plan, lease)
 
     assert "dst_descs" not in control
     assert isinstance(control["dst_descs_packed"], bytes)
@@ -1665,8 +1672,8 @@ def test_b10_send_control_packs_descs():
 
 
 def test_b10_dst_descs_from_control_rejects_truncated_packed_payload():
-    plan, lease, _ = _make_send_control_fixture()
-    control = b10_send.SendPipeline._make_send_control(plan, lease)
+    pipeline, plan, lease, _ = _make_send_control_fixture()
+    control = b10_send.SendPipeline._make_send_control(pipeline, plan, lease)
     received = b10_protocol._unpack_message(b10_protocol._pack_message(control))
 
     corrupt = dict(received)
@@ -1679,8 +1686,8 @@ def test_b10_dst_descs_from_control_rejects_truncated_packed_payload():
 def test_b10_dst_descs_from_control_rejects_legacy_encoding():
     # A control from a pre-packed_descs sender carries list-of-dicts
     # "dst_descs" and no "dst_descs_packed"; this build rejects it loudly.
-    plan, lease, dst_descs = _make_send_control_fixture()
-    control = b10_send.SendPipeline._make_send_control(plan, lease)
+    pipeline, plan, lease, dst_descs = _make_send_control_fixture()
+    control = b10_send.SendPipeline._make_send_control(pipeline, plan, lease)
     legacy = {key: value for key, value in control.items() if key != "dst_descs_packed"}
     legacy["dst_descs"] = [
         {

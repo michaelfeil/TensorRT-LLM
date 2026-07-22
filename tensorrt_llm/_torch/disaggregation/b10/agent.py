@@ -24,6 +24,7 @@ import torch
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.b10 import net as b10_net
+from tensorrt_llm._torch.disaggregation.b10.am import B10AmDispatcher
 from tensorrt_llm._torch.disaggregation.b10.config import B10AgentConfig
 from tensorrt_llm._torch.disaggregation.b10.copy_engine import _CopyEngine
 from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
@@ -153,22 +154,29 @@ class B10CacheTransferAgent(BaseTransferAgent):
             trace_transfer_level=cfg.trace_transfer_level,
         )
         self._copies = _CopyEngine(self._core)
+        # One worker-scoped AM dispatcher per agent: every B10 wire message
+        # (control/READY/RESULT/DATA) arrives through its single receiver
+        # callback and is routed on the agent loop. Registered with the ucxx
+        # worker in _start_am_plane.
+        self._dispatcher = B10AmDispatcher(self._core.loop)
         self._recv = RecvPipeline(
             self._core,
             self._copies,
             self._tracer,
+            self._dispatcher,
+            self._ucxx,
         )
         self._send = SendPipeline(
             self._core,
             self._copies,
             self._endpoints,
             self._tracer,
+            self._dispatcher,
             validate_send_source=cfg.validate_send_source,
             send_admission_limit=cfg.send_admission_limit,
             send_admission_bypass_bytes=cfg.send_admission_bypass_bytes,
         )
         self._warm_scatter_kernels_at_startup()
-        self._listener = None
 
         self._loop_started = threading.Event()
         self._loop_thread = threading.Thread(
@@ -178,7 +186,7 @@ class B10CacheTransferAgent(BaseTransferAgent):
         self._loop_started.wait()
 
         descriptor_future = asyncio.run_coroutine_threadsafe(
-            self._start_listener(), self._core.loop
+            self._start_am_plane(), self._core.loop
         )
         try:
             self._descriptor = descriptor_future.result(timeout=cfg.startup_timeout_s)
@@ -329,25 +337,28 @@ class B10CacheTransferAgent(BaseTransferAgent):
                 self._core.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._core.loop.close()
 
-    async def _start_listener(self) -> B10AgentDescriptor:
+    async def _start_am_plane(self) -> B10AgentDescriptor:
         # First ucxx context touch in the process must happen here, on the
         # agent loop, so the Python-future notifier binds to it; rebinds a
         # foreign-bound pre-existing context. See net.py for the failure
         # mode this prevents.
         b10_net._bind_ucxx_python_future_notifier(self._ucxx)
-        listener = self._ucxx.create_listener(self._recv._on_endpoint, port=self._port)
-        self._listener = listener
+        # No UCX listener: endpoints on both sides are created from worker
+        # addresses (the only endpoint kind UCX failover supports), and all
+        # inbound messages arrive via the worker-scoped AM receiver callback.
+        self._dispatcher.attach(self._ucxx)
         return B10AgentDescriptor(
             name=self.name,
             host=self._ucxx.get_address(ifname=self._advertised_ifname),
-            port=int(listener.port),
+            port=int(self._port),
             tag_domain=self._tag_domain,
             features=(_FEATURE_PACKED_DESCS,),
+            worker_address=bytes(self._ucxx.get_worker_address()),
         )
 
     async def _shutdown_async(self) -> None:
-        if self._listener is not None:
-            self._listener.close()
+        for address, endpoint in list(self._recv._reply_endpoints.items()):
+            self._recv._drop_reply_endpoint(address, endpoint)
         for name in list(self._endpoints._remote_slots):
             await self._endpoints._drop_remote_slots(name)
 

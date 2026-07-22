@@ -14,12 +14,14 @@
 # limitations under the License.
 from __future__ import annotations
 
+import struct
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Hashable, Iterable, Optional
 
 import msgpack
+import numpy as np
 
 from tensorrt_llm._torch.disaggregation.b10 import async_utils as b10_async_utils
 
@@ -51,6 +53,129 @@ _TAG_KIND_DATA = 3
 _DEFAULT_TAG_SPACE_SIZE = 1 << _TRANSFER_ID_BITS
 _DEFAULT_TAG_QUARANTINE_TTL_S = 120.0
 
+# ---- AM wire plane -------------------------------------------------------
+#
+# B10's wire protocol rides UCX active messages instead of tag send/recv so
+# transfers use UCX's failover-capable AM protocol and transparently survive
+# a NIC failure mid-transfer (tag has no failover-eligible protocol). AM
+# carries no tag, so per-message identity moves into a fixed 32-byte in-band
+# header prepended to every message. Endpoint scoping replaces tag quarantine for staleness defense:
+# one endpoint carries at most one transfer at a time (slot lock), a retired
+# endpoint's message stream dies with it, and a header mismatch on a live
+# endpoint is dropped loudly.
+#
+# The plane also requires exchanging UCX worker addresses: endpoints are
+# created from the peer's worker address (carried in B10AgentDescriptor),
+# because UCX failover reconfiguration is only supported on worker-address
+# endpoints, not sockaddr/CM ones. A peer that does not advertise a worker
+# address (a pre-AM build) is therefore incompatible and is rejected rather
+# than silently downgraded.
+#
+# All B10 active messages are sent with receiver callback info
+# (_AM_RECEIVER_OWNER, _AM_RECEIVER_ID) so they route to the worker-scoped
+# callback registered at agent startup (auto-re-arming; never matched by
+# `am_recv()`).
+
+_AM_RECEIVER_OWNER = "b10"
+_AM_RECEIVER_ID = 0
+_AM_RECEIVER_CALLBACK_INFO = (_AM_RECEIVER_OWNER, _AM_RECEIVER_ID)
+
+_AM_KIND_CONTROL = 0
+_AM_KIND_READY = 1
+_AM_KIND_RESULT = 2
+_AM_KIND_DATA = 3
+_AM_KIND_NAMES = {
+    _AM_KIND_CONTROL: "control",
+    _AM_KIND_READY: "READY",
+    _AM_KIND_RESULT: "RESULT",
+    _AM_KIND_DATA: "DATA",
+}
+
+_AM_HEADER_MAGIC = b"B10A"
+_AM_HEADER_VERSION = 1
+# magic(4) | version(1) | kind(1) | pad(2) | transfer_id(8) | chunk_index(4)
+# | endpoint_generation(4) | payload_len(8) = 32 bytes
+_AM_HEADER_STRUCT = struct.Struct("<4sBBHQIIQ")
+_AM_HEADER_SIZE = _AM_HEADER_STRUCT.size
+assert _AM_HEADER_SIZE == 32
+
+
+@dataclass(frozen=True)
+class _AmHeader:
+    kind: int
+    transfer_id: int
+    chunk_index: int
+    endpoint_generation: int
+    payload_len: int
+
+    @property
+    def kind_name(self) -> str:
+        return _AM_KIND_NAMES.get(self.kind, f"kind{self.kind}")
+
+
+def _pack_am_header(
+    kind: int,
+    transfer_id: int,
+    chunk_index: int,
+    endpoint_generation: int,
+    payload_len: int,
+) -> bytes:
+    return _AM_HEADER_STRUCT.pack(
+        _AM_HEADER_MAGIC,
+        _AM_HEADER_VERSION,
+        kind,
+        0,
+        transfer_id,
+        chunk_index,
+        endpoint_generation,
+        payload_len,
+    )
+
+
+def _unpack_am_header(buf: Any) -> _AmHeader:
+    """Parse the 32-byte header at the start of `buf` (any buffer protocol
+    object of at least `_AM_HEADER_SIZE` bytes)."""
+    magic, version, kind, _pad, transfer_id, chunk_index, endpoint_generation, payload_len = (
+        _AM_HEADER_STRUCT.unpack_from(buf, 0)
+    )
+    if magic != _AM_HEADER_MAGIC:
+        raise ValueError(f"B10 AM header bad magic: {magic!r}")
+    if version != _AM_HEADER_VERSION:
+        raise ValueError(f"B10 AM header unexpected version: {version}")
+    return _AmHeader(
+        kind=kind,
+        transfer_id=transfer_id,
+        chunk_index=chunk_index,
+        endpoint_generation=endpoint_generation,
+        payload_len=payload_len,
+    )
+
+
+def _pack_am_message(
+    kind: int, transfer_id: int, endpoint_generation: int, payload: dict[str, Any]
+) -> bytes:
+    """One control-plane AM message: 32-byte header + msgpack payload."""
+    body = _pack_message(payload)
+    return _pack_am_header(kind, transfer_id, 0, endpoint_generation, len(body)) + body
+
+
+async def _am_send_message(
+    endpoint: Any,
+    kind: int,
+    transfer_id: int,
+    endpoint_generation: int,
+    payload: dict[str, Any],
+    timeout_s: Optional[float],
+) -> None:
+    """Send one header+msgpack control-plane message via AM."""
+    buf = np.frombuffer(
+        _pack_am_message(kind, transfer_id, endpoint_generation, payload), dtype=np.uint8
+    )
+    await b10_async_utils._await_detached_with_timeout(
+        endpoint.am_send(buf, receiver_callback_info=_AM_RECEIVER_CALLBACK_INFO),
+        timeout_s,
+    )
+
 
 def _request_id_from_sync_message(sync_message: Optional[str]) -> Optional[int]:
     if not sync_message:
@@ -68,6 +193,10 @@ class B10AgentDescriptor:
     port: int
     tag_domain: int = 0
     features: tuple[str, ...] = ()
+    # UCX worker address blob for the AM plane. Endpoints are created from
+    # this (worker-address endpoints are the only kind UCX failover
+    # supports); host/port remain for registration-plane identity only.
+    worker_address: bytes = b""
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -79,6 +208,7 @@ class B10AgentDescriptor:
                 "port": self.port,
                 "tag_domain": self.tag_domain,
                 "features": list(self.features),
+                "worker_address": self.worker_address,
             },
             use_bin_type=True,
         )
@@ -96,6 +226,7 @@ class B10AgentDescriptor:
             port=int(payload["port"]),
             tag_domain=int(payload.get("tag_domain", 0)),
             features=tuple(payload.get("features", ())),
+            worker_address=payload.get("worker_address", b""),
         )
 
 
@@ -336,36 +467,6 @@ def _unpack_message(payload: bytes) -> dict[str, Any]:
     return msgpack.unpackb(payload, raw=False)
 
 
-async def _send_reply(
-    endpoint: Any, transfer_id: int, tag: int, payload: dict[str, Any], timeout_s: Optional[float]
-) -> None:
-    await _send_obj(endpoint, {**payload, "transfer_id": transfer_id}, tag, timeout_s)
-
-
-async def _recv_reply(
-    endpoint: Any, transfer_id: int, tag: int, message_name: str, timeout_s: Optional[float]
-) -> dict[str, Any]:
-    payload = await _recv_obj(endpoint, tag, timeout_s)
-    if int(payload.get("transfer_id", -1)) != transfer_id:
-        raise RuntimeError(
-            f"B10 {message_name} transfer_id mismatch: expected {transfer_id}, got {payload}"
-        )
-    if not payload.get("ok"):
-        raise RuntimeError(
-            f"B10 {message_name} failed for transfer {transfer_id}: {payload.get('error')}"
-        )
-    return payload
-
-
-async def _send_obj(
-    endpoint: Any, payload: dict[str, Any], tag: int, timeout_s: Optional[float]
-) -> None:
-    await b10_async_utils._await_detached_with_timeout(
-        endpoint.send_obj(_pack_message(payload), tag=tag), timeout_s
-    )
-
-
-async def _recv_obj(endpoint: Any, tag: int, timeout_s: Optional[float]) -> dict[str, Any]:
-    return _unpack_message(
-        await b10_async_utils._await_detached_with_timeout(endpoint.recv_obj(tag=tag), timeout_s)
-    )
+# The tag-plane wire helpers (_send_obj/_recv_obj/_send_reply/_recv_reply)
+# were removed with the move to the AM plane; control-plane messages now
+# flow through _am_send_message and the B10AmDispatcher.

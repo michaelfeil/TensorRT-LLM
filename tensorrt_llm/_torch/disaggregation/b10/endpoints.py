@@ -138,21 +138,23 @@ class EndpointPool:
     async def _get_or_create_endpoint(
         self, slot: _EndpointSlot, remote: B10AgentDescriptor, deadline: _TransferDeadline
     ) -> Any:
+        # Worker-address endpoints, not sockaddr: UCX failover (NIC-loss lane
+        # reconfiguration) is rejected for any endpoint with a CM lane, which
+        # every host:port/listener endpoint carries. The peer's worker address
+        # blob rides its descriptor.
         if slot.endpoint is None:
+            if not remote.worker_address:
+                raise RuntimeError(
+                    f"B10 remote agent {remote.name} descriptor has no UCX "
+                    "worker address (peer running a pre-AM build?)"
+                )
             slot.generation = _next_endpoint_generation(slot.generation)
-            timeout_s = deadline.remaining_s()
-            try:
-                slot.endpoint = await self._ucxx.create_endpoint(
-                    remote.host, remote.port, connect_timeout=timeout_s
-                )
-            except TypeError as exc:
-                if "connect_timeout" not in str(exc):
-                    raise
-                slot.endpoint = await _await_detached_with_timeout(
-                    self._ucxx.create_endpoint(remote.host, remote.port),
-                    timeout_s,
-                    on_late_result=_abort_endpoint_background,
-                )
+            address = self._ucxx.get_ucx_address_from_buffer(remote.worker_address)
+            slot.endpoint = await _await_detached_with_timeout(
+                self._ucxx.create_endpoint_from_worker_address(address),
+                deadline.remaining_s(),
+                on_late_result=_abort_endpoint_background,
+            )
         return slot.endpoint
 
     def _retire_endpoint_slot(

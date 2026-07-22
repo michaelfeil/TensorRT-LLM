@@ -32,7 +32,7 @@ import torch
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.b10 import net as b10_net
-from tensorrt_llm._torch.disaggregation.b10 import protocol as b10_protocol
+from tensorrt_llm._torch.disaggregation.b10.am import B10AmDispatcher
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
     _acquire_with_timeout,
     _await_detached_with_timeout,
@@ -67,17 +67,19 @@ from tensorrt_llm._torch.disaggregation.b10.pools import (
     _record_cuda_copy_events,
 )
 from tensorrt_llm._torch.disaggregation.b10.protocol import (
+    _AM_HEADER_SIZE,
+    _AM_KIND_CONTROL,
+    _AM_KIND_DATA,
+    _AM_KIND_READY,
+    _AM_KIND_RESULT,
+    _AM_RECEIVER_CALLBACK_INFO,
     _B10_PROTOCOL,
     _B10_PROTOCOL_VERSION,
-    _BOOTSTRAP_CONTROL_TAG,
     _FEATURE_PACKED_DESCS,
     _MAX_CHUNK_INDEX,
-    _data_tag,
-    _ready_tag,
-    _recv_reply,
+    _am_send_message,
+    _pack_am_header,
     _request_id_from_sync_message,
-    _result_tag,
-    _send_obj,
 )
 from tensorrt_llm._torch.disaggregation.b10.state import (
     B10TransferStatus,
@@ -119,10 +121,12 @@ class _SendTransfer:
     admission_acquired: bool = False
     span_count: int = 0
     send_in_flight: int = 0
-    tag_owner: tuple[str, int] = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.tag_owner = ("send", self.plan.transfer_id)
+    # READY/RESULT arrive via the AM dispatcher; both futures are registered
+    # before the control message is sent so a reply can never race its
+    # waiter. Keyed by (transfer_id, endpoint_generation, kind) — a lease
+    # refresh (new generation) re-registers them.
+    ready_future: Optional[asyncio.Future] = None
+    result_future: Optional[asyncio.Future] = None
 
 
 class SendPipeline:
@@ -132,6 +136,7 @@ class SendPipeline:
         copies: _CopyEngine,
         endpoints: EndpointPool,
         tracer: TransferTracer,
+        dispatcher: B10AmDispatcher,
         *,
         validate_send_source: bool,
         send_admission_limit: int,
@@ -141,6 +146,8 @@ class SendPipeline:
         self._copies = copies
         self._endpoints = endpoints
         self._tracer = tracer
+        self._dispatcher = dispatcher
+        self._local_worker_address: Optional[bytes] = None
         self._validate_send_source = validate_send_source
         self._send_admission = (
             asyncio.Semaphore(send_admission_limit) if send_admission_limit > 0 else None
@@ -272,15 +279,19 @@ class SendPipeline:
         with self._source_ready_events_lock:
             return self._source_ready_events.get(int(request_id))
 
-    async def _send_buffer(
-        self, endpoint: Any, buffer: Any, tag: int, deadline: _TransferDeadline
-    ) -> None:
+    async def _send_buffer(self, endpoint: Any, buffer: Any, deadline: _TransferDeadline) -> None:
+        # One DATA active message. `buffer` already carries the 32-byte AM
+        # header written into its first bytes by `send_one`; identity rides
+        # in-band, so there is no tag.
         if isinstance(buffer, torch.Tensor):
             if buffer.is_cuda and self._core.sync_cuda_before_transfer:
                 torch.cuda.synchronize(buffer.device)
             elif not buffer.is_cuda:
                 buffer = buffer.numpy()
-        await _await_detached_with_timeout(endpoint.send(buffer, tag=tag), deadline.remaining_s())
+        await _await_detached_with_timeout(
+            endpoint.am_send(buffer, receiver_callback_info=_AM_RECEIVER_CALLBACK_INFO),
+            deadline.remaining_s(),
+        )
 
     def _build_send_transfer_plan(
         self,
@@ -310,8 +321,12 @@ class SendPipeline:
                 f"descriptor encoding — upgrade the peer build"
             )
 
+        # DATA payload shares its staging buffer with the 32-byte in-band AM
+        # header, so chunks coalesce up to header-size less than the buffer.
         desc_order = _reorder_desc_pairs_for_contiguity(
-            src_descs, dst_descs, self._core.staging_buffer_pool.buffer_size
+            src_descs,
+            dst_descs,
+            self._core.staging_buffer_pool.buffer_size - _AM_HEADER_SIZE,
         )
         src_descs = desc_order.src_descs
         dst_descs = desc_order.dst_descs
@@ -355,16 +370,25 @@ class SendPipeline:
                 f"error={type(exc).__name__}: {exc}"
             ) from exc
 
-    @staticmethod
-    def _make_send_control(plan: _SendTransferPlan, lease: _SendEndpointLease) -> dict[str, Any]:
+    def _get_local_worker_address(self) -> bytes:
+        if self._local_worker_address is None:
+            self._local_worker_address = bytes(self._endpoints._ucxx.get_worker_address())
+        return self._local_worker_address
+
+    def _make_send_control(
+        self, plan: _SendTransferPlan, lease: _SendEndpointLease
+    ) -> dict[str, Any]:
         control = {
             "protocol": _B10_PROTOCOL,
             "version": _B10_PROTOCOL_VERSION,
             "transfer_id": plan.transfer_id,
             "endpoint_generation": lease.endpoint_generation,
-            "tag_domain": lease.tag_domain,
             "src_type": plan.src_type,
             "dst_type": plan.dst_type,
+            # The receiver creates its reverse (READY/RESULT) endpoint from
+            # this; self-contained so replies never depend on registration-
+            # plane state. Stable per process, computed once.
+            "src_worker_address": self._get_local_worker_address(),
         }
         # plan.dst_descs is the array-backed view carried from
         # _reorder_desc_pairs_for_contiguity, so the encoding below is
@@ -383,24 +407,56 @@ class SendPipeline:
             control["sync_message"] = plan.sync_message
         return control
 
+    def _discard_reply_futures(self, ctx: _SendTransfer, lease: _SendEndpointLease) -> None:
+        self._dispatcher.discard_reply_future(
+            ctx.plan.transfer_id, lease.endpoint_generation, _AM_KIND_READY
+        )
+        self._dispatcher.discard_reply_future(
+            ctx.plan.transfer_id, lease.endpoint_generation, _AM_KIND_RESULT
+        )
+        ctx.ready_future = None
+        ctx.result_future = None
+
+    @staticmethod
+    def _check_reply(payload: dict[str, Any], transfer_id: int, message_name: str) -> None:
+        if int(payload.get("transfer_id", -1)) != transfer_id:
+            raise RuntimeError(
+                f"B10 {message_name} transfer_id mismatch: expected {transfer_id}, got {payload}"
+            )
+        if not payload.get("ok"):
+            raise RuntimeError(
+                f"B10 {message_name} failed for transfer {transfer_id}: {payload.get('error')}"
+            )
+
     async def _send_control_and_wait_ready(
         self,
         ctx: _SendTransfer,
         lease: _SendEndpointLease,
     ) -> None:
         plan = ctx.plan
-        ready_tag = _ready_tag(plan.transfer_id, lease.endpoint_generation, lease.tag_domain)
-        result_tag = _result_tag(plan.transfer_id, lease.endpoint_generation, lease.tag_domain)
-        await _send_obj(
-            lease.endpoint,
-            self._make_send_control(plan, lease),
-            _BOOTSTRAP_CONTROL_TAG,
-            ctx.deadline.remaining_s(),
+        # Register both reply futures before control leaves so neither reply
+        # can race its waiter; RESULT is awaited later in _execute_write.
+        ctx.ready_future = self._dispatcher.register_reply_future(
+            plan.transfer_id, lease.endpoint_generation, _AM_KIND_READY
         )
-        ctx.trace.debug(lambda: f"control sent: ready_tag={ready_tag} result_tag={result_tag}")
-        await _recv_reply(
-            lease.endpoint, plan.transfer_id, ready_tag, "READY", ctx.deadline.remaining_s()
+        ctx.result_future = self._dispatcher.register_reply_future(
+            plan.transfer_id, lease.endpoint_generation, _AM_KIND_RESULT
         )
+        try:
+            await _am_send_message(
+                lease.endpoint,
+                _AM_KIND_CONTROL,
+                plan.transfer_id,
+                lease.endpoint_generation,
+                self._make_send_control(plan, lease),
+                ctx.deadline.remaining_s(),
+            )
+            ctx.trace.debug(lambda: "control sent")
+            ready = await _await_detached_with_timeout(ctx.ready_future, ctx.deadline.remaining_s())
+            self._check_reply(ready, plan.transfer_id, "READY")
+        except BaseException:
+            self._discard_reply_futures(ctx, lease)
+            raise
         ctx.trace.debug(lambda: "READY received")
 
     async def _send_control_and_wait_ready_with_retry(
@@ -411,22 +467,12 @@ class SendPipeline:
         plan = ctx.plan
 
         async def timed_control_ready(current_lease: _SendEndpointLease) -> None:
-            reserved_tags = False
+            # Sending CONTROL and awaiting READY needs no per-transfer setup:
+            # message identity travels in the in-band header (endpoint-scoped)
+            # and replies resolve through dispatcher futures keyed by
+            # (transfer_id, generation, kind).
             with ctx.trace.measure_attempt("control_ready"):
-                try:
-                    self._core._reserve_message_tags(
-                        ctx.tag_owner,
-                        plan.transfer_id,
-                        current_lease.endpoint_generation,
-                        current_lease.tag_domain,
-                        plan.wire_chunk_count,
-                    )
-                    reserved_tags = True
-                    await self._send_control_and_wait_ready(ctx, current_lease)
-                except Exception:
-                    if reserved_tags:
-                        self._core.tag_registry.quarantine(ctx.tag_owner)
-                    raise
+                await self._send_control_and_wait_ready(ctx, current_lease)
 
         async def refresh_and_ready(current_lease: _SendEndpointLease) -> _SendEndpointLease:
             refreshed_lease = await self._endpoints._refresh_stale_send_endpoint(
@@ -441,15 +487,6 @@ class SendPipeline:
 
         try:
             await timed_control_ready(lease)
-        except b10_protocol.B10TagCollisionError as exc:
-            logger.warning(
-                f"B10 send transfer {plan.transfer_id} retrying tag "
-                f"collision before DATA: remote={plan.remote_name} "
-                f"slot_index={lease.slot_index} "
-                f"endpoint_generation={lease.endpoint_generation} "
-                f"error={type(exc).__name__}: {exc}"
-            )
-            lease = await refresh_and_ready(lease)
         except Exception as exc:
             if not _is_retryable_endpoint_error(exc):
                 raise
@@ -469,24 +506,35 @@ class SendPipeline:
         assert lease is not None
         source_ready_waited_keys: set[tuple[str, int]] = set()
 
-        async def send_one(chunk: _TransferChunk, idx: int) -> None:
+        async def send_one(chunk: _TransferChunk, chunk_idx: int) -> None:
             try:
                 with ctx.trace.measure("staging_acquire"):
+                    # The wire message is header + payload in one contiguous
+                    # pinned buffer: 32-byte in-band AM header first, chunk
+                    # payload after it (plan build already caps chunk size at
+                    # buffer_size - header).
                     staging_view = await self._core._acquire_staging_buffer(
-                        chunk.size, ctx.deadline
+                        chunk.size + _AM_HEADER_SIZE, ctx.deadline
                     )
             except Exception as exc:
                 logger.warning(
                     f"B10 send transfer {plan.transfer_id} failed to acquire "
                     f"staging buffer: remote={plan.remote_name} "
-                    f"chunk_index={idx} chunk_size={chunk.size} "
+                    f"chunk_index={chunk_idx} chunk_size={chunk.size} "
                     f"data_chunks={plan.wire_chunk_count} "
                     f"error={type(exc).__name__}: {exc} "
                     f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
                 )
                 raise
             ctx.staging_tracker.track(staging_view)
-            data_tag = _data_tag(plan.transfer_id, idx, lease.endpoint_generation, lease.tag_domain)
+            header = _pack_am_header(
+                _AM_KIND_DATA, plan.transfer_id, chunk_idx, lease.endpoint_generation, chunk.size
+            )
+            # CPU write into pinned host memory; trivially cheap vs the chunk.
+            staging_view.buffer[:_AM_HEADER_SIZE].copy_(
+                torch.frombuffer(bytearray(header), dtype=torch.uint8)
+            )
+            payload_view = staging_view.buffer[_AM_HEADER_SIZE:]
             try:
                 with ctx.trace.measure("src_copy"):
                     # Keep fallback source span views alive until their D2H
@@ -496,7 +544,7 @@ class SendPipeline:
                         plan.src_descs,
                         chunk,
                         plan.src_type,
-                        staging_view.buffer,
+                        payload_view,
                         copy_from_staging=False,
                         lifetime_refs=copy_lifetime_refs,
                         source_ready_events=ctx.source_ready_events,
@@ -514,11 +562,10 @@ class SendPipeline:
                 copy_lifetime_refs.clear()
 
                 # The wire send: everything above staged this chunk into
-                # pinned host memory; this ships it to the peer.
+                # pinned host memory after the in-band header; this ships
+                # header+payload as one active message.
                 with ctx.trace.measure("ucxx_send"):
-                    await self._send_buffer(
-                        lease.endpoint, staging_view.buffer, data_tag, ctx.deadline
-                    )
+                    await self._send_buffer(lease.endpoint, staging_view.buffer, ctx.deadline)
 
                 with ctx.trace.measure("staging_release"):
                     self._core._release_staging_buffers([staging_view])
@@ -526,9 +573,9 @@ class SendPipeline:
             except Exception as exc:
                 logger.warning(
                     f"B10 send transfer {plan.transfer_id} chunk failed: "
-                    f"remote={plan.remote_name} chunk_index={idx} "
+                    f"remote={plan.remote_name} chunk_index={chunk_idx} "
                     f"chunk_size={chunk.size} "
-                    f"data_chunks={plan.wire_chunk_count} data_tag={data_tag} "
+                    f"data_chunks={plan.wire_chunk_count} "
                     f"error={type(exc).__name__}: {exc}"
                 )
                 raise
@@ -540,8 +587,8 @@ class SendPipeline:
         with ctx.trace.measure("data_phase_wall"):
             await _run_limited(
                 [
-                    (lambda chunk=chunk, idx=idx: send_one(chunk, idx))
-                    for idx, chunk in enumerate(plan.transfer_chunks)
+                    (lambda chunk=chunk, chunk_idx=chunk_idx: send_one(chunk, chunk_idx))
+                    for chunk_idx, chunk in enumerate(plan.transfer_chunks)
                 ],
                 transfer_id=plan.transfer_id,
                 phase="send DATA",
@@ -633,13 +680,10 @@ class SendPipeline:
             await self._send_transfer_chunks(ctx)
             lease = ctx.lease
             with ctx.trace.measure("result_recv"):
-                await _recv_reply(
-                    lease.endpoint,
-                    plan.transfer_id,
-                    _result_tag(plan.transfer_id, lease.endpoint_generation, lease.tag_domain),
-                    "RESULT",
-                    ctx.deadline.remaining_s(),
+                result = await _await_detached_with_timeout(
+                    ctx.result_future, ctx.deadline.remaining_s()
                 )
+                self._check_reply(result, plan.transfer_id, "RESULT")
             ctx.trace.debug(lambda: "RESULT received: ok=True")
 
     def _fail_write(self, ctx: _SendTransfer, exc: BaseException) -> None:
@@ -676,11 +720,11 @@ class SendPipeline:
     def _finish_write(self, ctx: _SendTransfer) -> None:
         if ctx.admission_acquired:
             self._send_admission.release()
-        if ctx.status == "success":
-            self._core.tag_registry.release(ctx.tag_owner)
-        elif ctx.status in ("failed", "cancelled"):
-            self._core.tag_registry.quarantine(ctx.tag_owner)
+        # Drop any reply future still registered (no-op after clean RESULT,
+        # which pops its future on delivery); a reply landing later is then
+        # dropped by the dispatcher as stale.
         if ctx.lease is not None:
+            self._discard_reply_futures(ctx, ctx.lease)
             ctx.abort_handle.unbind_endpoint(ctx.lease.endpoint)
         self._tracer.log_send(
             ctx.trace,

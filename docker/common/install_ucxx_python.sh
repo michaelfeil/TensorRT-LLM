@@ -5,8 +5,15 @@
 
 set -ex
 
-UCXX_REPO="${GITHUB_MIRROR:-https://github.com}/rapidsai/ucxx.git"
-UCXX_COMMIT="cf34a4e9033eedba278d44f2235eb06e2878c9c0"
+# basetenlabs/ucxx fork: rapidsai/ucxx v0.50.00 (cf34a4e) + the AM
+# receiver-callback Python binding and opt-in UCP failover error-handling
+# mode that the B10 AM KV-transfer wire plane depends on. See
+# basetenlabs/ucxx#1 (branch wilson/am-receiver-callback, base release-0.50).
+# Cloned from github.com directly, NOT via GITHUB_MIRROR: the mirror only
+# carries upstream (rapidsai/nvidia) repos, not this fork. The rapids-cmake
+# fetch below still honors GITHUB_MIRROR.
+UCXX_REPO="${UCXX_REPO:-https://github.com/basetenlabs/ucxx.git}"
+UCXX_COMMIT="6c6d7015c4bb08949c294c61e7c3e715adb43fd9"
 UCXX_INSTALL_PREFIX="${UCXX_INSTALL_PREFIX:-/usr/local}"
 UCX_INSTALL_PATH="${UCX_INSTALL_PATH:-/usr/local/ucx}"
 UCXX_SOURCE_PATH="${UCXX_SOURCE_PATH:-/tmp/ucxx-python-src}"
