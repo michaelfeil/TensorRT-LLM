@@ -14,11 +14,12 @@
 # limitations under the License.
 """Worker-scoped active message dispatcher for the B10 AM wire plane.
 
-One instance per agent, registered once with the UCXX worker at startup via
-``ucxx.register_am_receiver_callback``. Every B10 message (control / READY /
-RESULT / DATA) arrives through the single auto-re-arming receiver callback;
-this class parses the 32-byte in-band header (`protocol._AmHeader`) and
-routes on the agent event loop:
+One permanent callback is registered per UCXX worker via
+``ucxx.register_am_receiver_callback``; sequential B10 agents attach their
+dispatcher behind it because UCXX does not support unregistering callbacks.
+Every B10 message (control / READY / RESULT / DATA) arrives through that
+auto-re-arming callback; this class parses the 32-byte in-band header
+(`protocol._AmHeader`) and routes on the active agent event loop:
 
 - ``control``      -> the control handler installed by the receive pipeline
                       (spawns one incoming-write task per transfer)
@@ -39,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Any, Callable, Optional
 
 from tensorrt_llm._torch.disaggregation.b10.protocol import (
@@ -56,6 +58,25 @@ from tensorrt_llm._torch.disaggregation.b10.protocol import (
 
 logger = logging.getLogger(__name__)
 
+
+class _AmCallbackSlot:
+    """Permanent UCXX callback that forwards to the active B10 agent."""
+
+    def __init__(self):
+        self.dispatcher: Optional[B10AmDispatcher] = None
+
+    def __call__(self, request: Any, ep_handle: int) -> None:
+        dispatcher = self.dispatcher
+        if dispatcher is not None:
+            dispatcher._on_am(request, ep_handle)
+
+
+# UCXX callbacks live for the worker's lifetime and cannot be unregistered.
+# Keep one permanent trampoline per process-global worker, while sequential
+# B10 agents attach and detach their dispatcher behind it.
+_AM_CALLBACK_SLOTS: dict[int, _AmCallbackSlot] = {}
+_AM_CALLBACK_SLOTS_LOCK = threading.Lock()
+
 # sink(chunk_index, payload_view) — payload_view is a view over the
 # ucxx-allocated receive buffer and transitively keeps that buffer alive
 # (ucxx hands the numpy array ownership of the malloc'd data), so the sink
@@ -70,23 +91,49 @@ ControlHandler = Callable[[int, _AmHeader, dict[str, Any]], None]
 class B10AmDispatcher:
     """Worker-scoped router for the B10 AM wire plane.
 
-    Owns the single AM receiver callback registered with the UCXX worker and
-    fans every inbound message out on the agent event loop by kind: CONTROL
-    to the recv pipeline's handler, DATA to the active transfer's chunk sink,
-    READY/RESULT to the send pipeline's reply futures. Messages with no live
-    target are dropped as stale. See the module docstring for the full
-    routing and staleness contract.
+    Receives messages from the UCXX worker's permanent callback and fans them
+    out on the agent event loop by kind: CONTROL to the recv pipeline's
+    handler, DATA to the active transfer's chunk sink, and READY/RESULT to the
+    send pipeline's reply futures. Messages with no live target are dropped
+    as stale. See the module docstring for the full routing and staleness
+    contract.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
+        self._callback_slot: Optional[_AmCallbackSlot] = None
         self._control_handler: Optional[ControlHandler] = None
         self._data_sinks: dict[tuple[int, int, int], DataSink] = {}
         self._reply_futures: dict[tuple[int, int, int], asyncio.Future] = {}
 
     def attach(self, ucxx: Any) -> None:
-        """Register with the UCXX worker; call once at agent startup."""
-        ucxx.register_am_receiver_callback(_AM_RECEIVER_OWNER, _AM_RECEIVER_ID, self._on_am)
+        """Attach to the worker's permanent AM callback trampoline."""
+        worker_key = int(ucxx.get_ucxx_worker())
+        with _AM_CALLBACK_SLOTS_LOCK:
+            slot = _AM_CALLBACK_SLOTS.get(worker_key)
+            if slot is None:
+                slot = _AmCallbackSlot()
+                ucxx.register_am_receiver_callback(
+                    _AM_RECEIVER_OWNER,
+                    _AM_RECEIVER_ID,
+                    slot,
+                )
+                _AM_CALLBACK_SLOTS[worker_key] = slot
+            active = slot.dispatcher
+            if active is not None and active is not self and not active._loop.is_closed():
+                raise RuntimeError("B10 AM callback is already attached to a live agent")
+            slot.dispatcher = self
+            self._callback_slot = slot
+
+    def detach(self) -> None:
+        """Stop forwarding AMs to this agent; the UCXX callback remains."""
+        slot = self._callback_slot
+        if slot is None:
+            return
+        with _AM_CALLBACK_SLOTS_LOCK:
+            if slot.dispatcher is self:
+                slot.dispatcher = None
+            self._callback_slot = None
 
     def set_control_handler(self, handler: ControlHandler) -> None:
         self._control_handler = handler

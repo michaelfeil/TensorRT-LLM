@@ -84,6 +84,42 @@ def test_agent_descriptor_worker_address_roundtrip():
     assert decoded.worker_address == b"\x01\x02\x03worker"
 
 
+@pytest.mark.asyncio
+async def test_dispatchers_reuse_worker_callback_after_detach():
+    class FakeUcxx:
+        def __init__(self):
+            self.worker_key = id(self)
+            self.callback = None
+            self.registrations = 0
+
+        def get_ucxx_worker(self):
+            return self.worker_key
+
+        def register_am_receiver_callback(self, owner, identifier, callback):
+            assert (owner, identifier) == ("b10", 0)
+            self.registrations += 1
+            self.callback = callback
+
+    ucxx = FakeUcxx()
+    loop = asyncio.get_running_loop()
+    first = B10AmDispatcher(loop)
+    second = B10AmDispatcher(loop)
+    first.attach(ucxx)
+
+    with pytest.raises(RuntimeError, match="already attached to a live agent"):
+        second.attach(ucxx)
+
+    first.detach()
+    second.attach(ucxx)
+    delivered = []
+    second._on_am = lambda request, ep_handle: delivered.append((request, ep_handle))
+    ucxx.callback("request", 7)
+
+    assert ucxx.registrations == 1
+    assert delivered == [("request", 7)]
+    second.detach()
+
+
 def _fake_request(message: bytes) -> types.SimpleNamespace:
     import numpy as np
 

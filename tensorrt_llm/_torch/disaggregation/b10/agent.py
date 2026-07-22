@@ -143,10 +143,9 @@ class B10CacheTransferAgent(BaseTransferAgent):
             trace_transfer_level=cfg.trace_transfer_level,
         )
         self._copies = _CopyEngine(self._core)
-        # One worker-scoped AM dispatcher per agent: every B10 wire message
-        # (control/READY/RESULT/DATA) arrives through its single receiver
-        # callback and is routed on the agent loop. Registered with the ucxx
-        # worker in _start_am_plane.
+        # One AM dispatcher per agent routes control/READY/RESULT/DATA on the
+        # agent loop. _start_am_plane attaches it to the worker's permanent
+        # receiver callback.
         self._dispatcher = B10AmDispatcher(self._core.loop)
         self._recv = RecvPipeline(
             self._core,
@@ -349,6 +348,7 @@ class B10CacheTransferAgent(BaseTransferAgent):
             self._recv._drop_reply_endpoint(address, endpoint)
         for name in list(self._endpoints._remote_slots):
             await self._endpoints._drop_remote_slots(name)
+        self._dispatcher.detach()
 
 
 def create_b10_transfer_agent(
