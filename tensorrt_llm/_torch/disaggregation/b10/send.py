@@ -15,8 +15,8 @@
 """Send side of the B10 UCXX transfer agent.
 
 ``SendPipeline`` plans and executes outgoing WRITEs over a leased persistent
-endpoint. A transfer owns its admission permit, endpoint slot, staging views,
-and tags until its single terminal cleanup boundary. See DESIGN.md "Anatomy
+endpoint. A transfer owns its admission permit, endpoint slot, and staging
+views until its single terminal cleanup boundary. See DESIGN.md "Anatomy
 of a WRITE" and "Timeout and failure handling".
 """
 
@@ -250,8 +250,6 @@ class SendPipeline:
             abort_handle,
             b10_net._status_wait_timeout_ms(self._core.transfer_timeout_s),
             cleanup_event=cleanup_event,
-            tag_registry=self._core.tag_registry,
-            tag_owner=("send", transfer_id),
         )
 
     def record_source_ready_event(self, request_id: int, *, stream: Optional[Any] = None) -> None:
@@ -610,7 +608,6 @@ class SendPipeline:
         source_ready_events: Optional[_SourceReadyEvents] = None,
     ) -> bool:
         trace = self._tracer.start("send", transfer_id)
-        tag_owner = ("send", transfer_id)
         try:
             abort_handle.bind_current_task()
             with trace.measure("plan_build"):
@@ -620,7 +617,9 @@ class SendPipeline:
                 if self._validate_send_source:
                     self._validate_send_source_residency(plan)
         except BaseException:
-            self._core.tag_registry.quarantine(tag_owner)
+            # The transfer id itself is handled by B10TransferStatus: the
+            # raise resolves the submit future, and _on_done quarantines the
+            # id on any failure.
             if cleanup_event is not None:
                 cleanup_event.set()
             raise
@@ -667,7 +666,6 @@ class SendPipeline:
                 f"remote={plan.remote_name} remote_host={plan.remote.host} "
                 f"remote_port={plan.remote.port} slot_index={slot_index} "
                 f"endpoint_generation={lease.endpoint_generation} "
-                f"tag_domain={lease.tag_domain} src_type={plan.src_type} "
                 f"dst_type={plan.dst_type} descs={plan.desc_count} "
                 f"data_chunks={plan.wire_chunk_count} total_bytes={plan.total_bytes} "
                 f"max_desc_size={plan.max_desc_size} "

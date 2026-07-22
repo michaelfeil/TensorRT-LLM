@@ -42,9 +42,7 @@ from tensorrt_llm._torch.disaggregation.b10.pools import (
 )
 from tensorrt_llm._torch.disaggregation.b10.protocol import (
     _FEATURE_PACKED_DESCS,
-    _MAX_TAG_DOMAIN,
     B10AgentDescriptor,
-    B10TagRegistry,
     B10TransferIdAllocator,
 )
 from tensorrt_llm._torch.disaggregation.b10.recv import RecvPipeline
@@ -80,7 +78,6 @@ class B10CacheTransferAgent(BaseTransferAgent):
         max_in_flight_ops: Optional[int] = None,
         tag_space_size: Optional[int] = None,
         tag_quarantine_ttl_s: Optional[float] = None,
-        tag_domain: Optional[int] = None,
         transfer_timeout_s: Optional[float] = None,
         staging_pool_num_buffers: Optional[int] = None,
         staging_pool_buffer_size: Optional[int] = None,
@@ -92,11 +89,6 @@ class B10CacheTransferAgent(BaseTransferAgent):
         self._advertised_ifname = b10_net._advertised_ifname_from_ucx_net_devices()
         b10_net._augment_ucx_net_devices_for_sockaddr()
         self._ucxx = ucxx_module or b10_net._load_ucxx_module()
-        self._tag_domain = (
-            int.from_bytes(os.urandom(8), "little") if tag_domain is None else tag_domain
-        )
-        if self._tag_domain < 0 or self._tag_domain > _MAX_TAG_DOMAIN:
-            raise ValueError(f"tag_domain must be in [0, {_MAX_TAG_DOMAIN}]")
         cfg = B10AgentConfig.from_env(
             port=port,
             endpoint_pool_size=endpoint_pool_size,
@@ -118,7 +110,6 @@ class B10CacheTransferAgent(BaseTransferAgent):
             tag_space_size=tag_space,
             quarantine_ttl_s=quarantine_ttl_s,
         )
-        tag_registry = B10TagRegistry(quarantine_ttl_s=quarantine_ttl_s)
         pool_num_buffers = cfg.staging_pool_num_buffers
         pool_buffer_size = cfg.staging_pool_buffer_size
         staging_buffer_pool = _PinnedStagingBufferPool(
@@ -137,7 +128,6 @@ class B10CacheTransferAgent(BaseTransferAgent):
             cfg,
             loop=asyncio.new_event_loop(),
             transfer_ids=transfer_ids,
-            tag_registry=tag_registry,
             staging_buffer_pool=staging_buffer_pool,
             staging_buffer_slots=staging_buffer_slots,
             recv_scratch_buffer_pool=recv_scratch_buffer_pool,
@@ -146,7 +136,6 @@ class B10CacheTransferAgent(BaseTransferAgent):
         self._endpoints = EndpointPool(
             self._core,
             ucxx=self._ucxx,
-            tag_domain=self._tag_domain,
             endpoint_pool_size=cfg.endpoint_pool_size,
         )
         self._tracer = TransferTracer(
@@ -351,7 +340,6 @@ class B10CacheTransferAgent(BaseTransferAgent):
             name=self.name,
             host=self._ucxx.get_address(ifname=self._advertised_ifname),
             port=int(self._port),
-            tag_domain=self._tag_domain,
             features=(_FEATURE_PACKED_DESCS,),
             worker_address=bytes(self._ucxx.get_worker_address()),
         )

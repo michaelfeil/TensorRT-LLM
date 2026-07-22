@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable, Hashable
+from typing import Any, Callable
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
@@ -41,11 +41,7 @@ from tensorrt_llm._torch.disaggregation.b10.pools import (
     _PinnedStagingBufferPool,
     _QuarantinedBufferViews,
 )
-from tensorrt_llm._torch.disaggregation.b10.protocol import (
-    B10TagRegistry,
-    B10TransferIdAllocator,
-    _transfer_message_tags,
-)
+from tensorrt_llm._torch.disaggregation.b10.protocol import B10TransferIdAllocator
 
 
 class _AgentCore:
@@ -55,7 +51,6 @@ class _AgentCore:
         *,
         loop: asyncio.AbstractEventLoop,
         transfer_ids: B10TransferIdAllocator,
-        tag_registry: B10TagRegistry,
         staging_buffer_pool: _PinnedStagingBufferPool,
         staging_buffer_slots: asyncio.BoundedSemaphore,
         recv_scratch_buffer_pool: _CudaScratchBufferPool,
@@ -64,7 +59,6 @@ class _AgentCore:
         self.config = config
         self.loop = loop
         self.transfer_ids = transfer_ids
-        self.tag_registry = tag_registry
         self.staging_buffer_pool = staging_buffer_pool
         self.staging_buffer_slots = staging_buffer_slots
         self.recv_scratch_buffer_pool = recv_scratch_buffer_pool
@@ -75,19 +69,6 @@ class _AgentCore:
         self.sync_cuda_before_transfer = config.sync_cuda_before_transfer
         self.transfer_timeout_s = config.transfer_timeout_s
         self.shutdown = False
-
-    def _reserve_message_tags(
-        self,
-        owner: Hashable,
-        transfer_id: int,
-        endpoint_generation: int,
-        tag_domain: int,
-        wire_chunk_count: int,
-    ) -> None:
-        self.tag_registry.reserve(
-            owner,
-            _transfer_message_tags(transfer_id, endpoint_generation, tag_domain, wire_chunk_count),
-        )
 
     async def _acquire_staging_buffer(self, size: int, deadline: _TransferDeadline) -> _BufferView:
         return await self._acquire_pooled_buffer(

@@ -54,8 +54,9 @@ Design goals:
 
 - Reuse `KvCacheTransceiverV2` session, peer registration, KV slicing, cancellation, and status
   flow; implement only `WRITE` transfers.
-- Own tag derivation, active tag tracking, and quarantine in TensorRT-LLM
-  code — never reuse a tag that might still match a stale operation.
+- Own message identity (the in-band AM header), transfer-id quarantine, and
+  endpoint generations in TensorRT-LLM code — never let a stale message
+  match a live transfer.
 - Receive into pinned host staging before copying into final destinations;
   use preallocated GPU scratch for fragmented VRAM receive copies.
 - Keep persistent endpoints and bounded in-flight DATA chunk tasks.
@@ -87,13 +88,13 @@ Everything else in this document (staging, chunking, tags, kernels,
 quarantine) exists to do that one job fast and safely.**
 
 **Where B10 stops and UCXX begins: B10 owns everything that has meaning —
-the message protocol (control/READY/DATA/RESULT), tags and their
-quarantine, endpoint lifecycle policy, staging pools, chunk planning,
-timeouts, and completion. UCXX is used as a dumb pipe: B10 hands it a
-buffer and a 64-bit tag and says "send this on that endpoint" or "receive
-whatever arrives with this tag into here." Connection wireup, transport
-selection (RDMA vs TCP), rendezvous, and physically moving bytes over the
-NIC belong to UCXX/UCX. UCXX knows nothing about requests or KV; B10 knows
+the message protocol (control/READY/DATA/RESULT), the in-band message
+header, transfer-id quarantine, endpoint lifecycle policy, staging pools,
+chunk planning, timeouts, and completion. UCXX is used as a dumb pipe: B10
+hands it a header-prefixed buffer and says "send this active message on
+that endpoint"; a worker-scoped receiver callback delivers every inbound
+message. Connection wireup, transport selection, NIC failover rerouting,
+and physically moving bytes over the NIC belong to UCXX/UCX. UCXX knows nothing about requests or KV; B10 knows
 nothing about NICs.**
 
 Animated versions of this architecture, the WRITE sequence, and the
@@ -134,7 +135,7 @@ creates the existing NIXL agent.
 | `b10/endpoints.py` | endpoint pool collaborator (`EndpointPool`): peer descriptor registry, slot leasing, generation retirement, stale-endpoint refresh, abort arming |
 | `b10/timings.py` | transfer-owned timing state and timing-log formatting (`TransferTracer` / `TransferTrace`) |
 | `b10/config.py` | `B10AgentConfig`: env-var parsing and agent defaults |
-| `b10/protocol.py` | agent descriptors, control/reply packing, transfer-ID allocation, tag derivation, tag registry |
+| `b10/protocol.py` | agent descriptors, the 32-byte AM header codec, control/reply packing, transfer-ID allocation |
 | `b10/memory.py` | array-backed container vocabulary: descriptor/span views and the scatter-plan/chunk/buffer-view types |
 | `b10/planning.py` | descriptor normalization and ingestion, chunk coalescing, span building, overlap/stat checks, copy planning |
 | `b10/pools.py` | pinned staging pool, CUDA scratch pool, copy-stream pool, quarantine bookkeeping |
@@ -150,7 +151,7 @@ Suggested order for a first end-to-end read; each step assumes only the
 ones before it:
 
 1. **`protocol.py`** — the wire vocabulary: agent descriptors and feature
-   flags, transfer-id allocation, tag derivation, and the tag registry.
+   flags, the AM header codec, and transfer-id allocation.
    Everything else speaks in these terms.
 2. **`memory.py`** — the container vocabulary and the array-native
    contract (see [Array-native hot path](#array-native-hot-path)).
@@ -266,7 +267,7 @@ Each B10 agent advertises a msgpack descriptor (`B10AgentDescriptor` in
 
 ```text
 { protocol: "b10-ucxx", version: 1, name, host, port,
-  tag_domain: <random 64-bit agent tag domain>,
+  worker_address: <UCX worker address blob for the AM plane>,
   features: [additive capability flags, e.g. "packed_descs"] }
 ```
 
@@ -301,20 +302,20 @@ sequenceDiagram
     PEc->>SW: respond_and_send_async: resume KV,<br/>record source-ready event, enqueue write metas
     Note over SW: task -> TRANSFERRING
     SW->>SL: submit_transfer_requests(WRITE)<br/>(blocks on B10TransferStatus.wait)
-    Note over SL: build plan: normalize, reorder by src ptr,<br/>coalesce into <=buffer-size chunks,<br/>allocate transfer_id, reserve tags
+    Note over SL: build plan: normalize, reorder by src ptr,<br/>coalesce into <=buffer-size chunks,<br/>allocate transfer_id, register reply futures
     SL->>SL: acquire endpoint slot lock, lease endpoint
-    SL->>RL: UCXX control (bootstrap tag):<br/>transfer_id, dst descs, chunk plan, tag domain
-    Note over RL: validate, check cancelled-request tombstone<br/>(see "Timeout and failure handling"),<br/>reserve same tags, optionally reserve<br/>request-level scratch
-    RL-->>SL: UCXX READY (per-transfer tag)
+    SL->>RL: UCXX AM control:<br/>transfer_id, dst descs, chunk plan,<br/>sender worker address
+    Note over RL: validate, check cancelled-request tombstone<br/>(see "Timeout and failure handling"),<br/>register per-chunk data sink, optionally<br/>reserve request-level scratch
+    RL-->>SL: UCXX AM READY (reply future)
     par per chunk, bounded by max_in_flight_ops
         SL->>SL: acquire staging, batched D2H copy on copy stream<br/>(waits source-ready event once per device),<br/>record + await copy event
-        SL->>RL: UCXX DATA[i] (per-chunk tag)
+        SL->>RL: UCXX AM DATA[i] (header carries chunk_index)
         RL->>RL: recv into pinned staging,<br/>copy/scatter toward KV (see strategies)
     end
     Note over RL: wait ALL copy events —<br/>RESULT must imply KV landed
-    RL-->>SL: UCXX RESULT {ok} (per-transfer tag)
+    RL-->>SL: UCXX AM RESULT {ok} (reply future)
     RL->>RXn: local incoming-write listener:<br/>task -> TRANSFERRED (same process,<br/>no network dependency)
-    Note over SL: release transfer_id + tags
+    Note over SL: release transfer_id
     SL->>SW: status future resolves
     SW--)RXn: ZMQ KV_AGENT_RESULT (redundant for B10 —<br/>dropped by task.is_done, kept for<br/>old receivers and passive agents)
     PEg->>RXn: check_gen_transfer_status:<br/>consensus, apply aux, request COMPLETE
@@ -323,12 +324,17 @@ sequenceDiagram
 
 The four B10 messages, in order:
 
-| Message | Direction | Tag | Carries | Meaning |
+All four messages are UCX active messages carrying a fixed 32-byte in-band
+header (`kind`, `transfer_id`, `chunk_index`, `endpoint_generation`,
+`payload_len` — `_pack_am_header` in `protocol.py`); the worker-scoped
+`B10AmDispatcher` routes each message by that header on the agent loop.
+
+| Message | Direction | Routed to | Carries | Meaning |
 |---|---|---|---|---|
-| control | sender → receiver | fixed bootstrap tag | `transfer_id`, packed destination descriptors, chunk plan, sender tag domain, endpoint generation, request sync metadata | "here is what I am about to write and exactly where it goes" — the receiver validates, reserves the matching tags, and optionally reserves request-level scratch |
-| READY | receiver → sender | per-transfer | `transfer_id`, ok | "destination is set up and tags are reserved — start sending"; delaying it is how the receiver applies backpressure |
-| DATA ×N | sender → receiver | per-chunk | payload bytes, one message per coalesced chunk | the actual KV bytes, staged and shipped chunk by chunk |
-| RESULT | receiver → sender | per-transfer | `transfer_id`, ok/error | "every destination copy event completed — the KV physically landed" (invariant 3); on ok the sender releases the transfer ID and tags |
+| control | sender → receiver | recv pipeline's control handler | `transfer_id`, packed destination descriptors, chunk plan, endpoint generation, sender worker address, request sync metadata | "here is what I am about to write and exactly where it goes" — the receiver validates, registers the per-chunk data sink, and optionally reserves request-level scratch |
+| READY | receiver → sender | pre-registered reply future | `transfer_id`, ok | "destination is set up — start sending"; delaying it is how the receiver applies backpressure |
+| DATA ×N | sender → receiver | per-(transfer, generation) chunk sink, by header `chunk_index` | 32-byte header + payload bytes in one pinned buffer, one message per coalesced chunk | the actual KV bytes, staged and shipped chunk by chunk |
+| RESULT | receiver → sender | pre-registered reply future | `transfer_id`, ok/error | "every destination copy event completed — the KV physically landed" (invariant 3); on ok the sender releases the transfer ID |
 
 Key invariants encoded in that flow (referenced by number elsewhere in this
 doc):
@@ -342,7 +348,7 @@ doc):
    without request sync metadata or a source-ready event fails before DATA.
 3. The receiver sends RESULT only after every destination copy event has
    completed, so a sender observing success implies the KV physically landed.
-4. Success releases the transfer ID and tags; failure, timeout, cancellation,
+4. Success releases the transfer ID; failure, timeout, cancellation,
    or uncertain endpoint state quarantines them and retires the endpoint slot.
 5. Receive-side completion is local: the agent's terminal incoming-write
    signal (fired at the same point the RESULT is sent, i.e. after all
@@ -439,52 +445,45 @@ Two rules prevent misreading them:
 | `ucxx_send_ms`, `ucxx_recv_ms` | cumulative | UCXX await time across concurrent chunks |
 | `request_scatter_chunks/fragments/kernels` | count | request-level scatter shape |
 
-## Tag discipline
+## AM message identity and staleness
 
-READY, RESULT, and DATA tags are derived from:
+Every B10 active message is self-identifying: a fixed 32-byte in-band header
+carries `(kind, transfer_id, chunk_index, endpoint_generation, payload_len)`
+(`_pack_am_header`/`_unpack_am_header` in `protocol.py`). There is no tag
+matching and no per-transfer wire-identity reservation; identity is scoped by
+the endpoint plus this header, and the worker-scoped `B10AmDispatcher` routes
+each delivery by it:
 
-```text
-pair_tag_domain = hash(local_agent_domain, remote_agent_domain, slot_index)
-tag             = hash(pair_tag_domain, endpoint_generation,
-                       transfer_id, chunk_index, kind)
-```
+- **control** goes to the recv pipeline's handler, which spawns one
+  incoming-write task per transfer.
+- **DATA** goes to the sink the receiver registered for
+  `(transfer_id, endpoint_generation)` before it sent READY; the header's
+  `chunk_index` places the payload regardless of arrival order.
+- **READY/RESULT** resolve reply futures the sender registered — keyed by
+  `(transfer_id, endpoint_generation, kind)` — before control left, so a
+  reply can never race its waiter.
 
-(Derivation: `_pair_tag_domain` and `_message_tag` in `protocol.py`; final
-tags are reserved in `B10TagRegistry`, transfer IDs come from
-`B10TransferIdAllocator`.) `pair_tag_domain` is B10's per-agent-pair/slot
-namespace, not a UCX primitive; `chunk_index` is the coalesced DATA chunk
-index; `slot_index` and `endpoint_generation` identify one per-peer endpoint
-slot and its replacement count (both defined under "Endpoint lifecycle").
+A message with no registered target is stale by definition (its transfer
+completed, failed, timed out, or was cancelled) and the dispatcher drops it
+with a log. Three mechanisms make stale matching impossible rather than
+improbable:
 
-```mermaid
-stateDiagram-v2
-    [*] --> Reserved: transfer setup —<br/>sender and receiver both reserve<br/>READY/RESULT/DATA tags before DATA
-    Reserved --> Released: success (RESULT ok)
-    Reserved --> Quarantined: failure / timeout / cancel /<br/>uncertain endpoint state
-    Quarantined --> Released: TTL expiry<br/>(TRTLLM_B10_UCXX_TAG_QUARANTINE_TTL_S)
-    note right of Quarantined
-        endpoint slot retired alongside;
-        next transfer gets a fresh
-        endpoint generation, so stale ops
-        cannot match unless every hash
-        input collides
-    end note
-```
+- one endpoint slot carries at most one transfer at a time (slot lock);
+- a retired endpoint's message stream dies with it, and the slot's next
+  endpoint gets a fresh `endpoint_generation`, so nothing a wedged peer sends
+  can match a successor;
+- transfer IDs come from `B10TransferIdAllocator` and are quarantined for a
+  TTL (`TRTLLM_B10_UCXX_TAG_QUARANTINE_TTL_S`) on failure/timeout/cancel
+  instead of returning to the ring, so the ID itself cannot recirculate while
+  a slow peer might still emit messages carrying it.
 
-B10 never intentionally reuses a final UCX tag while it is active or
-quarantined. If reservation collides, the transfer fails before DATA or the
-sender retires the endpoint and retries control once. Registry work is per
-transfer setup/teardown, not per DATA operation.
+READY/RESULT payloads additionally include `transfer_id`, and the sender
+rejects mismatches.
 
-The bootstrap control receive uses a fixed tag because the receiver does not
-know the transfer ID before reading control. It carries no KV bytes and is
-scoped by UCXX endpoint tagging. READY/RESULT payloads include `transfer_id`,
-and the sender rejects mismatches.
-
-Future hardening: remove TTL expiry for transfer IDs, final tags, and
-uncertain staging buffers. That leaks resources for process lifetime but
-avoids assuming late UCX operations eventually become harmless; a separate
-transceiver process could later be restarted independently to reclaim them.
+Future hardening: remove TTL expiry for transfer IDs and uncertain staging
+buffers. That leaks resources for process lifetime but avoids assuming late
+UCX operations eventually become harmless; a separate transceiver process
+could later be restarted independently to reclaim them.
 
 ## Fault tolerance model
 
@@ -498,7 +497,7 @@ destination copy, the blast radius of a corrupt or late-arriving transfer is
 a staging buffer — cheap DRAM that can be quarantined and replaced — never
 the live KV cache. Concretely, four resources carry the doctrine:
 
-- transfer IDs and tags are quarantined with a TTL ("Tag discipline");
+- transfer IDs are quarantined with a TTL ("AM message identity and staleness");
 - staging buffers touched by uncertain operations are quarantined, and
   expired quarantine drops rather than recycles them ("Buffer ownership");
 - endpoint generations retire on timeout or peer death, so stale operations
@@ -536,12 +535,12 @@ B10 does. The reliability differences are contracts, not topology:
   built on it, rather than arriving as a transport optimization with
   containment attached to one buffer pool.
 - **Identity lifecycle: impossible vs improbable.** The worst failure mode
-  is silent KV corruption — a late or replayed message tag-matching into
+  is silent KV corruption — a late or replayed message matching into
   another transfer's staging and getting scattered into a live request. v1
   derives tags from identifiers that can recur and has no reuse protection.
-  B10 hashes tags over (pair domain, endpoint generation, transfer ID,
-  chunk, kind), registers every tag before receives post (collision → hard
-  failure), quarantines the tags and IDs of failed transfers, and never
+  B10 scopes every message to its endpoint and stamps it with an in-band
+  (transfer ID, endpoint generation, chunk) header, drops any delivery with
+  no registered target, quarantines the IDs of failed transfers, and never
   reuses endpoint generations — a stale message has nothing legal to match
   and dies by timeout.
 - **Verified completion.** B10's RESULT reply is sent only after CUDA copy
@@ -561,7 +560,7 @@ B10 does. The reliability differences are contracts, not topology:
 
 ## Timeout and failure handling
 
-| Outcome | Transfer ID / tags | Endpoint |
+| Outcome | Transfer ID | Endpoint |
 |---|---|---|
 | success | released | kept (persistent) |
 | reported failure | quarantined | slot dropped |
@@ -655,8 +654,8 @@ Sender endpoint state is keyed by (peer agent, slot) — `_EndpointSlot` in
 The default pool size
 is one because the default native sender concurrency is one transfer at a time
 per worker; larger pools matter only when sender workers submit overlapping
-transfers to the same peer. Slots have disjoint tag domains by construction
-(`slot_index` is a `pair_tag_domain` input), so growing the pool is
+transfers to the same peer. Slots are independent by construction (each has
+its own endpoint and generation sequence), so growing the pool is
 protocol-safe.
 
 When a peer re-registers under the same logical name with a changed
@@ -863,8 +862,9 @@ object-shaped keeps the fallback code identical to its pre-array form.
 
 Covered contracts (exercised in
 `tests/unittest/disaggregated/test_b10_cache_transceiver.py`) include
-runtime selection, public config, tag derivation,
-tag registry, transfer-ID quarantine, endpoint generation, endpoint retry and
+runtime selection, public config, the AM header codec and dispatcher
+routing (`test_b10_am_plane.py`), transfer-ID quarantine, endpoint
+generation, endpoint retry and
 retirement, timeout/cancellation cleanup, descriptor coalescing, staging and
 scratch pool behavior, receive-side copy-event waits, setup failure, and
 missing-UCXX errors.

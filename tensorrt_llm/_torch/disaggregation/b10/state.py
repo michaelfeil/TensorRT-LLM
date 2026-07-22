@@ -18,7 +18,7 @@ import asyncio
 import threading
 from concurrent.futures import CancelledError, Future, TimeoutError
 from dataclasses import dataclass
-from typing import Any, Callable, Hashable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -51,7 +51,6 @@ class _SendEndpointLease:
     slot: _EndpointSlot
     endpoint: Any
     endpoint_generation: int
-    tag_domain: int
 
 
 @dataclass(frozen=True)
@@ -181,8 +180,6 @@ class B10TransferStatus(TransferStatus):
         abort_handle: _TransferAbortHandle,
         default_timeout_ms: Optional[int],
         cleanup_event: Optional[threading.Event] = None,
-        tag_registry: Optional[b10_protocol.B10TagRegistry] = None,
-        tag_owner: Optional[Hashable] = None,
     ):
         self._future = future
         self._transfer_id = transfer_id
@@ -190,8 +187,6 @@ class B10TransferStatus(TransferStatus):
         self._abort_handle = abort_handle
         self._default_timeout_ms = default_timeout_ms
         self._cleanup_event = cleanup_event
-        self._tag_registry = tag_registry
-        self._tag_owner = tag_owner
         self._timed_out = False
         self._cancelled = False
         self._lock = threading.Lock()
@@ -270,13 +265,9 @@ class B10TransferStatus(TransferStatus):
             self._quarantine_resources()
 
     def _release_resources(self) -> None:
-        if self._tag_registry is not None and self._tag_owner is not None:
-            self._tag_registry.release(self._tag_owner)
         self._allocator.release(self._transfer_id)
 
     def _quarantine_resources(self) -> None:
-        if self._tag_registry is not None and self._tag_owner is not None:
-            self._tag_registry.quarantine(self._tag_owner)
         self._allocator.quarantine(self._transfer_id)
 
 

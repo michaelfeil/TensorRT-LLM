@@ -16,7 +16,7 @@
 
 Peer descriptors and slots live together so a descriptor change can retire
 the peer's endpoints atomically. One slot serializes a complete WRITE and each
-new endpoint advances its generation, isolating stale message tags.
+new endpoint advances its generation, isolating stale messages.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
 from tensorrt_llm._torch.disaggregation.b10.protocol import (
     B10AgentDescriptor,
     _next_endpoint_generation,
-    _pair_tag_domain,
 )
 from tensorrt_llm._torch.disaggregation.b10.state import (
     _EndpointSlot,
@@ -49,12 +48,10 @@ class EndpointPool:
         core: _AgentCore,
         *,
         ucxx: Any,
-        tag_domain: int,
         endpoint_pool_size: int,
     ):
         self._core = core
         self._ucxx = ucxx
-        self._tag_domain = tag_domain
         self._endpoint_pool_size = endpoint_pool_size
         self._remote_agents: dict[str, B10AgentDescriptor] = {}
         self._remote_slots: dict[str, list[_EndpointSlot]] = {}
@@ -74,7 +71,6 @@ class EndpointPool:
             slot=slot,
             endpoint=endpoint,
             endpoint_generation=slot.generation,
-            tag_domain=_pair_tag_domain(self._tag_domain, plan.remote.tag_domain, slot_index),
         )
         self._bind_send_abort_handle(abort_handle, lease)
         return lease

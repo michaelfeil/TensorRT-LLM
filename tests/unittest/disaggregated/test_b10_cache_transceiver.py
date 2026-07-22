@@ -45,12 +45,7 @@ import tensorrt_llm._torch.disaggregation.b10.transceiver as b10_transceiver
 import tensorrt_llm._torch.disaggregation.base.agent as base_agent
 import tensorrt_llm._torch.disaggregation.native.transfer as native_transfer
 from tensorrt_llm._torch.disaggregation.b10.agent import B10CacheTransferAgent
-from tensorrt_llm._torch.disaggregation.b10.protocol import (
-    B10TransferIdAllocator,
-    _data_tag,
-    _ready_tag,
-    _result_tag,
-)
+from tensorrt_llm._torch.disaggregation.b10.protocol import B10TransferIdAllocator
 from tensorrt_llm._torch.disaggregation.b10.state import B10TransferStatus, _TransferAbortHandle
 from tensorrt_llm._torch.disaggregation.b10.transceiver import B10CacheTransceiver
 from tensorrt_llm._torch.disaggregation.base.transfer import (
@@ -91,9 +86,6 @@ def _make_uninitialized_b10_agent(
     core.loop = loop or Mock()
     core.transfer_timeout_s = None
     core.max_in_flight_ops = 64
-    core.tag_registry = b10_protocol.B10TagRegistry(
-        quarantine_ttl_s=b10_protocol._DEFAULT_TAG_QUARANTINE_TTL_S
-    )
     core.sync_cuda_before_transfer = False
     core.staging_buffer_pool = FakePool()
     core.staging_buffer_slots = asyncio.BoundedSemaphore(4)
@@ -105,7 +97,6 @@ def _make_uninitialized_b10_agent(
     agent._endpoints = b10_agent.EndpointPool(
         core,
         ucxx=None,
-        tag_domain=1,
         endpoint_pool_size=1,
     )
     agent._tracer = b10_agent.TransferTracer(
@@ -131,7 +122,6 @@ def _make_uninitialized_b10_agent(
         send_admission_limit=0,
         send_admission_bypass_bytes=0,
     )
-    agent._tag_domain = 1
     # Deterministic regardless of local CUDA availability: tests that
     # exercise the scratch paths set the device explicitly.
     agent._recv._recv_scratch_device = None
@@ -881,65 +871,8 @@ def test_b10_transfer_id_allocator_rejects_unencodable_tag_space():
         B10TransferIdAllocator(tag_space_size=b10_protocol._MAX_TRANSFER_ID + 2)
 
 
-def test_b10_message_tags_are_scoped_by_transfer_chunk_generation_and_domain():
-    tags = {
-        _data_tag(transfer_id=1, chunk_index=0, endpoint_generation=1),
-        _data_tag(transfer_id=1, chunk_index=1, endpoint_generation=1),
-        _data_tag(transfer_id=2, chunk_index=0, endpoint_generation=1),
-        _data_tag(transfer_id=1, chunk_index=0, endpoint_generation=2),
-        _ready_tag(transfer_id=1, endpoint_generation=1),
-        _result_tag(transfer_id=1, endpoint_generation=1),
-        _ready_tag(transfer_id=2, endpoint_generation=1),
-        _ready_tag(transfer_id=1, endpoint_generation=2),
-        _ready_tag(transfer_id=1, endpoint_generation=1, tag_domain=1),
-        _ready_tag(transfer_id=1, endpoint_generation=1, tag_domain=2),
-        _result_tag(transfer_id=1, endpoint_generation=1, tag_domain=1),
-        _data_tag(transfer_id=1, chunk_index=0, endpoint_generation=1, tag_domain=1),
-    }
-
-    assert len(tags) == 12
-
-
-def test_b10_tag_registry_rejects_active_and_quarantined_tags():
-    registry = b10_protocol.B10TagRegistry(quarantine_ttl_s=60.0)
-
-    registry.reserve("first", [11, 12])
-    with pytest.raises(b10_protocol.B10TagCollisionError, match="collides"):
-        registry.reserve("second", [12])
-
-    registry.release("first")
-    registry.reserve("second", [12])
-    registry.quarantine("second")
-    with pytest.raises(b10_protocol.B10TagCollisionError, match="collides"):
-        registry.reserve("third", [12])
-
-
-def test_b10_tag_registry_rejects_duplicate_tags_in_one_reservation():
-    registry = b10_protocol.B10TagRegistry(quarantine_ttl_s=60.0)
-
-    with pytest.raises(b10_protocol.B10TagCollisionError, match="duplicate"):
-        registry.reserve("first", [11, 11])
-
-
-def test_b10_tag_registry_skips_future_quarantine_expiry_scan():
-    class ExplodingItemsDict(dict):
-        def items(self):
-            raise AssertionError("future quarantine should not be scanned")
-
-    registry = b10_protocol.B10TagRegistry(quarantine_ttl_s=60.0)
-    registry.reserve("first", [11])
-    registry.quarantine("first")
-    registry._quarantined_until = ExplodingItemsDict(registry._quarantined_until)
-    registry._next_quarantine_expiry_s = time.monotonic() + 60.0
-
-    registry.reserve("second", [12])
-
-
-def test_b10_status_releases_reserved_tags_on_success():
+def test_b10_status_releases_transfer_id_on_success():
     allocator = B10TransferIdAllocator(start=0, tag_space_size=1, quarantine_ttl_s=60.0)
-    tag_registry = b10_protocol.B10TagRegistry(quarantine_ttl_s=60.0)
-    tag_owner = ("send", 0)
-    tag_registry.reserve(tag_owner, [99])
     transfer_id = allocator.allocate()
     future = Future()
     status = B10TransferStatus(
@@ -948,21 +881,17 @@ def test_b10_status_releases_reserved_tags_on_success():
         allocator,
         _TransferAbortHandle(),
         default_timeout_ms=1000,
-        tag_registry=tag_registry,
-        tag_owner=tag_owner,
     )
 
     future.set_result(True)
 
     assert status.wait()
-    tag_registry.reserve("next", [99])
+    # Ring size 1: the id is reallocatable only if success released it.
+    assert allocator.allocate() == transfer_id
 
 
-def test_b10_status_quarantines_reserved_tags_on_cancel():
+def test_b10_status_quarantines_transfer_id_on_cancel():
     allocator = B10TransferIdAllocator(start=0, tag_space_size=1, quarantine_ttl_s=60.0)
-    tag_registry = b10_protocol.B10TagRegistry(quarantine_ttl_s=60.0)
-    tag_owner = ("send", 0)
-    tag_registry.reserve(tag_owner, [99])
     transfer_id = allocator.allocate()
     status = B10TransferStatus(
         Future(),
@@ -970,14 +899,13 @@ def test_b10_status_quarantines_reserved_tags_on_cancel():
         allocator,
         _TransferAbortHandle(),
         default_timeout_ms=1000,
-        tag_registry=tag_registry,
-        tag_owner=tag_owner,
     )
 
     status.cancel()
 
-    with pytest.raises(b10_protocol.B10TagCollisionError, match="collides"):
-        tag_registry.reserve("next", [99])
+    # Ring size 1 with the sole id quarantined: allocation must fail.
+    with pytest.raises(RuntimeError, match="No B10 transfer tags available"):
+        allocator.allocate()
 
 
 def test_b10_status_wait_uses_default_timeout_and_quarantines_id():
@@ -1016,11 +944,8 @@ def test_b10_status_timeout_retires_endpoint_without_cancelling_future():
     assert retire_calls == [True]
 
 
-def test_b10_status_cancel_quarantines_tags_without_cancelling_future():
+def test_b10_status_cancel_quarantines_id_without_cancelling_future():
     allocator = B10TransferIdAllocator(start=0, tag_space_size=1, quarantine_ttl_s=60.0)
-    tag_registry = b10_protocol.B10TagRegistry(quarantine_ttl_s=60.0)
-    tag_owner = ("send", 0)
-    tag_registry.reserve(tag_owner, [99])
     future = Future()
     abort_handle = _TransferAbortHandle()
     retire_calls = []
@@ -1031,16 +956,14 @@ def test_b10_status_cancel_quarantines_tags_without_cancelling_future():
         allocator,
         abort_handle,
         default_timeout_ms=1000,
-        tag_registry=tag_registry,
-        tag_owner=tag_owner,
     )
 
     status.cancel()
 
     assert not future.cancelled()
     assert retire_calls == [True]
-    with pytest.raises(b10_protocol.B10TagCollisionError, match="collides"):
-        tag_registry.reserve("next", [99])
+    with pytest.raises(RuntimeError, match="No B10 transfer tags available"):
+        allocator.allocate()
 
 
 def test_b10_status_timeout_waits_for_cleanup_event():
@@ -1060,7 +983,7 @@ def test_b10_status_timeout_waits_for_cleanup_event():
     assert cleanup_event.is_set()
 
 
-def test_b10_submit_status_can_quarantine_reserved_tags_on_cancel(monkeypatch):
+def test_b10_submit_status_quarantines_transfer_id_on_cancel(monkeypatch):
     submitted_future = Future()
 
     def fake_run_coroutine_threadsafe(coro, loop):
@@ -1080,13 +1003,10 @@ def test_b10_submit_status_can_quarantine_reserved_tags_on_cancel(monkeypatch):
     )
 
     status = agent.submit_transfer_requests(request)
-    tag_owner = ("send", 7)
-    agent._core.tag_registry.reserve(tag_owner, [99])
 
     status.cancel()
 
-    with pytest.raises(b10_protocol.B10TagCollisionError, match="collides"):
-        agent._core.tag_registry.reserve("next", [99])
+    assert 7 in agent._core.transfer_ids._quarantined_until
 
 
 def test_b10_sender_waits_on_source_ready_event_without_current_stream():
@@ -1574,7 +1494,6 @@ def test_b10_agent_descriptor_features_roundtrip_and_old_peer_compat():
         name="ctx",
         host="10.0.0.1",
         port=13337,
-        tag_domain=7,
         features=(b10_protocol._FEATURE_PACKED_DESCS,),
     )
 
@@ -1583,7 +1502,8 @@ def test_b10_agent_descriptor_features_roundtrip_and_old_peer_compat():
     assert decoded == desc
     assert decoded.features == ("packed_descs",)
 
-    # A payload from an old peer has no "features" key and decodes to ().
+    # A payload from an old peer has no "features" key (and still carries
+    # the retired "tag_domain" key, which from_bytes must ignore).
     old_payload = msgpack.packb(
         {
             "protocol": "b10-ucxx",
@@ -1617,7 +1537,9 @@ def test_b10_agent_descriptor_features_roundtrip_and_old_peer_compat():
         "name": "ctx",
         "host": "10.0.0.1",
         "port": 13337,
-        "tag_domain": 7,
+        # New descriptors no longer carry tag_domain; an old parser falls
+        # back to its default.
+        "tag_domain": 0,
     }
 
 
@@ -1640,11 +1562,10 @@ def _make_send_control_fixture():
             name="peer",
             host="10.0.0.3",
             port=1,
-            tag_domain=0,
             features=(b10_protocol._FEATURE_PACKED_DESCS,),
         ),
     )
-    lease = types.SimpleNamespace(endpoint_generation=2, tag_domain=5)
+    lease = types.SimpleNamespace(endpoint_generation=2)
     # _make_send_control needs the pipeline's local worker address (carried
     # in-control for the receiver's reverse READY/RESULT endpoint).
     pipeline = types.SimpleNamespace(_get_local_worker_address=lambda: b"test-worker-address")
@@ -1713,7 +1634,7 @@ def test_b10_build_send_transfer_plan_rejects_peer_without_packed_descs():
         _endpoints=types.SimpleNamespace(
             _remote_agents={
                 "peer": b10_protocol.B10AgentDescriptor(
-                    name="peer", host="10.0.0.3", port=1, tag_domain=0, features=()
+                    name="peer", host="10.0.0.3", port=1, features=()
                 )
             }
         ),
@@ -2648,7 +2569,6 @@ def test_b10_submit_side_channel_produces_identical_send_plan():
             name="peer",
             host="10.0.0.3",
             port=1,
-            tag_domain=0,
             features=(b10_protocol._FEATURE_PACKED_DESCS,),
         )
     }
