@@ -33,9 +33,6 @@ from tensorrt_llm._utils import prefer_pinned
 _DEFAULT_STAGING_POOL_NUM_BUFFERS = 32
 _DEFAULT_STAGING_POOL_BUFFER_SIZE = 512 * 1024 * 1024
 _DEFAULT_RECV_SCRATCH_MIN_SPANS = 8
-# Below this span count the send-side per-span copy loop is cheap enough;
-# at or above it one gather kernel launch replaces the per-span dispatches.
-_DEFAULT_SEND_GATHER_MIN_SPANS = _DEFAULT_RECV_SCRATCH_MIN_SPANS
 _DEFAULT_RECV_SCRATCH_METADATA_BYTES_PER_SPAN = 1024 * 1024
 
 

@@ -20,14 +20,17 @@ from typing import Any, Optional
 
 import torch
 
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
+
 from tensorrt_llm._torch.disaggregation.b10 import memory as b10_memory
 from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
 from tensorrt_llm._torch.disaggregation.b10.kernels import (
     _copy_buffer,
     _cuda_copy_device,
-    _gather_vram_spans_to_pinned_staging,
     _scatter_cuda_buffer_to_vram_spans,
-    _scatter_kernels_available,
     _span_view,
 )
 from tensorrt_llm._torch.disaggregation.b10.memory import (
@@ -36,8 +39,44 @@ from tensorrt_llm._torch.disaggregation.b10.memory import (
     _TransferChunk,
 )
 from tensorrt_llm._torch.disaggregation.b10.planning import _contiguous_desc_spans
-from tensorrt_llm._torch.disaggregation.b10.pools import _DEFAULT_SEND_GATHER_MIN_SPANS, _device_key
+from tensorrt_llm._torch.disaggregation.b10.pools import _device_key
 from tensorrt_llm._torch.disaggregation.b10.state import _SourceReadyEvents
+
+
+def _copy_vram_spans_to_pinned_staging_batch(
+    descs: _DescArrayView,
+    spans: b10_memory._SpanArrays,
+    staging_buffer: torch.Tensor,
+    copy_stream: Any,
+) -> bool:
+    """Submit multiple disjoint D2H spans as one CUDA batch."""
+    active = spans.sizes > 0
+    count = int(active.sum())
+    batch_copy = getattr(cudart, "cudaMemcpyBatchAsync", None)
+    if count < 2 or batch_copy is None:
+        return False
+
+    src_ptrs = descs.ptrs[spans.starts[active]].tolist()
+    dst_ptrs = (staging_buffer.data_ptr() + spans.chunk_offsets[active]).tolist()
+    sizes = spans.sizes[active].tolist()
+    attr = cudart.cudaMemcpyAttributes()
+    attr.srcAccessOrder = cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
+    attr.flags = cudart.cudaMemcpyFlags.cudaMemcpyFlagPreferOverlapWithCompute
+    # Raw runtime calls use the calling thread's current CUDA device.
+    torch.cuda.set_device(copy_stream.device)
+    (error,) = batch_copy(
+        dst_ptrs,
+        src_ptrs,
+        sizes,
+        count,
+        [attr],
+        [0],
+        1,
+        copy_stream.cuda_stream,
+    )
+    if error != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"B10 cudaMemcpyBatchAsync failed for {count} D2H spans: {error!r}")
+    return True
 
 
 class _CopyEngine:
@@ -55,27 +94,6 @@ class _CopyEngine:
         if not bool((devices == devices[0]).all()):
             return None
         return torch.device("cuda", int(devices[0]))
-
-    def send_gather_device(
-        self,
-        descs: _DescArrayView,
-        memory_type: str,
-        staging_buffer: Any,
-        spans: b10_memory._SpanArrays,
-    ) -> Optional[torch.device]:
-        """Return the device for an eligible single-kernel send gather."""
-
-        if memory_type != "VRAM" or len(spans) < _DEFAULT_SEND_GATHER_MIN_SPANS:
-            return None
-        if (
-            not isinstance(staging_buffer, torch.Tensor)
-            or staging_buffer.device.type != "cpu"
-            or not staging_buffer.is_pinned()
-        ):
-            return None
-        if not _scatter_kernels_available():
-            return None
-        return self.single_cuda_device(descs, spans)
 
     def _copy_stream_for_device(
         self,
@@ -137,7 +155,6 @@ class _CopyEngine:
         lifetime_refs: Optional[list[_BufferView]] = None,
         spans: Optional[b10_memory._SpanArrays] = None,
         scratch_view: Optional[_BufferView] = None,
-        staging_view: Optional[_BufferView] = None,
         source_ready_events: Optional[_SourceReadyEvents] = None,
         source_ready_waited_keys: Optional[set[tuple[str, int]]] = None,
     ) -> tuple[int, list[torch.device]]:
@@ -161,27 +178,6 @@ class _CopyEngine:
                 )
             )
             return len(spans), copy_devices
-
-        if not copy_from_staging:
-            gather_device = self.send_gather_device(descs, memory_type, staging_buffer, spans)
-            if gather_device is not None:
-                copy_stream = self._copy_stream_for_device(
-                    gather_device,
-                    prepared_copy_streams,
-                    wait_current_stream=True,
-                    source_ready_events=source_ready_events,
-                    source_ready_waited_keys=source_ready_waited_keys,
-                )
-                if _gather_vram_spans_to_pinned_staging(
-                    descs, spans, staging_buffer, copy_stream, lifetime_refs
-                ):
-                    copy_devices.append(gather_device)
-                    if staging_view is not None:
-                        # Gather stores bypass torch's host allocator tracking.
-                        event = torch.cuda.Event()
-                        event.record(copy_stream)
-                        staging_view.ready_event = event
-                return len(spans), copy_devices
 
         staging_tensor = staging_buffer if isinstance(staging_buffer, torch.Tensor) else None
         if (
@@ -241,6 +237,21 @@ class _CopyEngine:
         copy_devices: list[torch.device] = []
         prepared_copy_streams: dict[tuple[str, int], Any] = {}
         non_blocking = staging_buffer.is_pinned()
+        if not copy_from_staging and non_blocking:
+            copy_device = self.single_cuda_device(descs, spans)
+            if copy_device is not None:
+                copy_stream = self._copy_stream_for_device(
+                    copy_device,
+                    prepared_copy_streams,
+                    wait_current_stream=True,
+                    source_ready_events=source_ready_events,
+                    source_ready_waited_keys=source_ready_waited_keys,
+                )
+                if _copy_vram_spans_to_pinned_staging_batch(
+                    descs, spans, staging_buffer, copy_stream
+                ):
+                    return len(spans), [copy_device]
+
         active_stream = None
         stream_context = None
         try:

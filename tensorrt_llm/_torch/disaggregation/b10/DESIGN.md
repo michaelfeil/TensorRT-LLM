@@ -128,7 +128,7 @@ creates the existing NIXL agent.
 | `b10/transceiver.py` | V2 adapter: staging-pool derivation, source-KV readiness (`resume_request` + source-ready event), B10-specific timeout recovery |
 | `b10/agent.py` | composition shell: UCXX listener and event-loop thread, collaborator construction, scatter-kernel warmup, shutdown |
 | `b10/core.py` | `_AgentCore`: shared live state and ownership of tag reservation, staging permits, and staging quarantine |
-| `b10/copy_engine.py` | local descriptor ↔ staging copies shared by send and receive, including copy-stream and gather selection |
+| `b10/copy_engine.py` | local descriptor ↔ staging copies shared by send and receive, including copy-stream selection |
 | `b10/send.py` | send pipeline collaborator (`SendPipeline`): submit surface, send plan and control message build, source validation, DATA sends, admission gating |
 | `b10/recv.py` | recv pipeline collaborator (`RecvPipeline`): incoming-write lifecycle, packed control decode, recv scratch/request-level scatter routing, request cancellation |
 | `b10/endpoints.py` | endpoint pool collaborator (`EndpointPool`): peer descriptor registry, slot leasing, generation retirement, stale-endpoint refresh, abort arming |
@@ -138,7 +138,7 @@ creates the existing NIXL agent.
 | `b10/memory.py` | array-backed container vocabulary: descriptor/span views and the scatter-plan/chunk/buffer-view types |
 | `b10/planning.py` | descriptor normalization and ingestion, chunk coalescing, span building, overlap/stat checks, copy planning |
 | `b10/pools.py` | pinned staging pool, CUDA scratch pool, copy-stream pool, quarantine bookkeeping |
-| `b10/kernels.py` | Triton scatter/gather kernels, kernel-metadata assembly and upload, local copy helpers, kernel warmups |
+| `b10/kernels.py` | Triton receive scatter kernels, kernel-metadata assembly and upload, local copy helpers, kernel warmups |
 | `b10/state.py` | transfer status, endpoint leases, abort handles, checkout tracking |
 | `b10/async_utils.py`, `b10/net.py` | timeout wrappers, endpoint abort helpers, retry classification, UCXX import and progress-mode default, listener address handling |
 | `disaggregation/transceiver.py`, `native/transfer.py` | generic V2 hooks: agent factory, request sync metadata, cancellation, status drain |
@@ -307,7 +307,7 @@ sequenceDiagram
     Note over RL: validate, check cancelled-request tombstone<br/>(see "Timeout and failure handling"),<br/>reserve same tags, optionally reserve<br/>request-level scratch
     RL-->>SL: UCXX READY (per-transfer tag)
     par per chunk, bounded by max_in_flight_ops
-        SL->>SL: acquire staging, D2H copy on copy stream<br/>(waits source-ready event once per device),<br/>record + await copy event
+        SL->>SL: acquire staging, batched D2H copy on copy stream<br/>(waits source-ready event once per device),<br/>record + await copy event
         SL->>RL: UCXX DATA[i] (per-chunk tag)
         RL->>RL: recv into pinned staging,<br/>copy/scatter toward KV (see strategies)
     end
@@ -728,11 +728,9 @@ Three consequences drive everything B10 does for performance:
   wire messages cost more in launch and event-loop overhead than in bytes
   moved. B10 therefore coalesces source-contiguous runs into a few large
   (512 MiB) DATA chunks for staging and the wire.
-- **The reshaping must be undone at memory bandwidth.** Coalescing on one
-  side means the other side's fragmentation has to be resolved locally;
-  doing that with per-fragment copies squanders HBM. B10 uses custom
-  scatter kernels on receive (and a gather kernel on send) that move
-  thousands of fragments in one launch at near-HBM rates.
+- **The reshaping must be undone locally.** Coalescing on one side means the
+  other side's fragmentation has to be resolved locally. B10 uses custom
+  scatter kernels on receive and batched asynchronous D2H copies on send.
 - **At these span counts, the bookkeeping is itself a cost.** Planning over
   thousands of spans in Python objects can cost more than the copies it
   plans. Descriptor and span metadata stay in parallel int64 arrays end to
@@ -754,8 +752,11 @@ The optimizations that got here:
   kept as parallel int64 arrays from ingestion to kernel launch on both
   tiers (see "Array-native hot path");
 - Triton scatter kernels for fragmented VRAM receives (per-chunk and
-  request-level) and a UVA gather kernel for send staging, replacing
-  per-span copy loops; all kernel specializations compiled at startup;
+  request-level), with all kernel specializations compiled at startup;
+- one `cudaMemcpyBatchAsync` submission per multi-span send chunk, on a
+  dedicated copy stream ordered after the source-ready event and carrying
+  CUDA's prefer-overlap-with-compute hint (single-span and older-runtime
+  paths use the ordinary asynchronous copy);
 - local receive completion — no network round-trip on the completion path;
 - a send admission gate, so concurrent large sends do not time-slice the
   copy stream, NIC, and staging pool;
@@ -765,6 +766,12 @@ The optimizations that got here:
 Evaluated and parked (measured value below cost — do not revisit without new
 evidence):
 
+- **Direct-UVA send gather**: a Triton gather reduced Python dispatch
+  overhead, but its SM work overlapped the following model forward. Large
+  multimodal transfers could delay one TP rank while its peers entered a
+  model collective, hanging the worker. Send staging must use CUDA's memcpy
+  path instead of launching B10 SM work unless it is explicitly serialized
+  against model execution.
 - **VRAM/device staging**: host DRAM makes quarantine-and-replace free,
   every VRAM byte competes with KV capacity, and the measured throughput
   gap was queueing discipline, not the host bounce.
@@ -812,13 +819,12 @@ hot path:
   building, overlap checks, control packing, and copy planning.
 - `_SpanArrays` — a chunk's contiguous spans (`starts`, `sizes`,
   `chunk_offsets`), the sole output of `_contiguous_desc_spans`. Consumed
-  directly by the scatter/gather kernel metadata assembly and the routing
-  gates (`_CopyEngine.single_cuda_device`, `_use_aligned_scatter_kernel`,
-  `metadata_fits`).
+  directly by the copy engine, scatter-kernel metadata assembly, and receive
+  routing gates (`_CopyEngine.single_cuda_device`,
+  `_use_aligned_scatter_kernel`, `metadata_fits`).
 - `_DestinationScatterPlan` — destination-ordered copy fragments
   (`src_ptrs`, `dst_ptrs`, `sizes`, `device_ids`), feeding the
-  absolute-pointer kernels for the request-level recv scatter and the
-  send gather.
+  absolute-pointer kernels for the request-level receive scatter.
 
 Neither view type supports slicing or `__iter__` (zero-caller surface,
 deleted); cold-path loops use the sequence protocol over `__getitem__`.

@@ -2314,221 +2314,119 @@ def test_b10_scatter_span_metadata_pool_rejects_short_or_missing_tensors(monkeyp
     assert launches == []
 
 
-def test_b10_send_gather_plan_matches_span_loop_copy_plan():
-    import random
-
-    rng = random.Random(20260712)
-    for trial in range(100):
-        desc_count = rng.choice([1, 2, 3, 8, 33, 128])
-        descs = []
-        ptr = rng.randrange(1 << 40)
-        for _ in range(desc_count):
-            size = rng.choice([0, 0, 1, 8, 64, 4096, 16 * 1024 + 8])
-            if rng.random() < 0.6:
-                base = ptr  # extend the current contiguous run
-            else:
-                base = ptr + rng.randrange(1, 1 << 20)
-            descs.append(
-                b10_memory._NormalizedMemoryDesc(
-                    ptr=base, size=size, device_id=rng.choice([0, 0, 0, 1])
-                )
-            )
-            ptr = base + size
-        chunk = b10_memory._TransferChunk(
-            start=0, count=desc_count, size=sum(d.size for d in descs)
-        )
-        staging_base = rng.randrange(1 << 40)
-
-        view = _desc_array_view_from(descs)
-        spans = b10_planning._contiguous_desc_spans(view, chunk)
-        plan = b10_planning._gather_plan_for_vram_spans(view, spans, staging_base)
-        # Frozen reference: the per-span copy loop moved
-        # descs[span.start].ptr -> staging + span.chunk_offset for
-        # span.size bytes; zero-size spans moved nothing.
-        expected = [
-            (
-                descs[span.start].ptr,
-                staging_base + span.chunk_offset,
-                span.size,
-                descs[span.start].device_id,
-            )
-            for span in spans
-            if span.size > 0
-        ]
-        assert (
-            list(
-                zip(
-                    plan.src_ptrs.tolist(),
-                    plan.dst_ptrs.tolist(),
-                    plan.sizes.tolist(),
-                    plan.device_ids.tolist(),
-                )
-            )
-            == expected
-        )
-        assert plan.total_bytes == chunk.size
-
-
 class _FakePinnedStagingTensor(_FakeScatterCudaTensor):
-    """Fake pinned host staging tensor for the send-gather tests."""
+    """Fake pinned host staging tensor for copy-engine tests."""
 
-    def __init__(self, base_ptr=1 << 30, pinned=True, cuda=False):
+    def __init__(self):
         super().__init__()
-        self.is_cuda = cuda
-        self.device = types.SimpleNamespace(type="cuda" if cuda else "cpu")
-        self._pinned = pinned
-        self._base_ptr = base_ptr
+        self.is_cuda = False
+        self.device = types.SimpleNamespace(type="cpu")
 
     def is_pinned(self):
-        return self._pinned
-
-    def data_ptr(self):
-        return self._base_ptr
+        return True
 
 
-def _gather_span_case(span_sizes, base_ptr=1 << 20, device_ids=None):
+def _fragmented_span_case(span_sizes):
     descs = []
     spans = []
     chunk_offset = 0
-    ptr = base_ptr
+    ptr = 1 << 20
     for idx, size in enumerate(span_sizes):
-        descs.append(
-            b10_memory._NormalizedMemoryDesc(
-                ptr=ptr, size=size, device_id=device_ids[idx] if device_ids else 0
-            )
-        )
+        descs.append(b10_memory._NormalizedMemoryDesc(ptr=ptr, size=size, device_id=0))
         spans.append(b10_memory._ContiguousSpan(start=idx, size=size, chunk_offset=chunk_offset))
         chunk_offset += size
         ptr += size + 4096  # keep spans non-contiguous in source
     return _desc_array_view_from(descs), _span_arrays_from(spans)
 
 
-def test_b10_send_gather_launches_single_absolute_kernel(monkeypatch):
-    launches = []
-    pinned_arrays = []
-    fakes = _install_scatter_kernel_fakes(monkeypatch, launches, pinned_arrays=pinned_arrays)
+def test_b10_batched_d2h_uses_stream_order_and_overlap_hint(monkeypatch):
+    class FakeMemcpyAttributes:
+        pass
+
+    success = object()
+    calls = []
+
+    def fake_batch_copy(*args):
+        calls.append(args)
+        return (success,)
+
+    fake_cudart = types.SimpleNamespace(
+        cudaMemcpyBatchAsync=fake_batch_copy,
+        cudaMemcpyAttributes=FakeMemcpyAttributes,
+        cudaMemcpySrcAccessOrder=types.SimpleNamespace(cudaMemcpySrcAccessOrderStream=1),
+        cudaMemcpyFlags=types.SimpleNamespace(cudaMemcpyFlagPreferOverlapWithCompute=1),
+        cudaError_t=types.SimpleNamespace(cudaSuccess=success),
+    )
+    monkeypatch.setattr(b10_copy_engine, "cudart", fake_cudart)
+
+    descs, spans = _fragmented_span_case([16, 0, 24])
+    staging_base = 1 << 30
+    staging = types.SimpleNamespace(data_ptr=lambda: staging_base)
+    copy_device = torch.device("cuda", 3)
+    copy_stream = types.SimpleNamespace(cuda_stream=123, device=copy_device)
     set_devices = []
     monkeypatch.setattr(torch.cuda, "set_device", set_devices.append)
-    copy_stream = object()
-    word = b10_kernels._SCATTER_ALIGNED_WORD_BYTES
-    block = b10_kernels._REQUEST_SCATTER_ALIGNED_KERNEL_BLOCK_BYTES
 
-    # Aligned spans (middle one zero-size, dropped from the plan) take the
-    # absolute u64 kernel in one launch that stores straight into staging.
-    descs, spans = _gather_span_case([block + word, 0, word])
-    staging = _FakePinnedStagingTensor()
-    lifetime_refs = []
-    launched = b10_kernels._gather_vram_spans_to_pinned_staging(
-        descs, spans, staging, copy_stream, lifetime_refs=lifetime_refs
+    assert b10_copy_engine._copy_vram_spans_to_pinned_staging_batch(
+        descs, spans, staging, copy_stream
     )
+    dst_ptrs, src_ptrs, sizes, count, attrs, attr_idxs, num_attrs, stream = calls[0]
+    assert dst_ptrs == [staging_base, staging_base + 16]
+    assert src_ptrs == [int(descs.ptrs[0]), int(descs.ptrs[2])]
+    assert sizes == [16, 24]
+    assert (count, attr_idxs, num_attrs, stream) == (2, [0], 1, 123)
+    assert attrs[0].srcAccessOrder == 1
+    assert attrs[0].flags == 1
+    assert set_devices == [copy_device]
 
-    assert launched
-    assert set_devices == [0]
-    expected_sections = [
-        [descs[0].ptr, descs[2].ptr],
-        [staging.data_ptr() + spans[0].chunk_offset, staging.data_ptr() + spans[2].chunk_offset],
-        [(block + word) // word, 1],
-        [0, 0, 1],
-        [0, block // word, 0],
-    ]
-    assert pinned_arrays[0].tolist() == sum(expected_sections, [])
-    assert launches == [
-        {
-            "kernel": "request_u64",
-            "grid": (3,),
-            "args": expected_sections,
-            "kwargs": {
-                "block_words": b10_kernels._REQUEST_SCATTER_ALIGNED_KERNEL_BLOCK_WORDS,
-                "num_warps": 8,
-            },
-        }
-    ]
-    # Ad-hoc metadata lifetime: flat device upload + pinned host staging.
-    assert [ref.buffer for ref in lifetime_refs] == [
-        fakes.device_tensors[0],
-        fakes.pinned_tensors[0],
-    ]
-    assert fakes.device_tensors[0].recorded_streams == [copy_stream]
-
-    # An unaligned span size falls back to the absolute byte kernel.
-    launches.clear()
-    descs, spans = _gather_span_case([word, 1])
-    assert b10_kernels._gather_vram_spans_to_pinned_staging(
-        descs, spans, _FakePinnedStagingTensor(), copy_stream
+    one_desc, one_span = _fragmented_span_case([16])
+    assert not b10_copy_engine._copy_vram_spans_to_pinned_staging_batch(
+        one_desc, one_span, staging, copy_stream
     )
-    assert [launch["kernel"] for launch in launches] == ["request_byte"]
-    assert launches[0]["kwargs"] == {
-        "block_size": b10_kernels._SCATTER_KERNEL_BLOCK_SIZE,
-        "num_warps": 8,
-    }
+    assert len(calls) == 1
 
 
-def test_b10_send_gather_validates_staging_and_empty_spans(monkeypatch):
-    launches = []
-    _install_scatter_kernel_fakes(monkeypatch, launches)
-    set_devices = []
-    monkeypatch.setattr(torch.cuda, "set_device", set_devices.append)
-    descs, spans = _gather_span_case([8, 8])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="batched D2H copy requires CUDA")
+def test_b10_batched_d2h_copies_fragmented_vram():
+    if getattr(b10_copy_engine.cudart, "cudaMemcpyBatchAsync", None) is None:
+        pytest.skip("CUDA runtime does not expose cudaMemcpyBatchAsync")
 
-    for staging in (
-        object(),
-        _FakePinnedStagingTensor(pinned=False),
-        _FakePinnedStagingTensor(cuda=True),
-    ):
-        with pytest.raises(TypeError, match="pinned host torch tensor"):
-            b10_kernels._gather_vram_spans_to_pinned_staging(descs, spans, staging, None)
-
-    # All-zero spans move no bytes: no launch, no device pinning.
-    zero_descs, zero_spans = _gather_span_case([0, 0])
-    assert not b10_kernels._gather_vram_spans_to_pinned_staging(
-        zero_descs, zero_spans, _FakePinnedStagingTensor(), None
+    device = torch.device("cuda", torch.cuda.current_device())
+    source = torch.arange(96, dtype=torch.uint8, device=device)
+    staging = torch.zeros(80, dtype=torch.uint8, pin_memory=True)
+    descs = _desc_array_view_from(
+        [
+            b10_memory._NormalizedMemoryDesc(source.data_ptr(), 32, device.index),
+            b10_memory._NormalizedMemoryDesc(source.data_ptr() + 48, 48, device.index),
+        ]
     )
-    assert launches == []
-    assert set_devices == []
-
-
-def test_b10_send_gather_gating_routes_by_eligibility(monkeypatch):
-    agent = _make_uninitialized_b10_agent()
-    monkeypatch.setattr(torch, "Tensor", _FakeScatterCudaTensor)
-    monkeypatch.setattr(b10_copy_engine, "_scatter_kernels_available", lambda: True)
-    min_spans = b10_pools._DEFAULT_SEND_GATHER_MIN_SPANS
-    descs, spans = _gather_span_case([8] * min_spans)
-    staging = _FakePinnedStagingTensor()
-
-    assert agent._copies.send_gather_device(descs, "VRAM", staging, spans) == torch.device(
-        "cuda", 0
+    spans = _span_arrays_from(
+        [
+            b10_memory._ContiguousSpan(start=0, size=32, chunk_offset=0),
+            b10_memory._ContiguousSpan(start=1, size=48, chunk_offset=32),
+        ]
     )
-    # Triton missing/broken routes otherwise-eligible chunks to the loop.
-    monkeypatch.setattr(b10_copy_engine, "_scatter_kernels_available", lambda: False)
-    assert agent._copies.send_gather_device(descs, "VRAM", staging, spans) is None
-    monkeypatch.setattr(b10_copy_engine, "_scatter_kernels_available", lambda: True)
-    assert agent._copies.send_gather_device(descs, "DRAM", staging, spans) is None
-    short_descs, short_spans = _gather_span_case([8] * (min_spans - 1))
-    assert agent._copies.send_gather_device(short_descs, "VRAM", staging, short_spans) is None
-    assert agent._copies.send_gather_device(descs, "VRAM", object(), spans) is None
-    assert (
-        agent._copies.send_gather_device(
-            descs, "VRAM", _FakePinnedStagingTensor(pinned=False), spans
-        )
-        is None
+    copy_stream = torch.cuda.Stream(device=device)
+    source_ready = torch.cuda.Event()
+    source_ready.record(torch.cuda.current_stream(device))
+    copy_stream.wait_event(source_ready)
+
+    assert b10_copy_engine._copy_vram_spans_to_pinned_staging_batch(
+        descs, spans, staging, copy_stream
     )
-    assert (
-        agent._copies.send_gather_device(descs, "VRAM", _FakePinnedStagingTensor(cuda=True), spans)
-        is None
-    )
-    mixed_descs, mixed_spans = _gather_span_case(
-        [8] * min_spans, device_ids=[idx % 2 for idx in range(min_spans)]
-    )
-    assert agent._copies.send_gather_device(mixed_descs, "VRAM", staging, mixed_spans) is None
+    copy_stream.synchronize()
+    expected = torch.cat((source[:32], source[48:])).cpu()
+    assert torch.equal(staging, expected)
 
 
-def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
+def test_b10_copy_chunk_batches_send_and_keeps_receive_async(monkeypatch):
     device = torch.device("cuda", 0)
     source_ready_event = object()
 
     class FakeCopyStream:
         def __init__(self):
             self.waited_events = []
+            self.cuda_stream = 123
 
         def wait_event(self, event):
             self.waited_events.append(event)
@@ -2537,17 +2435,6 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
     agent = _make_uninitialized_b10_agent()
     agent._core.cuda_copy_streams = types.SimpleNamespace(stream_for=lambda dev: fake_copy_stream)
     monkeypatch.setattr(torch, "Tensor", _FakeScatterCudaTensor)
-    monkeypatch.setattr(b10_copy_engine, "_scatter_kernels_available", lambda: True)
-
-    class _FakeCudaEvent:
-        def __init__(self):
-            self.recorded_streams = []
-
-        def record(self, stream):
-            self.recorded_streams.append(stream)
-
-    # raising=False: the fake-torch harness environments lack cuda.Event.
-    monkeypatch.setattr(torch.cuda, "Event", _FakeCudaEvent, raising=False)
 
     stream_contexts = []
 
@@ -2584,6 +2471,16 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
 
     monkeypatch.setattr(b10_copy_engine, "_span_view", fake_span_view)
 
+    batch_calls = []
+
+    def fake_batch_copy(*args):
+        batch_calls.append(args)
+        return True
+
+    monkeypatch.setattr(
+        b10_copy_engine, "_copy_vram_spans_to_pinned_staging_batch", fake_batch_copy
+    )
+
     class _FakeStagingSlice:
         def __init__(self, start, stop):
             self.start = start
@@ -2595,8 +2492,8 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
             return self
 
     class _FakeLoopStagingTensor(_FakePinnedStagingTensor):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
+        def __init__(self):
+            super().__init__()
             self.slices = []
 
         def __getitem__(self, item):
@@ -2604,20 +2501,10 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
             self.slices.append(fake_slice)
             return fake_slice
 
-    gather_calls = []
-    monkeypatch.setattr(
-        b10_copy_engine,
-        "_gather_vram_spans_to_pinned_staging",
-        lambda *args, **kwargs: gather_calls.append((args, kwargs)) or True,
-    )
-
-    min_spans = b10_pools._DEFAULT_SEND_GATHER_MIN_SPANS
-
-    # Eligible send chunk: the gather kernel path is taken, the loop is not.
-    descs, spans = _gather_span_case([8] * min_spans)
+    # Fragmented sends use one batched D2H submission on the copy stream.
+    descs, spans = _fragmented_span_case([16] * 32)
     chunk = b10_memory._TransferChunk(start=0, count=len(descs), size=sum(d.size for d in descs))
     staging = _FakeLoopStagingTensor()
-    staging_view = b10_memory._BufferView(staging, staging)
     lifetime_refs = []
     span_count, copy_devices = agent._copies.copy_chunk(
         descs,
@@ -2626,64 +2513,26 @@ def test_b10_copy_chunk_send_gather_and_trimmed_loop(monkeypatch):
         staging,
         copy_from_staging=False,
         lifetime_refs=lifetime_refs,
-        staging_view=staging_view,
+        spans=spans,
         source_ready_events=[(device, source_ready_event)],
     )
     assert span_count == len(spans)
     assert copy_devices == [device]
-    assert len(gather_calls) == 1
-    gather_args = gather_calls[0][0]
-    assert gather_args[0] is descs
-    assert list(gather_args[1]) == list(spans)
-    assert gather_args[2:] == (staging, fake_copy_stream, lifetime_refs)
     assert fake_copy_stream.waited_events == [source_ready_event]
+    assert batch_calls == [(descs, spans, staging, fake_copy_stream)]
+    assert stream_contexts == []
     assert span_buffers == {} and staging.slices == []
-    # The gather kernel's staging writes are not allocator-tracked, so the
-    # copy-stream event must be attached for quarantine pruning.
-    assert isinstance(staging_view.ready_event, _FakeCudaEvent)
-    assert staging_view.ready_event.recorded_streams == [fake_copy_stream]
+    assert lifetime_refs == []
 
-    # Below the span threshold the trimmed loop runs: one stream context per
-    # chunk, direct copy_ calls, zero-size spans skipped, D2H non_blocking.
-    gather_calls.clear()
-    fake_copy_stream.waited_events.clear()
-    descs, spans = _gather_span_case([16, 0, 24])
-    chunk = b10_memory._TransferChunk(start=0, count=len(descs), size=sum(d.size for d in descs))
-    staging = _FakeLoopStagingTensor()
-    lifetime_refs = []
-    span_count, copy_devices = agent._copies.copy_chunk(
-        descs,
-        chunk,
-        "VRAM",
-        staging,
-        copy_from_staging=False,
-        lifetime_refs=lifetime_refs,
-        source_ready_events=[(device, source_ready_event)],
-    )
-    assert gather_calls == []
-    assert span_count == 3
-    assert copy_devices == [device, device]
-    assert stream_contexts == [("enter", fake_copy_stream), ("exit", fake_copy_stream)]
-    assert [(s.start, s.stop) for s in staging.slices] == [(0, 16), (16, 40)]
-    assert [s.copies for s in staging.slices] == [
-        [(span_buffers[0], True)],
-        [(span_buffers[16], True)],
-    ]
-    assert [ref.buffer for ref in lifetime_refs] == [span_buffers[0], span_buffers[16]]
-
-    # copy_from_staging chunks never gather, even when otherwise eligible:
-    # the loop copies staging slices into the span views.
+    # Receive chunks use the same stream but reverse the copy direction.
     stream_contexts.clear()
     span_buffers.clear()
-    descs, spans = _gather_span_case([8] * min_spans)
-    chunk = b10_memory._TransferChunk(start=0, count=len(descs), size=sum(d.size for d in descs))
     staging = _FakeLoopStagingTensor()
     span_count, copy_devices = agent._copies.copy_chunk(
         descs, chunk, "VRAM", staging, copy_from_staging=True
     )
-    assert gather_calls == []
-    assert span_count == min_spans
-    assert copy_devices == [device] * min_spans
+    assert span_count == len(spans)
+    assert copy_devices == [device] * len(spans)
     assert stream_contexts == [("enter", fake_copy_stream), ("exit", fake_copy_stream)]
     assert all(
         buffer.copies == [(staging.slices[idx], True)]
@@ -2712,50 +2561,14 @@ def test_b10_prune_quarantined_views_waits_for_pending_ready_event():
     )
     agent._core._quarantined_staging_views = [pending, eventless]
 
-    # The un-fired gather-kernel event keeps its entry alive past the TTL
-    # (the kernel may still be pending on a wedged stream); entries without
-    # events keep the plain TTL behavior.
+    # An un-fired copy event keeps its entry alive past the TTL; entries
+    # without events keep the plain TTL behavior.
     agent._core._prune_quarantined_staging_buffers()
     assert agent._core._quarantined_staging_views == [pending]
 
     event.ready = True
     agent._core._prune_quarantined_staging_buffers()
     assert agent._core._quarantined_staging_views == []
-
-
-def test_b10_send_gather_byte_kernel_tripwire_warns_once(monkeypatch):
-    launches = []
-    _install_scatter_kernel_fakes(monkeypatch, launches)
-    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
-    monkeypatch.setattr(b10_kernels, "_send_gather_byte_kernel_warned", False)
-    warnings = []
-    monkeypatch.setattr(b10_kernels.logger, "warning", warnings.append)
-
-    word = b10_kernels._SCATTER_ALIGNED_WORD_BYTES
-    descs, spans = _gather_span_case([word, 1])
-    assert b10_kernels._gather_vram_spans_to_pinned_staging(
-        descs, spans, _FakePinnedStagingTensor(), object()
-    )
-    assert [launch["kernel"] for launch in launches] == ["request_byte"]
-    assert len(warnings) == 1
-    assert "byte kernel" in warnings[0]
-    assert "misaligned_fragments=1/2" in warnings[0]
-
-    # Once per process: a second byte-kernel gather stays silent.
-    assert b10_kernels._gather_vram_spans_to_pinned_staging(
-        descs, spans, _FakePinnedStagingTensor(), object()
-    )
-    assert len(warnings) == 1
-
-    # Aligned gathers never trip the warning.
-    monkeypatch.setattr(b10_kernels, "_send_gather_byte_kernel_warned", False)
-    launches.clear()
-    descs, spans = _gather_span_case([word, word])
-    assert b10_kernels._gather_vram_spans_to_pinned_staging(
-        descs, spans, _FakePinnedStagingTensor(), object()
-    )
-    assert [launch["kernel"] for launch in launches] == ["request_u64"]
-    assert len(warnings) == 1
 
 
 def test_b10_desc_view_from_arrays_matches_normalize_fallback():

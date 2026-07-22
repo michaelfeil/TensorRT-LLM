@@ -63,6 +63,7 @@ from tensorrt_llm._torch.disaggregation.b10.planning import (
 )
 from tensorrt_llm._torch.disaggregation.b10.pools import (
     _format_staging_pool_state,
+    _ready_event_for_copy_events,
     _record_cuda_copy_events,
 )
 from tensorrt_llm._torch.disaggregation.b10.protocol import (
@@ -488,12 +489,8 @@ class SendPipeline:
             data_tag = _data_tag(plan.transfer_id, idx, lease.endpoint_generation, lease.tag_domain)
             try:
                 with ctx.trace.measure("src_copy"):
-                    # Holds the gather kernel's metadata tensors (and any span
-                    # views) until the copy events recorded on the copy stream
-                    # are awaited below; on failure the refs drop early, which
-                    # record_stream on the device metadata and the pinned-host
-                    # CachingHostAllocator events backstop (see
-                    # _upload_scatter_metadata_adhoc).
+                    # Keep fallback source span views alive until their D2H
+                    # copies complete.
                     copy_lifetime_refs: list[_BufferView] = []
                     span_count, copy_devices = self._copies.copy_chunk(
                         plan.src_descs,
@@ -502,7 +499,6 @@ class SendPipeline:
                         staging_view.buffer,
                         copy_from_staging=False,
                         lifetime_refs=copy_lifetime_refs,
-                        staging_view=staging_view,
                         source_ready_events=ctx.source_ready_events,
                         source_ready_waited_keys=source_ready_waited_keys,
                     )
@@ -511,6 +507,7 @@ class SendPipeline:
                     copy_events = _record_cuda_copy_events(
                         copy_devices, self._core.cuda_copy_streams.stream_for
                     )
+                    staging_view.ready_event = _ready_event_for_copy_events(copy_events)
                 if copy_events:
                     with ctx.trace.measure("copy_event_wait"):
                         await self._core._wait_copy_events_async(copy_events, ctx.deadline)

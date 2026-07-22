@@ -278,14 +278,11 @@ class B10CacheTransferAgent(BaseTransferAgent):
         return name in self._endpoints._remote_agents
 
     def _warm_scatter_kernels_at_startup(self) -> None:
-        # The absolute-kernel parity warmup covers the send gather (and the
-        # request-level recv scatter), which run on any local CUDA device
-        # regardless of recv-scratch config; only the recv-scratch pool
-        # warmups keep the scratch gate.
+        # Request-level receive scatter runs regardless of the per-chunk
+        # receive-scratch configuration, so always warm its absolute kernels.
         if not torch.cuda.is_available():
             return
-        # Same device choice as _preallocate_recv_scratch_buffers: the send
-        # gather runs on the local KV pool device.
+        # Same device choice as _preallocate_recv_scratch_buffers.
         warm_device = (
             self._recv._recv_scratch_device
             if self._recv._recv_scratch_device is not None

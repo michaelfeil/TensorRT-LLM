@@ -456,37 +456,3 @@ def _scatter_programs_for_fragment_sizes(
         np.arange(program_count, dtype=np.int64) - first_program_of_fragment
     ) * block_size
     return program_fragment_indices, program_offsets
-
-
-def _gather_plan_for_vram_spans(
-    descs: _DescArrayView,
-    spans: _SpanArrays,
-    staging_base_ptr: int,
-) -> _DestinationScatterPlan:
-    """Absolute-pointer copy plan gathering VRAM spans into a staging buffer.
-
-    Source pointers are the spans' VRAM addresses; destination pointers are
-    staging_base_ptr + span.chunk_offset — the same staging offsets the
-    per-span fallback loop uses (the chunk's spans are contiguous in staging
-    in span order). Zero-size spans move no bytes and
-    are dropped. No sort or coalesce pass is needed: spans are already
-    maximal contiguous runs, so no two spans are adjacent in both source and
-    staging.
-    """
-    src_ptrs = descs.ptrs[spans.starts]
-    device_ids = descs.device_ids[spans.starts]
-    sizes = spans.sizes
-    dst_ptrs = staging_base_ptr + spans.chunk_offsets
-    nonzero = sizes > 0
-    if not bool(nonzero.all()):
-        src_ptrs = src_ptrs[nonzero]
-        dst_ptrs = dst_ptrs[nonzero]
-        sizes = sizes[nonzero]
-        device_ids = device_ids[nonzero]
-    return _DestinationScatterPlan(
-        src_ptrs=src_ptrs,
-        dst_ptrs=dst_ptrs,
-        sizes=sizes,
-        device_ids=device_ids,
-        total_bytes=int(sizes.sum()),
-    )

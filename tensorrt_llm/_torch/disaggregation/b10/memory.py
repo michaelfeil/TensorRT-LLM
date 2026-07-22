@@ -143,9 +143,6 @@ class _DescPairOrder:
 class _DestinationScatterPlan:
     """Destination-ordered scatter fragments as parallel int64 arrays.
 
-    Direction-agnostic absolute src -> dst fragments; also the send-gather
-    plan.
-
     The hot path (thousands of fragments per request-level scatter) stores
     fragments as numpy arrays so metadata assembly never walks per-fragment
     Python objects.

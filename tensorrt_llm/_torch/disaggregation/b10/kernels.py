@@ -30,16 +30,8 @@ from tensorrt_llm._torch.disaggregation.b10.memory import (
     _NormalizedMemoryDesc,
     _SpanArrays,
 )
-from tensorrt_llm._torch.disaggregation.b10.planning import (
-    _gather_plan_for_vram_spans,
-    _scatter_programs_for_fragment_sizes,
-)
-from tensorrt_llm._utils import (
-    TensorWrapper,
-    convert_to_torch_tensor,
-    maybe_pin_memory,
-    prefer_pinned,
-)
+from tensorrt_llm._torch.disaggregation.b10.planning import _scatter_programs_for_fragment_sizes
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, maybe_pin_memory
 
 _SCATTER_KERNEL_BLOCK_SIZE = 16 * 1024
 _SCATTER_ALIGNED_WORD_BYTES = 8
@@ -200,33 +192,6 @@ def _get_scatter_cuda_buffer_to_vram_spans_kernel() -> tuple[Any, Any, Any, Any,
             scatter_absolute_aligned_u64_kernel,
         )
     return G_SCATTER_CUDA_BUFFER_TO_VRAM_SPANS_KERNEL
-
-
-_scatter_kernels_availability: Optional[bool] = None
-
-
-def _scatter_kernels_available() -> bool:
-    """Whether the Triton copy kernels can be built (memoized, warns once).
-
-    Probed at gate time so a missing/broken Triton is a routing decision:
-    eligible send-gather chunks fall back to the per-span copy loop instead
-    of failing inside the transfer. Only the import/getter failure is
-    absorbed here; launch errors still propagate.
-    """
-    global _scatter_kernels_availability
-    if _scatter_kernels_availability is None:
-        try:
-            _get_scatter_cuda_buffer_to_vram_spans_kernel()
-        except Exception as exc:
-            _scatter_kernels_availability = False
-            logger.warning(
-                "B10 Triton copy kernels unavailable; fragmented sends fall "
-                "back to the per-span copy loop: "
-                f"error={type(exc).__name__}: {exc}"
-            )
-        else:
-            _scatter_kernels_availability = True
-    return _scatter_kernels_availability
 
 
 def _use_aligned_scatter_kernel(descs: _DescArrayView, spans: _SpanArrays) -> bool:
@@ -490,17 +455,12 @@ def _scatter_cuda_buffers_to_vram_destination_order(
     lifetime_refs: Optional[list[_BufferView]] = None,
     mark_launch_started: Optional[Callable[[], None]] = None,
 ) -> bool:
-    """Launch one absolute-pointer copy kernel over the plan's fragments.
-
-    Destinations are absolute pointers — VRAM for the recv scatter,
-    UVA-mapped pinned host for the send gather.
-    """
+    """Launch one absolute-pointer receive scatter kernel."""
     fragment_count = plan.fragment_count
     if fragment_count == 0:
         return False
-    # Every caller enforces single-device fragments before a plan is built:
-    # the request-level recv gate in recv.py, CopyEngine's send-gather gate,
-    # and the warmup constructions.
+    # The request-level receive gate and warmup construction both enforce
+    # single-device fragments before building the plan.
     device_id = int(plan.device_ids[0])
     device = torch.device("cuda", device_id)
     use_aligned_kernel = _use_aligned_destination_scatter_plan(plan)
@@ -580,84 +540,6 @@ def _scatter_cuda_buffers_to_vram_destination_order(
     return use_aligned_kernel
 
 
-_send_gather_byte_kernel_warned = False
-
-
-def _warn_send_gather_byte_kernel_once(plan: _DestinationScatterPlan) -> None:
-    """Perf tripwire: the byte kernel's UVA stores (~21GB/s) are slower than
-    the per-span copy loop, and production KV layouts are 8-byte aligned
-    today, so a byte-kernel send gather means the layout changed. Routing is
-    unchanged; this only warns once per process.
-    """
-    global _send_gather_byte_kernel_warned
-    if _send_gather_byte_kernel_warned:
-        return
-    _send_gather_byte_kernel_warned = True
-    word = _SCATTER_ALIGNED_WORD_BYTES
-    misaligned = (
-        (plan.src_ptrs % word != 0) | (plan.dst_ptrs % word != 0) | (plan.sizes % word != 0)
-    )
-    first = int(np.flatnonzero(misaligned)[0])
-    logger.warning(
-        "B10 send gather selected the unaligned byte kernel; sends will be "
-        f"slower until the KV layout is {word}-byte aligned: "
-        f"misaligned_fragments={int(misaligned.sum())}/{plan.fragment_count} "
-        f"first_src_ptr={int(plan.src_ptrs[first])} "
-        f"first_dst_ptr={int(plan.dst_ptrs[first])} "
-        f"first_size={int(plan.sizes[first])}"
-    )
-
-
-def _gather_vram_spans_to_pinned_staging(
-    descs: _DescArrayView,
-    spans: _SpanArrays,
-    staging_buffer: torch.Tensor,
-    copy_stream: Optional[Any],
-    lifetime_refs: Optional[list[_BufferView]] = None,
-    *,
-    warn_byte_kernel: bool = True,
-) -> bool:
-    """Gather a chunk's contiguous VRAM spans into pinned host staging with
-    one Triton launch (the send-side hot path).
-
-    Pinned host memory is UVA-mapped, so the absolute-pointer scatter
-    kernels (which are direction-agnostic src_ptr -> dst_ptr copy kernels)
-    store directly into the staging buffer through its host address: one
-    launch replaces the per-span D2H copy_ dispatches AND the D2H copies
-    themselves — the same bytes cross the bus from inside the kernel.
-    Sources are read-only, so no overlap check is needed. Metadata lifetime
-    follows the _upload_scatter_metadata_adhoc contract: pass lifetime_refs
-    and keep them until the copy_stream event recorded after this call
-    completes.
-
-    Returns True when a kernel was launched, False when the spans move no
-    bytes.
-    """
-    if (
-        not isinstance(staging_buffer, torch.Tensor)
-        or staging_buffer.device.type != "cpu"
-        or not staging_buffer.is_pinned()
-    ):
-        raise TypeError("B10 send gather staging destination must be a pinned host torch tensor")
-    plan = _gather_plan_for_vram_spans(descs, spans, staging_base_ptr=staging_buffer.data_ptr())
-    if plan.fragment_count == 0:
-        return False
-    # CopyEngine's send-gather gate and the warmup construction enforce
-    # single-device sources, matching the request-level scatter contract in
-    # _scatter_cuda_buffers_to_vram_destination_order.
-    device_id = int(plan.device_ids[0])
-    # The per-span loop pinned the thread's CUDA device via _make_buffer_view
-    # (torch.cuda.set_device per span view); the kernel path must do the same
-    # once so the metadata upload and launch land on the spans' device.
-    torch.cuda.set_device(device_id)
-    use_aligned_kernel = _scatter_cuda_buffers_to_vram_destination_order(
-        plan, copy_stream, lifetime_refs
-    )
-    if warn_byte_kernel and not use_aligned_kernel:
-        _warn_send_gather_byte_kernel_once(plan)
-    return True
-
-
 def _warm_scatter_kernels(device: torch.device, copy_stream: Any) -> None:
     """Compile every Triton scatter kernel variant at startup.
 
@@ -697,9 +579,7 @@ def _warm_scatter_kernels(device: torch.device, copy_stream: Any) -> None:
 
 
 def _warm_absolute_kernel_parity_specializations(device: torch.device, copy_stream: Any) -> None:
-    """Compile every absolute-kernel parity specialization shared by the
-    send gather and the request-level recv scatter (before this warmup the
-    request-level recv path could JIT mid-transfer).
+    """Compile every request-level receive scatter parity specialization.
 
     The metadata sections are torch.split views of one flat int64 upload,
     and Triton's specialization key includes each pointer argument's
@@ -727,21 +607,16 @@ def _warm_absolute_kernel_parity_specializations(device: torch.device, copy_stre
             ]
         )
     max_chunk_size = max(sum(sizes) for sizes in span_size_cases)
-    gather_src = torch.zeros(max_chunk_size, dtype=torch.uint8, device=device)
-    gather_staging = torch.empty(
-        (max_chunk_size,), dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
-    )
+    warm_src = torch.zeros(max_chunk_size, dtype=torch.uint8, device=device)
+    warm_dst = torch.empty(max_chunk_size, dtype=torch.uint8, device=device)
     for span_sizes in span_size_cases:
         sizes = np.asarray(span_sizes, dtype=np.int64)
         chunk_offsets = np.concatenate(([0], np.cumsum(sizes[:-1])))
-        descs = _DescArrayView(
-            gather_src.data_ptr() + chunk_offsets,
-            sizes,
-            np.full(sizes.shape[0], device_id, dtype=np.int64),
+        plan = _DestinationScatterPlan(
+            src_ptrs=warm_src.data_ptr() + chunk_offsets,
+            dst_ptrs=warm_dst.data_ptr() + chunk_offsets,
+            sizes=sizes,
+            device_ids=np.full(sizes.shape[0], device_id, dtype=np.int64),
+            total_bytes=int(sizes.sum()),
         )
-        spans = _SpanArrays(np.arange(sizes.shape[0], dtype=np.int64), sizes, chunk_offsets)
-        # warn_byte_kernel=False: the byte-kernel cases here are deliberate
-        # warmups, not production layout regressions.
-        _gather_vram_spans_to_pinned_staging(
-            descs, spans, gather_staging, copy_stream, warn_byte_kernel=False
-        )
+        _scatter_cuda_buffers_to_vram_destination_order(plan, copy_stream)
