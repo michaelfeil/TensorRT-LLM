@@ -25,6 +25,8 @@ _STATUS_WAIT_CLEANUP_GRACE_S = 1.0
 _UCXX_PROGRESS_MODE_ENV = "UCXPY_PROGRESS_MODE"
 _UCXX_PYTHON_FUTURE_ENV = "UCXPY_ENABLE_PYTHON_FUTURE"
 _DEFAULT_UCXX_PROGRESS_MODE = "thread-polling"
+_UCXX_ERROR_HANDLING_MODE_ENV = "UCXX_ERROR_HANDLING_MODE"
+_DEFAULT_UCXX_ERROR_HANDLING_MODE = "failover"
 
 
 def _apply_default_ucxx_progress_mode() -> None:
@@ -55,6 +57,16 @@ def _apply_default_ucxx_progress_mode() -> None:
     # attached to a foreign loop (observed fleet-wide as listener-handler
     # "Future attached to a different loop" failures).
     os.environ.setdefault(_UCXX_PYTHON_FUTURE_ENV, "1")
+    # NIC fault-tolerance on by default: ucxx creates worker-address
+    # endpoints with UCP_ERR_HANDLING_MODE_FAILOVER, so a NIC/lane failure
+    # mid-transfer is transparently rerouted onto surviving rails instead of
+    # failing the endpoint. Measured cost vs peer mode is ~2% at the current
+    # stack ceiling. Both peers must agree only in the sense that each side's
+    # own endpoints are failover-capable; deployments can force the previous
+    # behavior with UCXX_ERROR_HANDLING_MODE=peer. Rail striping/fragment
+    # tuning (UCX_MAX_EAGER_RAILS, UCX_RC_MLX5_SEG_SIZE) is hardware-specific
+    # and intentionally left to deployment config.
+    os.environ.setdefault(_UCXX_ERROR_HANDLING_MODE_ENV, _DEFAULT_UCXX_ERROR_HANDLING_MODE)
 
 
 def _bind_ucxx_python_future_notifier(ucxx_module: Any) -> None:
