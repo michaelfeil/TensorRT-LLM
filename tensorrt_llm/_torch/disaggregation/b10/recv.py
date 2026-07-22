@@ -271,6 +271,10 @@ class _RecvTransfer:
     transfer_id: int
     request_id: Optional[int]
     endpoint_generation: int
+    # UCX endpoint handle on which CONTROL and DATA arrive. Transfer ids and
+    # endpoint generations are sender-local, so the source endpoint is part
+    # of the dispatcher key when several peers send concurrently.
+    src_ep_handle: int
     # Sender's worker address from the control message; keys the cached
     # reverse endpoint (`endpoint`, assigned right after validation) used
     # for READY/RESULT.
@@ -540,18 +544,34 @@ class RecvPipeline:
         if len(self._retired_recv_scratch_views) >= self._core.recv_scratch_buffer_pool.num_buffers:
             self._recv_scratch_device = None
 
-    def _on_am_control(self, header: _AmHeader, control: dict[str, Any]) -> None:
+    def _on_am_control(
+        self, src_ep_handle: int, header: _AmHeader, control: dict[str, Any]
+    ) -> None:
         """AM dispatcher control handler: runs on the agent loop; spawns one
         incoming-write task per transfer (the AM analog of the per-endpoint
         listener loop)."""
         if self._core.shutdown:
             return
-        self._core.loop.create_task(self._handle_incoming_write_safe(control))
+        if (
+            control.get("transfer_id") != header.transfer_id
+            or control.get("endpoint_generation") != header.endpoint_generation
+        ):
+            logger.warning(
+                f"B10 CONTROL header/payload identity mismatch: "
+                f"header_transfer_id={header.transfer_id} "
+                f"payload_transfer_id={control.get('transfer_id')} "
+                f"header_endpoint_generation={header.endpoint_generation} "
+                f"payload_endpoint_generation={control.get('endpoint_generation')}"
+            )
+            return
+        self._core.loop.create_task(self._handle_incoming_write_safe(src_ep_handle, control))
 
-    async def _handle_incoming_write_safe(self, control: dict[str, Any]) -> None:
+    async def _handle_incoming_write_safe(
+        self, src_ep_handle: int, control: dict[str, Any]
+    ) -> None:
         transfer_id = int(control.get("transfer_id", -1))
         try:
-            await self._handle_incoming_write(control)
+            await self._handle_incoming_write(src_ep_handle, control)
         except TimeoutError as exc:
             if not self._core.shutdown:
                 logger.warning(
@@ -585,8 +605,8 @@ class RecvPipeline:
             self._reply_endpoints.pop(src_worker_address, None)
         _abort_endpoint_background(endpoint)
 
-    async def _handle_incoming_write(self, control: dict[str, Any]) -> None:
-        ctx = self._validate_and_prepare(control)
+    async def _handle_incoming_write(self, src_ep_handle: int, control: dict[str, Any]) -> None:
+        ctx = self._validate_and_prepare(src_ep_handle, control)
         # Reverse endpoint for READY/RESULT, from the sender's worker address
         # in the control message (self-contained; no registration-plane
         # dependency). DATA needs no endpoint object at all — it arrives via
@@ -606,12 +626,12 @@ class RecvPipeline:
                 if ready_sent:
                     await self._fail_after_ready(ctx, exc)
                 else:
-                    self._fail_before_ready(ctx, exc)
+                    await self._fail_before_ready(ctx, exc)
                 raise
             finally:
                 self._finish_transfer(ctx)
 
-    def _validate_and_prepare(self, control: dict[str, Any]) -> _RecvTransfer:
+    def _validate_and_prepare(self, src_ep_handle: int, control: dict[str, Any]) -> _RecvTransfer:
         deadline = _TransferDeadline(self._core.transfer_timeout_s)
         if control.get("protocol") != _B10_PROTOCOL:
             raise ValueError(f"Unexpected B10 control protocol: {control.get('protocol')}")
@@ -636,6 +656,7 @@ class RecvPipeline:
             transfer_id=transfer_id,
             request_id=request_id,
             endpoint_generation=endpoint_generation,
+            src_ep_handle=src_ep_handle,
             src_worker_address=bytes(src_worker_address),
             dst_type=dst_type,
             dst_descs=dst_descs,
@@ -720,14 +741,21 @@ class RecvPipeline:
                 return
             future.set_result(payload)
 
-        self._dispatcher.register_data_sink(ctx.transfer_id, ctx.endpoint_generation, sink)
+        self._dispatcher.register_data_sink(
+            ctx.src_ep_handle,
+            ctx.transfer_id,
+            ctx.endpoint_generation,
+            sink,
+        )
         ctx.am_sink_registered = True
 
     def _unregister_am_data_sink(self, ctx: _RecvTransfer) -> None:
         if not ctx.am_sink_registered:
             return
         ctx.am_sink_registered = False
-        self._dispatcher.unregister_data_sink(ctx.transfer_id, ctx.endpoint_generation)
+        self._dispatcher.unregister_data_sink(
+            ctx.src_ep_handle, ctx.transfer_id, ctx.endpoint_generation
+        )
         ctx.am_chunks.clear()
 
     async def _reserve_transfer_resources(self, ctx: _RecvTransfer) -> None:
@@ -791,9 +819,17 @@ class RecvPipeline:
             await self._send_reply_am(ctx, _AM_KIND_READY, {"ok": True})
         ctx.trace.debug(lambda: "READY sent")
 
-    def _fail_before_ready(self, ctx: _RecvTransfer, exc: BaseException) -> None:
+    async def _fail_before_ready(self, ctx: _RecvTransfer, exc: BaseException) -> None:
         ctx.recv_status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
         self._release_recv_scratch_buffers(ctx.recv_scratch_tracker.take_all())
+        if ctx.recv_status == "cancelled":
+            return
+        try:
+            await self._send_reply_am(ctx, _AM_KIND_READY, {"ok": False, "error": str(exc)})
+        except Exception as reply_exc:
+            logger.warning(
+                f"B10 failed to send failure READY for transfer {ctx.transfer_id}: {reply_exc}"
+            )
 
     async def _receive_one(self, ctx: _RecvTransfer, chunk: _TransferChunk, idx: int) -> None:
         try:

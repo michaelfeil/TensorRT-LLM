@@ -1418,6 +1418,29 @@ def test_b10_incoming_write_listener_mapping():
     notify(types.SimpleNamespace(_incoming_write_listener=None), 7, "success")
 
 
+@pytest.mark.asyncio
+async def test_b10_recv_failure_before_ready_notifies_sender():
+    agent = _make_uninitialized_b10_agent(loop=asyncio.get_running_loop())
+    pipeline = agent._recv
+    replies = []
+
+    async def send_reply(ctx, kind, payload):
+        replies.append((kind, payload))
+
+    pipeline._send_reply_am = send_reply
+    pipeline._release_recv_scratch_buffers = lambda views: None
+    ctx = types.SimpleNamespace(
+        transfer_id=9,
+        recv_status="unknown",
+        recv_scratch_tracker=types.SimpleNamespace(take_all=lambda: []),
+    )
+
+    await pipeline._fail_before_ready(ctx, RuntimeError("no receive capacity"))
+
+    assert ctx.recv_status == "failed"
+    assert replies == [(b10_protocol._AM_KIND_READY, {"ok": False, "error": "no receive capacity"})]
+
+
 def test_b10_derived_staging_pool_default_from_token_budget():
     class FakeKVCacheManager:
         num_local_layers = 2

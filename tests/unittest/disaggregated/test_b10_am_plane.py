@@ -96,38 +96,58 @@ async def test_dispatcher_routes_control_data_and_replies():
     dispatcher = B10AmDispatcher(loop)
 
     controls: list[tuple] = []
-    dispatcher.set_control_handler(lambda hdr, payload: controls.append((hdr, payload)))
+    dispatcher.set_control_handler(
+        lambda ep_handle, hdr, payload: controls.append((ep_handle, hdr, payload))
+    )
     data: list[tuple] = []
-    dispatcher.register_data_sink(5, 2, lambda idx, payload: data.append((idx, bytes(payload))))
+    dispatcher.register_data_sink(10, 5, 2, lambda idx, payload: data.append((idx, bytes(payload))))
     ready_future = dispatcher.register_reply_future(5, 2, _AM_KIND_READY)
 
     dispatcher._dispatch(
-        _fake_request(_pack_am_message(_AM_KIND_CONTROL, 5, 2, {"transfer_id": 5})), 0
+        _fake_request(_pack_am_message(_AM_KIND_CONTROL, 5, 2, {"transfer_id": 5})), 10
     )
     dispatcher._dispatch(
-        _fake_request(_pack_am_header(_AM_KIND_DATA, 5, 1, 2, 4) + b"\xaa\xbb\xcc\xdd"), 0
+        _fake_request(_pack_am_header(_AM_KIND_DATA, 5, 1, 2, 4) + b"\xaa\xbb\xcc\xdd"), 10
     )
     dispatcher._dispatch(
         _fake_request(_pack_am_message(_AM_KIND_READY, 5, 2, {"transfer_id": 5, "ok": True})), 0
     )
 
-    assert len(controls) == 1 and controls[0][1] == {"transfer_id": 5}
+    assert len(controls) == 1 and controls[0][0] == 10
+    assert controls[0][2] == {"transfer_id": 5}
     assert data == [(1, b"\xaa\xbb\xcc\xdd")]
     assert ready_future.done() and ready_future.result() == {"transfer_id": 5, "ok": True}
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_scopes_data_routes_to_source_endpoint():
+    dispatcher = B10AmDispatcher(asyncio.get_running_loop())
+    peer_a: list[bytes] = []
+    peer_b: list[bytes] = []
+    dispatcher.register_data_sink(10, 1, 1, lambda idx, payload: peer_a.append(bytes(payload)))
+    dispatcher.register_data_sink(20, 1, 1, lambda idx, payload: peer_b.append(bytes(payload)))
+
+    message_a = _pack_am_header(_AM_KIND_DATA, 1, 0, 1, 1) + b"a"
+    message_b = _pack_am_header(_AM_KIND_DATA, 1, 0, 1, 1) + b"b"
+    dispatcher._dispatch(_fake_request(message_b), 20)
+    dispatcher._dispatch(_fake_request(message_a), 10)
+
+    assert peer_a == [b"a"]
+    assert peer_b == [b"b"]
 
 
 @pytest.mark.asyncio
 async def test_dispatcher_drops_stale_messages():
     loop = asyncio.get_running_loop()
     dispatcher = B10AmDispatcher(loop)
-    dispatcher.set_control_handler(lambda hdr, payload: None)
+    dispatcher.set_control_handler(lambda ep_handle, hdr, payload: None)
 
     # DATA with no registered sink, reply with no waiter: dropped, no raise.
     dispatcher._dispatch(_fake_request(_pack_am_header(_AM_KIND_DATA, 99, 0, 1, 2) + b"xy"), 0)
     dispatcher._dispatch(_fake_request(_pack_am_message(_AM_KIND_RESULT, 99, 1, {"ok": True})), 0)
     # Unregistered sink after registration behaves the same.
-    dispatcher.register_data_sink(7, 1, lambda idx, payload: pytest.fail("sink must be gone"))
-    dispatcher.unregister_data_sink(7, 1)
+    dispatcher.register_data_sink(0, 7, 1, lambda idx, payload: pytest.fail("sink must be gone"))
+    dispatcher.unregister_data_sink(0, 7, 1)
     dispatcher._dispatch(_fake_request(_pack_am_header(_AM_KIND_DATA, 7, 0, 1, 2) + b"xy"), 0)
 
 
@@ -153,7 +173,7 @@ async def test_dispatcher_drops_truncated_and_runt_messages():
     loop = asyncio.get_running_loop()
     dispatcher = B10AmDispatcher(loop)
     sink_calls: list = []
-    dispatcher.register_data_sink(3, 1, lambda idx, payload: sink_calls.append(idx))
+    dispatcher.register_data_sink(0, 3, 1, lambda idx, payload: sink_calls.append(idx))
 
     # Runt: shorter than the header.
     dispatcher._dispatch(_fake_request(b"short"), 0)

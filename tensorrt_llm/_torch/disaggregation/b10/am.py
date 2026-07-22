@@ -22,8 +22,9 @@ routes on the agent event loop:
 
 - ``control``      -> the control handler installed by the receive pipeline
                       (spawns one incoming-write task per transfer)
-- ``DATA``         -> the per-(transfer_id, endpoint_generation) chunk sink
-                      registered by the active receive transfer
+- ``DATA``         -> the per-(source endpoint, transfer_id,
+                      endpoint_generation) chunk sink registered by the
+                      active receive transfer
 - ``READY/RESULT`` -> the per-(transfer_id, endpoint_generation, kind) reply
                       future registered by the active send transfer
 
@@ -62,8 +63,8 @@ logger = logging.getLogger(__name__)
 # per-chunk future and copies into pinned staging later. The buffer is freed
 # once the last reference to the view drops.
 DataSink = Callable[[int, Any], None]
-# handler(header, payload_dict) — must not block; spawns its own task.
-ControlHandler = Callable[[_AmHeader, dict[str, Any]], None]
+# handler(ep_handle, header, payload_dict) — must not block; spawns its own task.
+ControlHandler = Callable[[int, _AmHeader, dict[str, Any]], None]
 
 
 class B10AmDispatcher:
@@ -80,7 +81,7 @@ class B10AmDispatcher:
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
         self._control_handler: Optional[ControlHandler] = None
-        self._data_sinks: dict[tuple[int, int], DataSink] = {}
+        self._data_sinks: dict[tuple[int, int, int], DataSink] = {}
         self._reply_futures: dict[tuple[int, int, int], asyncio.Future] = {}
 
     def attach(self, ucxx: Any) -> None:
@@ -93,7 +94,10 @@ class B10AmDispatcher:
     # ---- send-side reply plumbing (loop thread only) ----
 
     def register_reply_future(
-        self, transfer_id: int, endpoint_generation: int, kind: int
+        self,
+        transfer_id: int,
+        endpoint_generation: int,
+        kind: int,
     ) -> asyncio.Future:
         """Create the future a READY/RESULT resolves. Must be registered
         before the control message is sent so the reply cannot race it."""
@@ -104,21 +108,32 @@ class B10AmDispatcher:
         self._reply_futures[key] = future
         return future
 
-    def discard_reply_future(self, transfer_id: int, endpoint_generation: int, kind: int) -> None:
+    def discard_reply_future(
+        self,
+        transfer_id: int,
+        endpoint_generation: int,
+        kind: int,
+    ) -> None:
         self._reply_futures.pop((transfer_id, endpoint_generation, kind), None)
 
     # ---- recv-side data plumbing (loop thread only) ----
 
     def register_data_sink(
-        self, transfer_id: int, endpoint_generation: int, sink: DataSink
+        self,
+        ep_handle: int,
+        transfer_id: int,
+        endpoint_generation: int,
+        sink: DataSink,
     ) -> None:
-        key = (transfer_id, endpoint_generation)
+        key = (ep_handle, transfer_id, endpoint_generation)
         if key in self._data_sinks:
             raise RuntimeError(f"B10 AM data sink already registered: {key}")
         self._data_sinks[key] = sink
 
-    def unregister_data_sink(self, transfer_id: int, endpoint_generation: int) -> None:
-        self._data_sinks.pop((transfer_id, endpoint_generation), None)
+    def unregister_data_sink(
+        self, ep_handle: int, transfer_id: int, endpoint_generation: int
+    ) -> None:
+        self._data_sinks.pop((ep_handle, transfer_id, endpoint_generation), None)
 
     # ---- delivery ----
 
@@ -163,14 +178,15 @@ class B10AmDispatcher:
             return
 
         if header.kind == _AM_KIND_DATA:
-            sink = self._data_sinks.get((header.transfer_id, header.endpoint_generation))
+            sink = self._data_sinks.get((ep_handle, header.transfer_id, header.endpoint_generation))
             if sink is None:
                 self._log_stale(header)
                 return
             sink(header.chunk_index, payload)
         elif header.kind in (_AM_KIND_READY, _AM_KIND_RESULT):
             future = self._reply_futures.pop(
-                (header.transfer_id, header.endpoint_generation, header.kind), None
+                (header.transfer_id, header.endpoint_generation, header.kind),
+                None,
             )
             if future is None or future.done():
                 self._log_stale(header)
@@ -180,7 +196,7 @@ class B10AmDispatcher:
             if self._control_handler is None:
                 logger.error("B10 AM control arrived before handler installed; dropped")
                 return
-            self._control_handler(header, _unpack_message(payload))
+            self._control_handler(ep_handle, header, _unpack_message(payload))
         else:
             logger.error(f"B10 AM unknown kind {header.kind}; dropped")
 
