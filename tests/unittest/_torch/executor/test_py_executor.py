@@ -251,6 +251,55 @@ class TestDisaggTerminationGuard:
         assert _classify_termination(req, True, False, 2) == "stats_only"
 
 
+def test_context_timeout_checked_after_completed_transfers_are_reaped(monkeypatch):
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock(kv_transfer_timeout_ms=30_000)
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = (
+        [1],
+        [],
+        [],
+        [],
+    )
+    completed = Mock(
+        py_request_id=1,
+        py_kv_transfer_start_time=0.0,
+        py_kv_transfer_timed_out=False,
+    )
+    pending = Mock(
+        py_request_id=2,
+        py_kv_transfer_start_time=0.0,
+        py_kv_transfer_timed_out=False,
+    )
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {
+        1: completed,
+        2: pending,
+    }
+    executor.enable_iter_perf_stats = False
+    executor._py_executor_observer = Mock()
+    executor._py_executor_observer.should_record_synthetic_kv_transfer_events_in_transceiver.return_value = False
+    executor._end_transfer_and_maybe_terminate = Mock()
+    executor._maybe_log_disagg_transfer_backpressure = Mock()
+    executor._check_cache_transfer_errors = Mock()
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.time", lambda: 31.0)
+
+    executor._check_disagg_ctx_cache_transfer_status(0)
+
+    assert completed.py_kv_transfer_start_time is None
+    assert not completed.py_kv_transfer_timed_out
+    assert pending.py_kv_transfer_timed_out
+    executor.kv_cache_transceiver.check_context_transfer_status.assert_called_once_with(
+        0,
+        collect_kv_transfer_events=False,
+        timed_out_context_request_ids=[],
+    )
+    executor._py_executor_observer.record_context_failure_events.assert_called_once_with(
+        [pending],
+        kv_cache_transceiver=executor.kv_cache_transceiver,
+        use_transceiver=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests for _compute_scheduled_tokens with KV cache reuse chunk-shift logic
 # ---------------------------------------------------------------------------

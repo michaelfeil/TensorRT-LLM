@@ -4814,7 +4814,8 @@ class PyExecutor:
         request.state = LlmRequestState.DISAGG_TRANS_ERROR
 
     @nvtx_range("_check_kv_transfer_timeout")
-    def _check_kv_transfer_timeout(self):
+    def _check_kv_transfer_timeout(self, context_requests=None):
+        """Check generation, or explicitly supplied post-poll context requests."""
         if not self.kv_cache_transceiver:
             return
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
@@ -4840,12 +4841,13 @@ class PyExecutor:
                 else:
                     newly_timed_out_context_requests.append(req)
 
-        for req in self.async_transfer_manager.requests_in_transfer().values():
-            flag_if_kv_transfer_timed_out(req, "context")
-
-        for req in self.active_requests:
-            if req.is_disagg_generation_transmission_in_progress:
-                flag_if_kv_transfer_timed_out(req, "generation")
+        if context_requests is None:
+            for req in self.active_requests:
+                if req.is_disagg_generation_transmission_in_progress:
+                    flag_if_kv_transfer_timed_out(req, "generation")
+        else:
+            for req in context_requests.values():
+                flag_if_kv_transfer_timed_out(req, "context")
 
         observer = self._py_executor_observer
         use_transceiver = observer.should_record_synthetic_kv_transfer_events_in_transceiver(
@@ -4860,6 +4862,9 @@ class PyExecutor:
             newly_timed_out_generation_requests,
             kv_cache_transceiver=self.kv_cache_transceiver,
             use_transceiver=use_transceiver)
+
+        if context_requests is not None:
+            return
 
         if not any(req.py_kv_transfer_timed_out
                    for req in self.active_requests):
@@ -5617,6 +5622,10 @@ class PyExecutor:
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
+        # Reap completed sends before classifying pending transfers as timed
+        # out. This reuses the existing status poll rather than adding another
+        # consensus round.
+        self._check_kv_transfer_timeout(requests_in_transfer)
         if requests_in_transfer:
             reason = ("context_transfer_wait"
                       if atLeastNum > 0 else "context_transfer_poll")
