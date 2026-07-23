@@ -68,12 +68,15 @@ from tensorrt_llm._torch.disaggregation.b10.planning import (
 )
 from tensorrt_llm._torch.disaggregation.b10.pools import (
     _DEFAULT_RECV_SCRATCH_MIN_SPANS,
+    _STAGING_VIEW_AM_DIRECT,
+    _AmStagingAllocator,
     _format_cuda_scratch_pool_state,
     _format_staging_pool_state,
     _ready_event_for_copy_events,
     _record_cuda_copy_events,
 )
 from tensorrt_llm._torch.disaggregation.b10.protocol import (
+    _AM_HEADER_SIZE,
     _AM_KIND_READY,
     _AM_KIND_RESULT,
     _B10_PROTOCOL,
@@ -332,12 +335,14 @@ class RecvPipeline:
         tracer: TransferTracer,
         dispatcher: B10AmDispatcher,
         ucxx: Any,
+        am_staging_allocator: Optional[_AmStagingAllocator] = None,
     ):
         self._core = core
         self._copies = copies
         self._tracer = tracer
         self._dispatcher = dispatcher
         self._ucxx = ucxx
+        self._am_staging_allocator = am_staging_allocator
         # Reverse (READY/RESULT) endpoints toward senders, keyed by the
         # sender's worker address blob carried in each control message.
         # Worker-address endpoints, same as the send side, so replies are
@@ -831,6 +836,15 @@ class RecvPipeline:
                 f"B10 failed to send failure READY for transfer {ctx.transfer_id}: {reply_exc}"
             )
 
+    def _claim_am_staging(self, payload: memoryview) -> Optional[_BufferView]:
+        """Claim the staging-pool view an AM message was received into, if
+        the AM staging allocator served that receive. The allocation starts
+        at the in-band header, `_AM_HEADER_SIZE` bytes before the payload."""
+        if self._am_staging_allocator is None or len(payload) == 0:
+            return None
+        payload_ptr = torch.frombuffer(payload, dtype=torch.uint8).data_ptr()
+        return self._am_staging_allocator.claim(payload_ptr - _AM_HEADER_SIZE)
+
     async def _receive_one(self, ctx: _RecvTransfer, chunk: _TransferChunk, idx: int) -> None:
         try:
             # Wait for this chunk's AM delivery before taking a staging
@@ -845,35 +859,49 @@ class RecvPipeline:
                     f"B10 recv transfer {ctx.transfer_id} chunk {idx} size "
                     f"mismatch: header/payload {len(payload)} B, plan {chunk.size} B"
                 )
-            try:
-                with ctx.trace.measure("staging_acquire"):
-                    staging_view = await self._core._acquire_staging_buffer(
-                        chunk.size, ctx.deadline
-                    )
-            except Exception as exc:
-                logger.warning(
-                    f"B10 recv transfer {ctx.transfer_id} failed to acquire "
-                    f"staging buffer: chunk_index={idx} "
-                    f"chunk_size={chunk.size} "
-                    f"data_chunks={ctx.wire_chunk_count} "
-                    f"error={type(exc).__name__}: {exc} "
-                    f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
+            claimed_view = self._claim_am_staging(payload)
+            if claimed_view is not None:
+                # The AM allocator already landed this message in a pinned
+                # staging buffer: slice the payload region out (the in-band
+                # header occupies the first _AM_HEADER_SIZE bytes) and skip
+                # both the staging acquire and the copy-in below.
+                staging_view = _BufferView(
+                    buffer=claimed_view.buffer[_AM_HEADER_SIZE : _AM_HEADER_SIZE + chunk.size],
+                    owner=claimed_view.owner,
+                    pool=claimed_view.pool,
+                    metadata={_STAGING_VIEW_AM_DIRECT: True},
                 )
-                raise
+            else:
+                try:
+                    with ctx.trace.measure("staging_acquire"):
+                        staging_view = await self._core._acquire_staging_buffer(
+                            chunk.size, ctx.deadline
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"B10 recv transfer {ctx.transfer_id} failed to acquire "
+                        f"staging buffer: chunk_index={idx} "
+                        f"chunk_size={chunk.size} "
+                        f"data_chunks={ctx.wire_chunk_count} "
+                        f"error={type(exc).__name__}: {exc} "
+                        f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
+                    )
+                    raise
             ctx.staging_tracker.track(staging_view)
             spans = ctx.chunk_dst_spans[idx]
             use_request_level_chunk = idx in ctx.request_level_scatter_chunk_indices
             use_recv_scratch = use_request_level_chunk or self._should_use_recv_scratch(
                 ctx.dst_descs, ctx.dst_type, spans, descs_have_overlap=ctx.dst_descs_have_overlap
             )
-            # Host-to-pinned-host copy out of the ucxx AM buffer; the copy
-            # engine's async H2D path requires pinned staging, which the
-            # ucxx eager buffer is not. Dropping the future's payload ref
-            # afterwards releases the ucxx buffer promptly.
-            with ctx.trace.measure("h2scratch"):
-                staging_view.buffer[: chunk.size].copy_(
-                    torch.frombuffer(payload, dtype=torch.uint8)
-                )
+            if claimed_view is None:
+                # Host-to-pinned-host copy out of the ucxx AM buffer; the
+                # copy engine's async H2D path requires pinned staging, which
+                # the ucxx-internal buffer is not. Dropping the future's
+                # payload ref afterwards releases the ucxx buffer promptly.
+                with ctx.trace.measure("h2scratch"):
+                    staging_view.buffer[: chunk.size].copy_(
+                        torch.frombuffer(payload, dtype=torch.uint8)
+                    )
             ctx.am_chunks.pop(idx, None)
             del payload
             await ctx.received_chunks.put(

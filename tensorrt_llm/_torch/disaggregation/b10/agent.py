@@ -34,6 +34,7 @@ from tensorrt_llm._torch.disaggregation.b10.kernels import (
     _warm_scatter_kernels,
 )
 from tensorrt_llm._torch.disaggregation.b10.pools import (
+    _AmStagingAllocator,
     _CudaCopyStreamPool,
     _CudaScratchBufferPool,
     _format_cuda_scratch_pool_state,
@@ -117,6 +118,13 @@ class B10CacheTransferAgent(BaseTransferAgent):
             buffer_size=pool_buffer_size,
         )
         staging_buffer_slots = asyncio.BoundedSemaphore(pool_num_buffers)
+        # Landing pad for eager AM receives (registered with the ucxx worker
+        # in _start_am_plane); a negative min-bytes knob disables it.
+        self._am_staging_allocator = (
+            _AmStagingAllocator(staging_buffer_pool, cfg.am_direct_staging_min_bytes)
+            if cfg.am_direct_staging_min_bytes >= 0
+            else None
+        )
         scratch_pool_num_buffers = cfg.recv_scratch_pool_num_buffers
         scratch_metadata_max_spans = cfg.recv_scratch_metadata_max_spans
         recv_scratch_buffer_pool = _CudaScratchBufferPool(
@@ -153,6 +161,7 @@ class B10CacheTransferAgent(BaseTransferAgent):
             self._tracer,
             self._dispatcher,
             self._ucxx,
+            am_staging_allocator=self._am_staging_allocator,
         )
         self._send = SendPipeline(
             self._core,
@@ -335,6 +344,16 @@ class B10CacheTransferAgent(BaseTransferAgent):
         # addresses (the only endpoint kind UCX failover supports), and all
         # inbound messages arrive via the worker-scoped AM receiver callback.
         self._dispatcher.attach(self._ucxx)
+        register_am_host_allocator = getattr(self._ucxx, "register_am_host_allocator", None)
+        if self._am_staging_allocator is not None and register_am_host_allocator is not None:
+            # Eager AM receives land directly in pinned staging buffers,
+            # skipping the ucxx-internal host buffer and the copy out of it.
+            register_am_host_allocator(self._am_staging_allocator.allocate)
+        elif self._am_staging_allocator is not None:
+            logger.info(
+                "B10 ucxx module has no register_am_host_allocator; AM "
+                "receives use ucxx-internal buffers plus a staging copy"
+            )
         return B10AgentDescriptor(
             name=self.name,
             host=self._ucxx.get_address(ifname=self._advertised_ifname),

@@ -218,3 +218,94 @@ async def test_dispatcher_drops_truncated_and_runt_messages():
         _fake_request(_pack_am_header(_AM_KIND_DATA, 3, 0, 1, 100) + b"only-a-few"), 0
     )
     assert sink_calls == []
+
+
+def _staging_pool(num_buffers: int = 2, buffer_size: int = 4096):
+    from tensorrt_llm._torch.disaggregation.b10.pools import _PinnedStagingBufferPool
+
+    return _PinnedStagingBufferPool(num_buffers=num_buffers, buffer_size=buffer_size)
+
+
+def test_am_staging_allocator_serves_and_claim_transfers_ownership():
+    from tensorrt_llm._torch.disaggregation.b10.pools import _AmStagingAllocator
+
+    pool = _staging_pool()
+    allocator = _AmStagingAllocator(pool, min_bytes=64)
+
+    array = allocator.allocate(1000)
+    assert array is not None and array.nbytes == 1000
+    assert pool.snapshot()["checked_out"] == 1
+
+    array[:4] = list(b"b10a")
+    view = allocator.claim(array.ctypes.data)
+    assert view is not None
+    assert bytes(view.buffer[:4].numpy()) == b"b10a"
+    # Claimed: the buffer's death must not return the view to the pool...
+    del array
+    assert pool.snapshot()["checked_out"] == 1
+    # ...only the claimer's release does.
+    pool.release([view])
+    assert pool.snapshot()["checked_out"] == 0
+
+    # A claim only succeeds once, and unknown addresses are not ours.
+    assert allocator.claim(view.buffer.data_ptr()) is None
+    assert allocator.claim(0) is None
+
+
+def test_am_staging_allocator_declines_unservable_sizes():
+    from tensorrt_llm._torch.disaggregation.b10.pools import _AmStagingAllocator
+
+    pool = _staging_pool(num_buffers=1, buffer_size=4096)
+    allocator = _AmStagingAllocator(pool, min_bytes=64)
+
+    assert allocator.allocate(63) is None  # below the DATA-size gate
+    assert allocator.allocate(4097) is None  # larger than a pool buffer
+    held = allocator.allocate(64)
+    assert held is not None
+    assert allocator.allocate(64) is None  # pool momentarily empty
+
+
+def test_am_staging_allocator_returns_unclaimed_buffer_on_release():
+    from tensorrt_llm._torch.disaggregation.b10.pools import _AmStagingAllocator
+
+    pool = _staging_pool(num_buffers=1)
+    allocator = _AmStagingAllocator(pool, min_bytes=64)
+
+    # A message that is never claimed (e.g. stale DATA for a failed
+    # transfer): dropping the last reference must return the pool buffer.
+    array = allocator.allocate(128)
+    assert array is not None
+    del array
+    assert pool.snapshot()["checked_out"] == 0
+    assert allocator.allocate(128) is not None
+
+
+def test_release_staging_slots_skips_am_direct_views():
+    import threading
+
+    from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
+    from tensorrt_llm._torch.disaggregation.b10.memory import _BufferView
+    from tensorrt_llm._torch.disaggregation.b10.pools import _STAGING_VIEW_AM_DIRECT
+
+    pool = _staging_pool()
+    slots = threading.BoundedSemaphore(1)
+    core = types.SimpleNamespace(
+        staging_buffer_pool=pool,
+        staging_buffer_slots=slots,
+        _event_ready_for_slot_release=_AgentCore._event_ready_for_slot_release,
+    )
+
+    normal = pool.acquire(100)
+    slots.acquire()
+    direct = _BufferView(
+        buffer=normal.buffer,
+        owner=normal.owner,
+        pool=pool,
+        metadata={_STAGING_VIEW_AM_DIRECT: True},
+    )
+    # The am-direct view took no slot permit, so none is returned for it;
+    # the normal view's permit is. A second release for the am-direct view
+    # would raise ValueError on the bounded semaphore.
+    _AgentCore._release_staging_slots_for_views(core, [direct, normal])
+    with pytest.raises(ValueError):
+        slots.release()

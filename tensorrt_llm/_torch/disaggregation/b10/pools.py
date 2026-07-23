@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import threading
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -31,6 +32,10 @@ from tensorrt_llm._torch.disaggregation.b10.planning import _scatter_program_cou
 from tensorrt_llm._utils import prefer_pinned
 
 _DEFAULT_STAGING_POOL_NUM_BUFFERS = 32
+# Metadata key marking a staging view delivered directly by the AM staging
+# allocator: it was checked out without a staging-slot permit, so releasing
+# it must not return one.
+_STAGING_VIEW_AM_DIRECT = "am_direct"
 _DEFAULT_STAGING_POOL_BUFFER_SIZE = 512 * 1024 * 1024
 _DEFAULT_RECV_SCRATCH_MIN_SPANS = 8
 _DEFAULT_RECV_SCRATCH_METADATA_BYTES_PER_SPAN = 1024 * 1024
@@ -323,6 +328,20 @@ class _PinnedStagingBufferPool:
             self._checked_out += 1
             return _BufferView(owner[:size], owner, self)
 
+    def try_acquire(self, size: int) -> Optional[_BufferView]:
+        """Non-blocking `acquire`: None instead of raising when no buffer
+        fits or none is available. Safe to call from any thread, including
+        the ucxx progress thread."""
+        if size < 0 or size > self._buffer_size:
+            return None
+        with self._lock:
+            self._collect_ready_locked()
+            if not self._available:
+                return None
+            owner = self._available.pop()
+            self._checked_out += 1
+            return _BufferView(owner[:size], owner, self)
+
     def release(self, views: list[_BufferView]) -> None:
         with self._lock:
             for view in views:
@@ -435,6 +454,64 @@ class _PinnedStagingBufferPool:
     @staticmethod
     def _allocate(size: int) -> torch.Tensor:
         return torch.empty((size,), dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned())
+
+
+class _AmStagingAllocator:
+    """Serves ucxx AM receive allocations straight from the pinned staging
+    pool, so DATA messages land in B10 staging memory instead of a
+    ucxx-internal host buffer that the recv path would immediately copy out
+    of.
+
+    `allocate` runs on the ucxx progress thread and must never block: it
+    declines (returns None, making ucxx fall back to its internal host
+    allocation, and the recv path to its copy-in) whenever the message is too
+    small to be a DATA payload, too large for a pool buffer, or the pool is
+    momentarily empty.
+
+    Views handed out here bypass the staging-slot semaphore — the allocation
+    happens before any transfer claims it — so claimed views carry the
+    `_STAGING_VIEW_AM_DIRECT` metadata mark and skip the slot release.
+    """
+
+    def __init__(self, pool: _PinnedStagingBufferPool, min_bytes: int):
+        self._pool = pool
+        self._min_bytes = min_bytes
+        self._lock = threading.Lock()
+        # Allocation base address -> checked-out pool view, until claimed by
+        # the transfer that received into it or returned by _on_buffer_dead.
+        self._outstanding: dict[int, _BufferView] = {}
+
+    def allocate(self, size: int) -> Optional[Any]:
+        if size < self._min_bytes or size > self._pool.buffer_size:
+            return None
+        view = self._pool.try_acquire(size)
+        if view is None:
+            return None
+        # ucxx needs the buffer protocol, which torch tensors lack; the
+        # numpy view shares the pinned tensor's memory.
+        array = view.buffer.numpy()
+        base_ptr = int(view.buffer.data_ptr())
+        with self._lock:
+            self._outstanding[base_ptr] = view
+        # If the message is never claimed (e.g. stale DATA for a transfer
+        # that already failed), the pool buffer must go back once ucxx drops
+        # its receive buffer. The view-identity check makes the finalizer a
+        # no-op after a claim, even if the same owner buffer has since been
+        # reissued at the same address.
+        weakref.finalize(array, self._on_buffer_dead, base_ptr, view)
+        return array
+
+    def claim(self, base_ptr: int) -> Optional[_BufferView]:
+        """Take over the pool view backing an AM receive, if it is ours."""
+        with self._lock:
+            return self._outstanding.pop(base_ptr, None)
+
+    def _on_buffer_dead(self, base_ptr: int, view: _BufferView) -> None:
+        with self._lock:
+            if self._outstanding.get(base_ptr) is not view:
+                return
+            del self._outstanding[base_ptr]
+        self._pool.release([view])
 
 
 def _ready_event_for_copy_events(events: list[Any]) -> Optional[Any]:

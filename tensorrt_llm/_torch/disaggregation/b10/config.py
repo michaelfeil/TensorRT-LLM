@@ -36,6 +36,10 @@ _DEFAULT_MAX_IN_FLIGHT_OPS = 64
 # concurrency of 1 for the same reason). Small transfers bypass the gate.
 _DEFAULT_SEND_ADMISSION_LIMIT = 3
 _DEFAULT_SEND_ADMISSION_BYPASS_BYTES = 512 * 1024 * 1024
+# Smallest AM message the receive-side staging allocator serves from the
+# pinned staging pool; smaller messages (control/READY/RESULT) use ucxx's
+# internal host allocation so they never tie up a whole staging buffer.
+_DEFAULT_AM_DIRECT_STAGING_MIN_BYTES = 1024 * 1024
 _TRACE_TRANSFERS_ENV = "TRTLLM_B10_UCXX_TRACE_TRANSFERS"
 _VALIDATE_SEND_SOURCE_ENV = "TRTLLM_B10_UCXX_VALIDATE_SEND_SOURCE"
 _TRACE_LEVEL_NONE = "none"
@@ -77,6 +81,7 @@ class B10AgentConfig:
     tag_quarantine_ttl_s: float
     staging_pool_num_buffers: int
     staging_pool_buffer_size: int
+    am_direct_staging_min_bytes: int
     send_admission_limit: int
     send_admission_bypass_bytes: int
     recv_scratch_pool_num_buffers: int
@@ -145,6 +150,12 @@ class B10AgentConfig:
             if staging_pool_buffer_size is None
             else staging_pool_buffer_size
         )
+        am_direct_staging_min_bytes = int(
+            os.getenv(
+                "TRTLLM_B10_UCXX_AM_DIRECT_STAGING_MIN_BYTES",
+                str(_DEFAULT_AM_DIRECT_STAGING_MIN_BYTES),
+            )
+        )
         admission_limit = (
             int(
                 os.getenv(
@@ -193,6 +204,7 @@ class B10AgentConfig:
             tag_quarantine_ttl_s=quarantine_ttl_s,
             staging_pool_num_buffers=pool_num_buffers,
             staging_pool_buffer_size=pool_buffer_size,
+            am_direct_staging_min_bytes=am_direct_staging_min_bytes,
             send_admission_limit=admission_limit,
             send_admission_bypass_bytes=admission_bypass_bytes,
             recv_scratch_pool_num_buffers=scratch_pool_num_buffers,

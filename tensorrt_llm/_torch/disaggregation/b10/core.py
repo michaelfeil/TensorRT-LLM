@@ -34,6 +34,7 @@ from tensorrt_llm._torch.disaggregation.b10.async_utils import (
 from tensorrt_llm._torch.disaggregation.b10.config import B10AgentConfig
 from tensorrt_llm._torch.disaggregation.b10.memory import _BufferView
 from tensorrt_llm._torch.disaggregation.b10.pools import (
+    _STAGING_VIEW_AM_DIRECT,
     _CudaCopyStreamPool,
     _CudaScratchBufferPool,
     _format_staging_pool_state,
@@ -118,6 +119,11 @@ class _AgentCore:
     def _release_staging_slots_for_views(self, views: list[_BufferView]) -> None:
         for view in views:
             if view.pool is not self.staging_buffer_pool:
+                continue
+            if view.metadata and view.metadata.get(_STAGING_VIEW_AM_DIRECT):
+                # Delivered straight into staging by the AM allocator: no
+                # slot permit was taken for it, so none goes back. The pool
+                # checkout itself is still released/quarantined normally.
                 continue
             event = view.ready_event
             if event is not None and not self._event_ready_for_slot_release(event, "staging"):

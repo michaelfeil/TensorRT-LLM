@@ -13,7 +13,7 @@ set -ex
 # carries upstream (rapidsai/nvidia) repos, not this fork. The rapids-cmake
 # fetch below still honors GITHUB_MIRROR.
 UCXX_REPO="${UCXX_REPO:-https://github.com/basetenlabs/ucxx.git}"
-UCXX_COMMIT="6c6d7015c4bb08949c294c61e7c3e715adb43fd9"
+UCXX_COMMIT="2819b4d26e2dab7e0676a81326138278c7b987ec"
 UCXX_INSTALL_PREFIX="${UCXX_INSTALL_PREFIX:-/usr/local}"
 UCX_INSTALL_PATH="${UCX_INSTALL_PATH:-/usr/local/ucx}"
 UCXX_SOURCE_PATH="${UCXX_SOURCE_PATH:-/tmp/ucxx-python-src}"
