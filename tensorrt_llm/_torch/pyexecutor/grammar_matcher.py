@@ -69,6 +69,39 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
         super().__init__()
         if tokenizer is not None:
             hf_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+            # [B10FIX] transformers 5.5.x AutoTokenizer returns a generic
+            # TokenizersBackend that mislabels Kimi special-token ids
+            # (</think> -> 163604 instead of the real 163607). xgrammar then
+            # masks the real </think>=163607 to -inf, so the model can never
+            # end thinking (tool_calls loop, finish_reason=length). Mirror the
+            # frontend `_load_frontend_tokenizer`: force the remote
+            # TikTokenTokenizer when the tokenizer config declares it, so the
+            # grammar is compiled on the correct token ids. Best-effort: any
+            # failure falls through to the original tokenizer.
+            try:
+                from transformers.dynamic_module_utils import \
+                    get_class_from_dynamic_module
+                from transformers.models.auto.tokenization_auto import \
+                    get_tokenizer_config
+                _nm = getattr(hf_tokenizer, "name_or_path", None) or getattr(
+                    tokenizer, "name_or_path", None)
+                if _nm and type(hf_tokenizer).__name__ != "TikTokenTokenizer":
+                    _cfg = get_tokenizer_config(_nm, trust_remote_code=True)
+                    if _cfg.get("tokenizer_class") == "TikTokenTokenizer":
+                        _am = _cfg.get("auto_map", {}).get("AutoTokenizer")
+                        _ref = (next(
+                            (e for e in _am if isinstance(e, str)), None)
+                                if isinstance(_am, (list, tuple)) else _am)
+                        if isinstance(_ref, str):
+                            _cls = get_class_from_dynamic_module(_ref, _nm)
+                            hf_tokenizer = _cls.from_pretrained(_nm)
+                            import logging as _lg
+                            _lg.getLogger(__name__).warning(
+                                "[B10FIX] xgrammar: forced TikTokenTokenizer for %s (</think>=%s)",
+                                _nm,
+                                hf_tokenizer.convert_tokens_to_ids("</think>"))
+            except Exception:
+                pass
             tokenizer_info = xgrammar.TokenizerInfo.from_huggingface(
                 hf_tokenizer,
                 vocab_size=vocab_size_padded,
