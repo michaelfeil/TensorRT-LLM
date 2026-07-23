@@ -5,15 +5,17 @@
 
 set -ex
 
-# basetenlabs/ucxx fork: rapidsai/ucxx v0.50.00 (cf34a4e) + the AM
-# receiver-callback Python binding and opt-in UCP failover error-handling
-# mode that the B10 AM KV-transfer wire plane depends on. See
-# basetenlabs/ucxx#1 (branch wilson/am-receiver-callback, base release-0.50).
+# basetenlabs/ucxx fork: rapidsai/ucxx v0.50.00 (cf34a4e) + the pieces the
+# B10 AM KV-transfer wire plane depends on: the AM receiver-callback Python
+# binding and opt-in UCP failover error-handling mode (basetenlabs/ucxx#1),
+# the AM host allocator used for direct-to-staging receives
+# (basetenlabs/ucxx#2), and the cancelation-path fix for the progress-loop
+# runaway under transfer-failure storms (basetenlabs/ucxx#3).
 # Cloned from github.com directly, NOT via GITHUB_MIRROR: the mirror only
 # carries upstream (rapidsai/nvidia) repos, not this fork. The rapids-cmake
 # fetch below still honors GITHUB_MIRROR.
 UCXX_REPO="${UCXX_REPO:-https://github.com/basetenlabs/ucxx.git}"
-UCXX_COMMIT="2819b4d26e2dab7e0676a81326138278c7b987ec"
+UCXX_COMMIT="3307d3857f77a2160a32998ad3b099993e71605f"
 UCXX_INSTALL_PREFIX="${UCXX_INSTALL_PREFIX:-/usr/local}"
 UCX_INSTALL_PATH="${UCX_INSTALL_PATH:-/usr/local/ucx}"
 UCXX_SOURCE_PATH="${UCXX_SOURCE_PATH:-/tmp/ucxx-python-src}"
