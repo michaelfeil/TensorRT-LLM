@@ -59,6 +59,7 @@ from . import hbm_stats
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
+from .dynamic_profiler import DYNAMIC_PROFILE_DIR_ENV, DynamicProfilerSession
 from .error_classification import ErrorBudget, TokenBudgetExceededError
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
@@ -1244,6 +1245,18 @@ class PyExecutor:
                                                     record_shapes=True,
                                                     with_modules=True)
 
+        dynamic_dir = os.environ.get(DYNAMIC_PROFILE_DIR_ENV)
+        dynamic_session = None
+        if dynamic_dir and not enable_torch_trace and profile_start_stop is None:
+            try:
+                dynamic_session = DynamicProfilerSession(
+                    dynamic_dir, self.global_rank)
+            except Exception as e:
+                # e.g. unwritable dir or bad cap env; never block serving.
+                logger.error(
+                    f"Dynamic profiler init failed, continuing without: {e}")
+                dynamic_session = None
+
         log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
         if log_ranks_str.strip().lower() == "all":
             log_all_ranks = True
@@ -1336,6 +1349,9 @@ class PyExecutor:
                     f"Profiling started at iteration {self.iter_counter}.")
                 enabled = True
 
+            if dynamic_session is not None and not self.is_warmup:
+                dynamic_session.step(self.iter_counter)
+
             # Notify host line profiler of iteration for iteration-aware profiling
             host_profiler = get_global_profiler()
             if host_profiler is not None:
@@ -1364,6 +1380,8 @@ class PyExecutor:
                                 f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
                 calibrator.stop()
+            if dynamic_session is not None:
+                dynamic_session.shutdown(self.iter_counter)
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
