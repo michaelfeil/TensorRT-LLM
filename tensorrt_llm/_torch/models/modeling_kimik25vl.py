@@ -15,7 +15,7 @@
 """Thin VLM wrapper for Kimi K2.5 with external vision encoder.
 
 The vision encoder runs as a separate service.  This model receives
-pre-computed multimodal embeddings via ``multimodal_data["inputs_embeds"]``
+pre-computed multimodal embeddings via ``multimodal_data["multimodal_embedding"]``
 and fuses them with text embeddings before forwarding to the DeepseekV3
 LLM backbone.
 """
@@ -62,25 +62,20 @@ def _get_kimi_mm_token_indices(
             cumsum = runtime.embed_mask_cumsum
             segment = cumsum[chunk_start:chunk_end]
             if segment.numel() > 0:
-                prev_value = (cumsum[chunk_start - 1]
-                              if chunk_start > 0 else segment.new_zeros(()))
+                prev_value = cumsum[chunk_start - 1] if chunk_start > 0 else segment.new_zeros(())
                 prev = torch.cat((prev_value.reshape(1), segment[:-1]))
-                chunk_indices = torch.nonzero(segment > prev,
-                                              as_tuple=False).flatten()
+                chunk_indices = torch.nonzero(segment > prev, as_tuple=False).flatten()
                 if chunk_indices.numel() > 0:
-                    indices.extend(
-                        (chunk_indices + flat_base).tolist())
+                    indices.extend((chunk_indices + flat_base).tolist())
             continue
 
-        if (runtime.multimodal_positions is None
-                or runtime.multimodal_lengths is None):
+        if runtime.multimodal_positions is None or runtime.multimodal_lengths is None:
             return None
 
         multimodal_data = param.multimodal_data or {}
         special_offsets = set(multimodal_data.get("special_token_offsets") or [])
         mm_offset = 0
-        for pos, length in zip(runtime.multimodal_positions,
-                               runtime.multimodal_lengths):
+        for pos, length in zip(runtime.multimodal_positions, runtime.multimodal_lengths):
             span_end = pos + length
             overlap_start = max(pos, chunk_start)
             overlap_end = min(span_end, chunk_end)
@@ -107,7 +102,8 @@ def _fuse_kimi_external_input_embeds(
         raise ValueError(
             "Kimi K2.5 multimodal token count mismatch: found "
             f"{len(mm_token_indices)} media tokens in input_ids "
-            f"but received {mm_embed.shape[0]} media embeddings.")
+            f"but received {mm_embed.shape[0]} media embeddings."
+        )
 
     safe_input_ids = input_ids.clamp(max=embedding_layer.num_embeddings - 1)
     input_embeds = embedding_layer(safe_input_ids)
@@ -154,7 +150,7 @@ class KimiK25VLModel(DeepseekV3ForCausalLM):
         kwargs.pop("mm_token_indices", None)
         mm_embeds: list[torch.Tensor] = []
         for mp in mm_params_list:
-            ie = mp.multimodal_data.get("inputs_embeds") if mp.multimodal_data else None
+            ie = mp.multimodal_data.get("multimodal_embedding") if mp.multimodal_data else None
             if ie is not None:
                 mm_embeds.append(ie)
 
@@ -162,13 +158,16 @@ class KimiK25VLModel(DeepseekV3ForCausalLM):
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_params_list)
 
         if mm_embeds and input_ids is not None:
-            mm_token_indices = _get_kimi_mm_token_indices(
-                mm_params_list, device=input_ids.device)
+            mm_token_indices = _get_kimi_mm_token_indices(mm_params_list, device=input_ids.device)
         else:
             mm_token_indices = None
 
-        if (mm_embeds and input_ids is not None and mm_token_indices is not None
-                and mm_token_indices.shape[0] == _num_kimi_mm_embeds(mm_embeds)):
+        if (
+            mm_embeds
+            and input_ids is not None
+            and mm_token_indices is not None
+            and mm_token_indices.shape[0] == _num_kimi_mm_embeds(mm_embeds)
+        ):
             fused_ids, fused_embeds = _fuse_kimi_external_input_embeds(
                 self.model.embed_tokens,
                 input_ids,

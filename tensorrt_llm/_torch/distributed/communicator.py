@@ -1,3 +1,4 @@
+import io
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
@@ -236,101 +237,137 @@ class Distributed(ABC):
         return [entry for tp_group in obj for entry in tp_group]
 
 
-def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+# Smaller buffers stay in-band to avoid per-buffer collective latency.
+_OOB_BUFFER_MIN_BYTES = 64 * 1024
+
+
+def _rebuild_cpu_tensor(buffer, dtype_str: str, shape: Tuple[int, ...],
+                        stride: Tuple[int, ...]) -> torch.Tensor:
+    """Rebuild a CPU tensor as a zero-copy view over a received buffer."""
+    dtype = getattr(torch, dtype_str)
+    return torch.frombuffer(buffer, dtype=torch.uint8).view(dtype).as_strided(
+        shape, stride)
+
+
+class _TensorOOBPickler(pickle.Pickler):
+    """Move eligible CPU tensor storage into pickle-5 buffers.
+
+    Unsupported tensor types and layouts use torch's default reduction. The
+    NumPy view keeps reducer-created tensors alive and makes their storage
+    non-resizable.
     """
-    Safely broadcasts potentially large objects by splitting into fixed-size chunks,
-    using raw-byte MPI.Bcast to avoid pickle5's out-of-band buffer allocations.
+
+    def reducer_override(self, obj):
+        if (type(obj) is not torch.Tensor or obj.device.type != "cpu"
+                or obj.layout != torch.strided or obj.requires_grad
+                or obj.is_conj() or obj.is_neg() or obj.is_quantized
+                or obj.is_nested or obj.numel() == 0 or not obj.is_contiguous()
+                or obj.__dict__ or obj.data_ptr() == 0):
+            return NotImplemented
+        # uint8 supports dtypes that NumPy cannot represent, such as bfloat16.
+        flat = obj.reshape(-1).view(torch.uint8).numpy()
+        return (_rebuild_cpu_tensor, (pickle.PickleBuffer(flat),
+                                      str(obj.dtype).removeprefix("torch."),
+                                      tuple(obj.shape), tuple(obj.stride())))
+
+
+def _dumps_with_oob_buffers(obj):
+    """Pickle an object and return its metadata and large buffer views."""
+    oob_buffers = []
+
+    def _keep_large_oob(pb: pickle.PickleBuffer):
+        raw = pb.raw()
+        if raw.nbytes < _OOB_BUFFER_MIN_BYTES:
+            return True
+        oob_buffers.append(raw)
+        return False
+
+    bio = io.BytesIO()
+    _TensorOOBPickler(bio,
+                      protocol=pickle.HIGHEST_PROTOCOL,
+                      buffer_callback=_keep_large_oob).dump(obj)
+    return bio.getbuffer(), oob_buffers
+
+
+def _bcast_view_chunked(comm, view, root: int, chunk_size: int) -> None:
+    """Broadcast a byte view in chunks of at most chunk_size bytes."""
+    offset = 0
+    while offset < view.nbytes:
+        size = min(chunk_size, view.nbytes - offset)
+        comm.Bcast([view[offset:offset + size], MPI.BYTE], root=root)
+        offset += size
+
+
+def _broadcast_metadata(comm, obj, root: int, chunk_size: int):
+    """Broadcast pickle metadata and allocate large-buffer destinations."""
+    rank = comm.Get_rank()
+    header = np.zeros(3, dtype=np.int64)
+    if rank == root:
+        try:
+            metadata, buffers = _dumps_with_oob_buffers(obj)
+            header[:] = (1, metadata.nbytes, len(buffers))
+        except Exception as e:
+            header[:] = (0, 0, 0)
+            comm.Bcast([header, MPI.INT64_T], root=root)
+            raise RuntimeError(f"Serialization failed: {str(e)}") from e
+
+    comm.Bcast([header, MPI.INT64_T], root=root)
+    ok, metadata_size, num_buffers = map(int, header)
+    if not ok:
+        raise RuntimeError("Root rank failed during serialization")
+
+    if num_buffers:
+        if rank == root:
+            buffer_sizes = np.array([buffer.nbytes for buffer in buffers],
+                                    dtype=np.int64)
+        else:
+            buffer_sizes = np.empty(num_buffers, dtype=np.int64)
+        comm.Bcast([buffer_sizes, MPI.INT64_T], root=root)
+    else:
+        buffer_sizes = ()
+
+    if rank == root:
+        _bcast_view_chunked(comm, metadata, root, chunk_size)
+        return None, buffers
+
+    metadata = np.empty(metadata_size, dtype=np.uint8)
+    buffers = [np.empty(int(size), dtype=np.uint8) for size in buffer_sizes]
+    _bcast_view_chunked(comm, memoryview(metadata), root, chunk_size)
+    return metadata, buffers
+
+
+def _loads_with_buffers(metadata, buffers):
+    try:
+        return pickle.loads(metadata, buffers=buffers)  # nosec B301
+    except Exception as e:
+        raise RuntimeError(f"Deserialization failed: {str(e)}") from e
+
+
+def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+    """Broadcast an object with large pickle buffers transferred separately.
 
     Args:
-        comm: communicator to broadcast
-        obj: Python object to broadcast
-        root: Rank of the broadcasting process
-        chunk_size: Maximum size of each chunk in bytes (default: 4MB)
+        comm: Communicator to broadcast over.
+        obj: Python object to broadcast.
+        root: Rank of the broadcasting process.
+        chunk_size: Maximum size of each blocking transfer in bytes.
 
     Returns:
-        The broadcasted object on all ranks
+        The broadcast object on all ranks. The root returns `obj` itself.
     """
     if not ENABLE_MULTI_DEVICE:
         return obj
-    if ENABLE_MULTI_DEVICE and MPI is None:
+    if MPI is None:
         raise RuntimeError(
             "mpi4py is required when ENABLE_MULTI_DEVICE is True")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
+
     rank = comm.Get_rank()
-
-    # ---- Serialization phase (root only) ----
-    # Header layout: [ok_flag, total_size, num_chunks] as int64
-    header = np.zeros(3, dtype=np.int64)
-    if rank == root:
-        try:
-            serialized = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-            total_size = len(serialized)
-            num_chunks = math.ceil(total_size /
-                                   chunk_size) if total_size > 0 else 0
-            header[:] = (1, total_size, num_chunks)
-        except Exception as e:
-            # Signal failure to all ranks, then raise
-            header[:] = (0, 0, 0)
-            comm.Bcast([header, MPI.INT64_T], root=root)
-            raise RuntimeError(f"Serialization failed: {str(e)}") from e
-    else:
-        serialized = None  # not used on non-root before Bcast
-
-    # ---- Metadata broadcast (Bcast the fixed-size header) ----
-    comm.Bcast([header, MPI.INT64_T], root=root)
-    ok_flag, total_size, num_chunks = int(header[0]), int(header[1]), int(
-        header[2])
-    if not ok_flag:
-        raise RuntimeError("Root rank failed during serialization")
-
-    # ---- Allocate receive buffer (non-root) or build a view (root) ----
-    # We broadcast raw bytes chunk by chunk.
-    if rank == root:
-        src_view = memoryview(serialized)
-        dst_buf = None
-        dst_view = None
-    else:
-        # Pre-allocate a contiguous byte buffer to receive the payload
-        dst_buf = bytearray(total_size)
-        dst_view = memoryview(dst_buf)
-        src_view = None  # not used on non-root
-
-    # ---- Chunked raw-byte broadcast with MPI.Bcast ----
-    # Each round sends exactly `cur` bytes of the global payload.
-    offset = 0
-    for i in range(num_chunks):
-        cur = min(chunk_size, total_size - offset)
-        if cur <= 0:
-            break  # safety guard for zero-size payloads
-
-        if rank == root:
-            # Root sends a slice of the source view
-            part = src_view[offset:offset + cur]
-            comm.Bcast([part, MPI.BYTE], root=root)
-        else:
-            # Non-root receives directly into the destination view
-            part = dst_view[offset:offset + cur]
-            comm.Bcast([part, MPI.BYTE], root=root)
-
-        offset += cur
-
-    # ---- Reconstruction and deserialization ----
-    # Validate the received byte count and unpickle.
-    if rank == root:
-        # Root already has the object; deserializing its own bytes would only
-        # produce an equivalent copy while holding the GIL for O(payload).
-        # Callers receive the original (same as the world_size == 1 path).
-        return obj
-    else:
-        if len(dst_buf) != total_size:
-            raise RuntimeError(
-                f"Data size mismatch at rank {rank}: expected {total_size}, got {len(dst_buf)}"
-            )
-        try:
-            return pickle.loads(dst_buf)  # nosec B301
-        except Exception as e:
-            raise RuntimeError(f"Deserialization failed: {str(e)}") from e
+    metadata, buffers = _broadcast_metadata(comm, obj, root, chunk_size)
+    for buffer in buffers:
+        _bcast_view_chunked(comm, memoryview(buffer), root, chunk_size)
+    return obj if rank == root else _loads_with_buffers(metadata, buffers)
 
 
 def _allgather_int64_values(comm, values: List[int], size: int) -> np.ndarray:
@@ -666,6 +703,7 @@ class MPIDist(Distributed):
         self._cp_comm = None
         self._tp_comm = None
         self._pp_comm = None
+        self._device_broadcast_comm = None
 
     def _validate_world_size(self):
         """Validate world size before creating sub-communicators to prevent segfaults."""
@@ -683,6 +721,13 @@ class MPIDist(Distributed):
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+
+    def broadcast_device(self, tensor: torch.Tensor, root: int = 0) -> None:
+        """Broadcast a CUDA tensor on a communicator reserved for payloads."""
+        if self._device_broadcast_comm is None:
+            self._device_broadcast_comm = torch.classes.trtllm.NcclCommunicatorOp(
+                self.world_size, self.rank)
+        self._device_broadcast_comm.broadcast(tensor, root)
 
     def allgather(self, obj):
         return mpi_allgather(obj)

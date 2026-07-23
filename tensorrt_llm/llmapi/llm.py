@@ -825,7 +825,8 @@ class BaseLLM:
             multimodal_data = {}
             multimodal_input_obj = None
             if inputs.get("inputs_embeds") is not None:
-                multimodal_data["inputs_embeds"] = inputs["inputs_embeds"]
+                multimodal_data["multimodal_embedding"] = inputs[
+                    "inputs_embeds"]
                 mm_pos = inputs.get("multimodal_positions")
                 mm_len = inputs.get("multimodal_lengths")
                 mm_hash = inputs.get("multimodal_hashes")

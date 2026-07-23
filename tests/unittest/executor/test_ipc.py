@@ -1,10 +1,13 @@
 import asyncio
+import hashlib
 import time
 from threading import Thread
 
 import pytest
+import torch
 import zmq
 
+from tensorrt_llm.executor import ipc as ipc_module
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
 
@@ -45,8 +48,88 @@ class TestIpcBasics:
             server.put(response)
             received = client.get()
             assert received == response
+
+            tensor = torch.arange(64 * 1024, dtype=torch.float32)
+            client.put(tensor)
+            assert torch.equal(server.get(), tensor)
         finally:
             client.close()
+            server.close()
+
+    @pytest.mark.parametrize(
+        "parallel",
+        [False, True],
+        ids=["single-thread", "parallel"],
+    )
+    def test_multipart_authentication(self, monkeypatch, parallel):
+        """Multipart authentication covers contents and frame boundaries."""
+        hmac_digest = ipc_module.hmac.digest
+        hmac_digest_calls = 0
+
+        def counting_hmac_digest(*args, **kwargs):
+            nonlocal hmac_digest_calls
+            hmac_digest_calls += 1
+            return hmac_digest(*args, **kwargs)
+
+        monkeypatch.setattr(ipc_module.hmac, "digest", counting_hmac_digest)
+        monkeypatch.setattr(
+            ipc_module,
+            "_BLAKE3_PARALLEL_MIN_FRAME_BYTES",
+            1 if parallel else 1 << 60,
+        )
+        server = ZeroMqQueue(
+            address=("tcp://127.0.0.1:*", b"short-test-key"),
+            socket_type=zmq.PAIR,
+            is_server=True,
+            name="multipart_server",
+            use_hmac_encryption=True,
+        )
+        try:
+            tensor = torch.arange(64 * 1024, dtype=torch.float32)
+            obj = (tensor, tensor + 1)
+            frames = server._prepare_frames(obj)
+            assert len(frames) == 3
+            monkeypatch.setattr(
+                ipc_module,
+                "_BLAKE3_PARALLEL_MIN_FRAME_BYTES",
+                1 << 60 if parallel else 1,
+            )
+            wire_frames = [zmq.Frame(bytes(frame)) for frame in frames]
+            received = server._parse_frames(wire_frames)
+            assert all(torch.equal(actual, expected) for actual, expected in zip(received, obj))
+
+            signed_metadata, buffer_0, buffer_1 = map(bytes, frames)
+            tag_size = hashlib.sha256().digest_size
+            metadata = signed_metadata[:-tag_size]
+            tag = signed_metadata[-tag_size:]
+            tampered_buffer = bytearray(buffer_0)
+            tampered_buffer[0] ^= 0xFF
+            attacks = [
+                [
+                    zmq.Frame(signed_metadata),
+                    zmq.Frame(tampered_buffer),
+                    zmq.Frame(buffer_1),
+                ],
+                [
+                    zmq.Frame(metadata + buffer_0[:1] + tag),
+                    zmq.Frame(buffer_0[1:]),
+                    zmq.Frame(buffer_1),
+                ],
+                [
+                    zmq.Frame(signed_metadata),
+                    zmq.Frame(buffer_1),
+                    zmq.Frame(buffer_0),
+                ],
+            ]
+            for attack in attacks:
+                with pytest.raises(RuntimeError, match="Message authentication failed"):
+                    server._parse_frames(attack)
+
+            assert hmac_digest_calls == 1
+            server.hmac_key = b"replacement-test-key"
+            server._frame_auth_tag((metadata, buffer_0, buffer_1))
+            assert hmac_digest_calls == 2
+        finally:
             server.close()
 
     def test_poll_timeout(self):
@@ -328,6 +411,10 @@ class TestIpcAsyncBasics:
             await server.put_async(response)
             received = await client.get_async()
             assert received == response
+
+            tensor = torch.arange(64 * 1024, dtype=torch.float32)
+            await client.put_async(tensor)
+            assert torch.equal(await server.get_async(), tensor)
         finally:
             client.close()
             server.close()

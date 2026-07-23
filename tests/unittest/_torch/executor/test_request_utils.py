@@ -6,12 +6,21 @@ This module tests:
 
 """
 
+import pickle  # nosec B403
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
+    RequestBroadcaster,
+    _device_tensor_view,
+    _DeviceTensorRef,
+    _layout_device_tensors,
+    _MultimodalTensorPacker,
+    _pack_multimodal_tensors,
+    _restore_device_tensors,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
     get_from_waiting_queue,
@@ -21,6 +30,143 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.mapping import CpType
+
+
+def _materialize_packed(value):
+    placements, total_bytes = _layout_device_tensors(value)
+    flat = torch.empty(total_bytes, dtype=torch.uint8)
+    views = {}
+    for ref, offset in placements:
+        assert ref.source is not None
+        view = _device_tensor_view(flat, ref, offset)
+        view.copy_(ref.source)
+        views[id(ref)] = view
+    return _restore_device_tensors(value, views)
+
+
+def test_multimodal_tensor_packer_preserves_cpu_metadata():
+    pixels = torch.arange(16 * 1024, dtype=torch.float32).reshape(128, 128)
+    cumsum = torch.arange(16 * 1024, dtype=torch.int32)
+    data = {
+        "image": {"pixel_values": pixels},
+        "multimodal_embed_mask_cumsum": cumsum,
+    }
+
+    packer = _MultimodalTensorPacker(device_paths=None)
+    packed = packer.pack(data)
+    restored = _materialize_packed(packed)
+    placements, _ = _layout_device_tensors(packed)
+
+    assert len(placements) == 1
+    assert torch.equal(restored["image"]["pixel_values"], pixels)
+    assert restored["multimodal_embed_mask_cumsum"] is cumsum
+
+
+def test_multimodal_tensor_packer_honors_device_paths_and_size_threshold():
+    large = torch.ones(16 * 1024, dtype=torch.float32)
+    small = torch.ones(32, dtype=torch.float32)
+    data = {
+        "image": {"pixel_values": [large, small], "image_grid_thw": large.clone()},
+        "audio": {"input_features": large.clone()},
+    }
+
+    packer = _MultimodalTensorPacker(device_paths=["image.pixel_values"])
+    packed = packer.pack(data)
+    placements, _ = _layout_device_tensors(packed)
+
+    assert len(placements) == 1
+    assert packed["image"]["pixel_values"][1] is small
+    assert packed["image"]["image_grid_thw"] is data["image"]["image_grid_thw"]
+    assert packed["audio"]["input_features"] is data["audio"]["input_features"]
+
+
+def test_multimodal_tensor_packer_packs_small_external_embeddings():
+    embedding = torch.ones((4, 7168), dtype=torch.bfloat16)
+    packed = _MultimodalTensorPacker(device_paths=[]).pack({"multimodal_embedding": embedding})
+
+    assert isinstance(packed["multimodal_embedding"], _DeviceTensorRef)
+
+
+def test_pack_multimodal_tensors_deduplicates_aliases():
+    embedding = torch.arange(16 * 1024, dtype=torch.float32)
+    py_objects = (
+        (
+            "py_multimodal_data",
+            {1: {"multimodal_embedding": embedding}, 2: {"multimodal_embedding": embedding}},
+        ),
+        ("py_num_logprobs", {1: 5}),
+    )
+
+    packed = _pack_multimodal_tensors(py_objects, ["multimodal_embedding"])
+    restored_by_request = _materialize_packed(packed[0][1])
+    received = pickle.loads(pickle.dumps(packed))
+    received_refs, _ = _layout_device_tensors(received[0][1])
+    root_refs, _ = _layout_device_tensors(packed[0][1])
+
+    assert len(root_refs) == 1
+    assert received_refs[0][0].source is None
+    assert (
+        restored_by_request[1]["multimodal_embedding"].data_ptr()
+        == restored_by_request[2]["multimodal_embedding"].data_ptr()
+    )
+    assert packed[1] == py_objects[1]
+
+
+def test_materialize_multimodal_tensors_accepts_binding_requests():
+    broadcaster = RequestBroadcaster(Mock(), Mock())
+    broadcaster._nccl_broadcast_enabled = True
+    request = Mock(spec=[])
+    item = Mock(is_normal_request=True, request=request)
+
+    broadcaster.materialize_multimodal_tensors([item])
+
+
+@pytest.mark.parametrize(
+    "rank_settings, expected_overlap",
+    [
+        ([(True, True), (True, True)], True),
+        ([(True, True), (True, False)], False),
+    ],
+)
+def test_nccl_multimodal_overlap_requires_all_ranks(monkeypatch, rank_settings, expected_overlap):
+    monkeypatch.setenv("NCCL_LAUNCH_ORDER_IMPLICIT", "1")
+    dist = Mock(has_pp=False)
+    dist.allgather.return_value = rank_settings
+    broadcaster = RequestBroadcaster(dist, Mock(), execution_stream=Mock())
+
+    with patch("torch.cuda.is_available", return_value=True):
+        assert broadcaster._use_nccl_broadcast()
+
+    dist.allgather.assert_called_once_with((True, True))
+    assert broadcaster._nccl_broadcast_overlap_enabled is expected_overlap
+
+
+@pytest.mark.parametrize(
+    "overlap, source_device, expected_waits",
+    [
+        (False, "cpu", ("execution", "current")),
+        (True, "cpu", ()),
+        (True, "cuda", ("current",)),
+    ],
+)
+def test_nccl_multimodal_broadcast_stream_ordering(overlap, source_device, expected_waits):
+    execution_stream = Mock(name="execution")
+    current_stream = Mock(name="current")
+    stream = Mock()
+    source = Mock(device=Mock(type=source_device))
+    placements = [(_DeviceTensorRef(1, "uint8", (1,), source=source), 0)]
+    broadcaster = RequestBroadcaster(Mock(), Mock(), execution_stream=execution_stream)
+    broadcaster._nccl_broadcast_overlap_enabled = overlap
+
+    broadcaster._order_nccl_broadcast_stream(stream, current_stream, placements)
+
+    expected_streams = {
+        "execution": execution_stream,
+        "current": current_stream,
+    }
+    assert [call.args[0] for call in stream.wait_stream.call_args_list] == [
+        expected_streams[name] for name in expected_waits
+    ]
 
 
 @pytest.fixture

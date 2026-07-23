@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,6 +64,16 @@ void NcclCommunicator::receive(
 {
 #if ENABLE_MULTI_DEVICE
     TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
+}
+
+void NcclCommunicator::broadcast(
+    void* buffer, size_t count, nvinfer1::DataType dataType, int root, CudaStream const& stream) const
+{
+#if ENABLE_MULTI_DEVICE
+    TLLM_NCCL_CHECK(ncclBroadcast(buffer, buffer, count, toNcclType(dataType), root, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE

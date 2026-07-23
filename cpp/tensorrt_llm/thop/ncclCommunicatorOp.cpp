@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +49,15 @@ void NcclCommunicatorOp::recv(th::Tensor& tensor, int64_t fromRank) const
     mPipelineComm->receive(*tr::IBuffer::wrap(ptr, size), static_cast<int>(fromRank), cudaStream);
 }
 
+void NcclCommunicatorOp::broadcast(th::Tensor tensor, int64_t root) const
+{
+    tensor.record_stream(at::cuda::getCurrentCUDAStream());
+    auto ptr = static_cast<std::uint8_t*>(tensor.data_ptr());
+    size_t const size = tensor.numel() * th::elementSize(th::typeMetaToScalarType(tensor.dtype()));
+    tensorrt_llm::runtime::CudaStream cudaStream{at::cuda::getCurrentCUDAStream().stream(), mRank, false};
+    mPipelineComm->broadcast(*tr::IBuffer::wrap(ptr, size), static_cast<int>(root), cudaStream);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -57,4 +66,5 @@ static auto trtllmNcclCommunicator
     = torch::jit::class_<tensorrt_llm::torch_ext::NcclCommunicatorOp>("trtllm", "NcclCommunicatorOp")
           .def(torch::jit::init<int64_t, int64_t>())
           .def("send", &tensorrt_llm::torch_ext::NcclCommunicatorOp::send)
-          .def("recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::recv);
+          .def("recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::recv)
+          .def("broadcast", &tensorrt_llm::torch_ext::NcclCommunicatorOp::broadcast);

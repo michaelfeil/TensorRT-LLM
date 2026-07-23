@@ -681,8 +681,14 @@ class PyExecutor:
         self.request_accumulated: List[RequestQueueItem] = []
         self.new_active_requests_queue_latency_ms = 0.0
         self._disable_mpi = mpi_disabled()
-        self.request_broadcaster = RequestBroadcaster(self.dist,
-                                                      self.hang_detector)
+        self.request_broadcaster = RequestBroadcaster(
+            self.dist,
+            self.hang_detector,
+            execution_stream=self.execution_stream,
+            multimodal_data_device_paths=getattr(
+                self.model_engine.model, "multimodal_data_device_paths", None),
+            enable_attention_dp=self.enable_attention_dp,
+        )
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
@@ -2177,6 +2183,12 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+
+        # Finish any device broadcast before tearing down its CUDA stream.
+        try:
+            self.request_broadcaster.drain()
+        except Exception as e:
+            logger.error(f"Failed to drain request broadcast: {e}")
 
         for i in range(self.num_micro_batches):
             try:
@@ -4216,8 +4228,7 @@ class PyExecutor:
 
         # Attach Python objects to requests
         if py_request_objects and (self.dist.tp_size > 1 or self.dist.has_pp
-                                   or self.dist.cp_size
-                                   > 1) and self.dist.rank > 0:
+                                   or self.dist.cp_size > 1):
             attach_py_objects_to_requests(new_requests, py_request_objects)
 
         waiting_queue.add_requests(new_requests)
@@ -4304,6 +4315,12 @@ class PyExecutor:
         new_requests = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests,
             all_ranks_num_active_requests)
+
+        # Replace admitted tensor descriptors before request conversion reads
+        # their multimodal payloads.
+        with self.hang_detector.pause():
+            self.request_broadcaster.materialize_multimodal_tensors(
+                new_requests)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:

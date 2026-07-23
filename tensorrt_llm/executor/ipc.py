@@ -7,16 +7,22 @@ import threading
 import time
 import traceback
 from queue import Queue
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import zmq
 import zmq.asyncio
+from blake3 import blake3
 
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
+
+_AUTH_TAG_BYTES = hashlib.sha256().digest_size
+_BLAKE3_KEY_DOMAIN = b"TensorRT-LLM IPC BLAKE3 key v1\0"
+_BLAKE3_MAX_THREADS = 4
+_BLAKE3_PARALLEL_MIN_FRAME_BYTES = 4 * 1024 * 1024
 
 
 class ZeroMqQueue:
@@ -40,15 +46,17 @@ class ZeroMqQueue:
                  use_hmac_encryption: bool = True):
         '''
         Parameters:
-            address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
+            address (tuple[str, Optional[bytes]], optional): The address and authentication key for the IPC.
+                Defaults to None.
             socket_type (int): The type of socket to use. Defaults to zmq.PAIR.
             is_server (bool): Whether the current process is the server or the client.
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
-            use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
+            use_hmac_encryption (bool): Legacy name for mandatory message authentication. Single-frame
+                messages use HMAC-SHA256 and multipart messages use keyed BLAKE3. Defaults to True.
         '''
 
-        assert use_hmac_encryption, "HMAC encryption is always required. Turning off HMAC encryption risks security vulnerability of unauthorized data serialization and deserialization. "
+        assert use_hmac_encryption, "Message authentication is required to prevent unauthorized deserialization."
 
         self.socket_type = socket_type
         self.address_endpoint = address[
@@ -68,6 +76,10 @@ class ZeroMqQueue:
 
         self.hmac_key = address[1] if address is not None else None
         self.use_hmac_encryption = use_hmac_encryption
+        self._hmac_proto = None
+        self._hmac_key_cached = None
+        self._blake3_key = None
+        self._blake3_key_source = None
 
         self._setup_lock = threading.Lock()
 
@@ -185,12 +197,13 @@ class ZeroMqQueue:
         self.setup_lazily()
         self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
-            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
-                # Need manual serialization for encryption or ROUTER multipart
+            if self.socket_type in (zmq.ROUTER, zmq.DEALER):
                 data = self._prepare_data(obj)
                 self._send_data(data, routing_id=routing_id)
+            elif self.use_hmac_encryption:
+                # Preserve put()'s snapshot semantics.
+                self.socket.send_multipart(self._prepare_frames(obj), copy=True)
             else:
-                # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
 
     def put_noblock(self,
@@ -228,12 +241,13 @@ class ZeroMqQueue:
         self.setup_lazily()
         self._check_thread_safety()
         try:
-            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
-                # Need manual serialization for encryption or ROUTER multipart
+            if self.socket_type in (zmq.ROUTER, zmq.DEALER):
                 data = self._prepare_data(obj)
                 await self._send_data_async(data, routing_id=routing_id)
+            elif self.use_hmac_encryption:
+                await self.socket.send_multipart(self._prepare_frames(obj),
+                                                 copy=True)
             else:
-                # Standard socket without encryption
                 await self.socket.send_pyobj(obj)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
@@ -249,10 +263,13 @@ class ZeroMqQueue:
         self.setup_lazily()
         self._check_thread_safety()
         try:
-            if self.use_hmac_encryption:
-                data = pickle.dumps(obj)  # nosec B301
-                signed_data = self._sign_data(data)
-                await self.socket.send(signed_data, flags=zmq.NOBLOCK)
+            if self.socket_type in (zmq.ROUTER, zmq.DEALER):
+                await self.socket.send(self._prepare_data(obj),
+                                       flags=zmq.NOBLOCK)
+            elif self.use_hmac_encryption:
+                await self.socket.send_multipart(self._prepare_frames(obj),
+                                                 flags=zmq.NOBLOCK,
+                                                 copy=True)
             else:
                 await self.socket.send_pyobj(obj, flags=zmq.NOBLOCK)
         except Exception as e:
@@ -317,8 +334,9 @@ class ZeroMqQueue:
                         return obj
                 else:
                     if self.use_hmac_encryption:
-                        data = await self.socket.recv(flags=zmq.NOBLOCK)
-                        obj = self._parse_data(data)
+                        frames = await self.socket.recv_multipart(
+                            flags=zmq.NOBLOCK, copy=False)
+                        obj = self._parse_frames(frames)
                     else:
                         obj = await self.socket.recv_pyobj(flags=zmq.NOBLOCK)
 
@@ -351,16 +369,49 @@ class ZeroMqQueue:
             self.context.term()
             self.context = None
 
-    def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
+    def _keyed_hmac(self) -> "hmac.HMAC":
+        """Return a copy of the cached keyed HMAC state."""
+        if self._hmac_key_cached is not self.hmac_key:
+            self._hmac_proto = hmac.new(self.hmac_key, digestmod=hashlib.sha256)
+            self._hmac_key_cached = self.hmac_key
+        return self._hmac_proto.copy()
+
+    def _frame_auth_tag(self, frames: Iterable[bytes | memoryview]) -> bytes:
+        """Authenticate multipart frames with keyed BLAKE3.
+
+        BLAKE3 is not FIPS-approved. Peers must use the same multipart
+        authentication scheme because the wire format has no negotiation.
+        """
+        views = [memoryview(frame) for frame in frames]
+        hmac_key = self.hmac_key
+        if hmac_key is None:
+            raise RuntimeError("HMAC key is not initialized")
+
+        if self._blake3_key_source is not hmac_key:
+            self._blake3_key = hmac.digest(hmac_key, _BLAKE3_KEY_DOMAIN,
+                                           "sha256")
+            self._blake3_key_source = hmac_key
+        largest_frame_bytes = max((view.nbytes for view in views), default=0)
+        max_threads = (_BLAKE3_MAX_THREADS if largest_frame_bytes
+                       >= _BLAKE3_PARALLEL_MIN_FRAME_BYTES else 1)
+        h = blake3(key=self._blake3_key, max_threads=max_threads)
+        for frame in views:
+            h.update(frame.nbytes.to_bytes(8, "little"))
+            h.update(frame)
+        return h.digest()
+
+    def _verify_hmac(self, data: bytes | memoryview,
+                     actual_hmac: bytes | memoryview) -> bool:
         """Verify the HMAC of received pickle data."""
-        expected_hmac = hmac.new(self.hmac_key, data, hashlib.sha256).digest()
-        return hmac.compare_digest(expected_hmac, actual_hmac)
+        h = self._keyed_hmac()
+        h.update(data)
+        return hmac.compare_digest(h.digest(), actual_hmac)
 
     def _sign_data(self, data_before_encoding: bytes) -> bytes:
         """Generate HMAC for data."""
-        hmac_signature = hmac.new(self.hmac_key, data_before_encoding,
-                                  hashlib.sha256).digest()
-        return data_before_encoding + hmac_signature
+        h = self._keyed_hmac()
+        h.update(data_before_encoding)
+        return data_before_encoding + h.digest()
 
     def __del__(self):
         self.close()
@@ -372,20 +423,41 @@ class ZeroMqQueue:
             return self._sign_data(data)
         return data
 
-    def _parse_data(self, data: bytes) -> Any:
-        """Parse data and optionally verify HMAC signature."""
-        if self.use_hmac_encryption:
-            # Split data and HMAC
-            message_data = data[:-32]
-            actual_hmac = data[-32:]
+    def _prepare_frames(self, obj: Any) -> list:
+        """Serialize an object as authenticated pickle-5 frames."""
+        from tensorrt_llm._torch.distributed.communicator import \
+            _dumps_with_oob_buffers
+        metadata, buffers = _dumps_with_oob_buffers(obj)
+        if not buffers:
+            return [self._sign_data(bytes(metadata))]
+        tag = self._frame_auth_tag((metadata, *buffers))
+        return [bytes(metadata) + tag, *buffers]
 
-            # Verify HMAC
-            if not self._verify_hmac(message_data, actual_hmac):
-                raise RuntimeError("HMAC verification failed")
+    def _parse_frames(self, frames: list) -> Any:
+        """Deserialize frames created by _prepare_frames."""
+        if len(frames) == 1:
+            return self._parse_data(frames[0].buffer)
 
-            return pickle.loads(message_data)  # nosec B301
-        else:
+        views = [frame.buffer for frame in frames]
+        metadata = views[0][:-_AUTH_TAG_BYTES]
+        actual_tag = views[0][-_AUTH_TAG_BYTES:]
+        if not hmac.compare_digest(self._frame_auth_tag(
+            (metadata, *views[1:])), actual_tag):
+            raise RuntimeError("Message authentication failed")
+        # Rebuilt tensors retain the ZMQ frames through their buffer views.
+        return pickle.loads(metadata, buffers=views[1:])  # nosec B301
+
+    def _parse_data(self, data: bytes | memoryview) -> Any:
+        """Deserialize data after verifying its optional HMAC signature."""
+        if not self.use_hmac_encryption:
             return pickle.loads(data)  # nosec B301
+
+        view = memoryview(data)
+        message_data = view[:-_AUTH_TAG_BYTES]
+        actual_hmac = view[-_AUTH_TAG_BYTES:]
+        if not self._verify_hmac(message_data, actual_hmac):
+            raise RuntimeError("HMAC verification failed")
+        return pickle.loads(message_data)  # nosec B301
 
     def _send_data(self,
                    data: bytes,
@@ -423,8 +495,8 @@ class ZeroMqQueue:
             return obj
         else:
             if self.use_hmac_encryption:
-                data = self.socket.recv()
-                obj = self._parse_data(data)
+                frames = self.socket.recv_multipart(copy=False)
+                obj = self._parse_frames(frames)
             else:
                 obj = self.socket.recv_pyobj()
 
@@ -443,8 +515,8 @@ class ZeroMqQueue:
             return obj
         else:
             if self.use_hmac_encryption:
-                data = await self.socket.recv()
-                obj = self._parse_data(data)
+                frames = await self.socket.recv_multipart(copy=False)
+                obj = self._parse_frames(frames)
             else:
                 obj = await self.socket.recv_pyobj()
 

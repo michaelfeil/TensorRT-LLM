@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,11 +55,18 @@ public:
         receive(buf.data(), buf.getSize(), buf.getDataType(), peer, stream);
     }
 
+    void broadcast(IBuffer& buf, int root, CudaStream const& stream) const
+    {
+        broadcast(buf.data(), buf.getSize(), buf.getDataType(), root, stream);
+    }
+
 private:
     void send(
         void const* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
 
     void receive(void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
+
+    void broadcast(void* buffer, size_t count, nvinfer1::DataType dataType, int root, CudaStream const& stream) const;
 
     static ncclComm_t createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm);
 

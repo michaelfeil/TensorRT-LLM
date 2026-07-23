@@ -23,11 +23,13 @@ Run with mpirun:
     mpirun -n 2 python -m pytest tests/unittest/_torch/distributed/test_safe_mpi_comm.py -v
 """
 
+import io
 import pickle
 from unittest.mock import patch
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm import mapping
 from tensorrt_llm._torch import distributed
@@ -685,6 +687,177 @@ class TestSafeBroadcast:
         result = communicator.safe_broadcast(self.comm, obj, root=0, chunk_size=64 * 1024)
 
         assert result == payload
+
+    def test_broadcast_tensor_payload(self):
+        expected = {
+            "large": torch.arange(_LARGE_NUMEL, dtype=torch.bfloat16),
+            "small": torch.arange(16),
+            "array": np.arange(_LARGE_NUMEL, dtype=np.int32),
+            "metadata": {"ids": [1, 2, 3]},
+        }
+        obj = expected if self.rank == 0 else None
+
+        result = communicator.safe_broadcast(self.comm, obj, root=0)
+
+        assert torch.equal(result["large"], expected["large"])
+        assert torch.equal(result["small"], expected["small"])
+        np.testing.assert_array_equal(result["array"], expected["array"])
+        assert result["metadata"] == expected["metadata"]
+
+    def test_broadcast_chunked_tensor_buffer(self):
+        expected = torch.arange(256 * 1024, dtype=torch.float32)
+        obj = expected if self.rank == 0 else None
+
+        result = communicator.safe_broadcast(self.comm, obj, root=0, chunk_size=64 * 1024)
+
+        assert torch.equal(result, expected)
+
+
+def _roundtrip_oob(obj):
+    metadata, buffers = communicator._dumps_with_oob_buffers(obj)
+    received = [bytearray(buffer) for buffer in buffers]
+    return pickle.loads(bytes(metadata), buffers=received), len(buffers)
+
+
+_LARGE_NUMEL = communicator._OOB_BUFFER_MIN_BYTES
+
+
+def _rebuild_temp_tensor(tensor):
+    return tensor[0].item()
+
+
+class _TemporaryTensor:
+    def __reduce__(self):
+        tensor = torch.full((_LARGE_NUMEL,), 7.0)
+        return _rebuild_temp_tensor, (tensor,)
+
+
+class TestTensorOOBSerialization:
+    @pytest.mark.parametrize("numel,num_buffers", [(16, 0), (_LARGE_NUMEL, 1)])
+    def test_size_threshold(self, numel, num_buffers):
+        obj = torch.arange(numel, dtype=torch.float32)
+        rebuilt, actual_num_buffers = _roundtrip_oob(obj)
+        assert actual_num_buffers == num_buffers
+        assert torch.equal(rebuilt, obj)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.float32,
+            torch.bfloat16,
+            torch.float16,
+            torch.int64,
+            torch.uint8,
+            torch.bool,
+        ],
+    )
+    def test_tensor_dtypes(self, dtype):
+        obj = torch.arange(_LARGE_NUMEL, dtype=torch.float32).to(dtype)
+        rebuilt, num_buffers = _roundtrip_oob(obj)
+        assert num_buffers == 1
+        assert rebuilt.dtype == dtype
+        assert torch.equal(rebuilt, obj)
+
+    def test_unsupported_tensors_use_default_reduction(self):
+        base = torch.arange(_LARGE_NUMEL, dtype=torch.float32).reshape(256, -1)
+        tagged = torch.zeros(_LARGE_NUMEL)
+        tagged.my_tag = "provenance"
+        payload = {
+            "non_contiguous": base.t(),
+            "quantized": torch.quantize_per_tensor(torch.rand(_LARGE_NUMEL), 0.1, 3, torch.qint8),
+            "requires_grad": torch.zeros(_LARGE_NUMEL, requires_grad=True),
+            "tagged": tagged,
+            "empty": torch.empty(0, 7, dtype=torch.float16),
+        }
+
+        rebuilt, num_buffers = _roundtrip_oob(payload)
+
+        assert num_buffers == 0
+        assert rebuilt["non_contiguous"].stride() == payload["non_contiguous"].stride()
+        assert rebuilt["quantized"].q_scale() == 0.1
+        assert rebuilt["requires_grad"].requires_grad
+        assert rebuilt["tagged"].my_tag == "provenance"
+        assert rebuilt["empty"].shape == (0, 7)
+
+    def test_contiguous_view_ships_only_view_bytes(self):
+        base = torch.arange(_LARGE_NUMEL * 2, dtype=torch.float32)
+        obj = base[_LARGE_NUMEL:]
+
+        metadata, buffers = communicator._dumps_with_oob_buffers(obj)
+        rebuilt = pickle.loads(bytes(metadata), buffers=[bytearray(buffers[0])])
+
+        assert len(buffers) == 1
+        assert buffers[0].nbytes == obj.nbytes
+        assert rebuilt.storage_offset() == 0
+        assert torch.equal(rebuilt, obj)
+
+    def test_singleton_stride_is_preserved(self):
+        base = torch.arange(_LARGE_NUMEL, dtype=torch.float32)
+        obj = base.reshape(_LARGE_NUMEL // 2, 1, 2).as_strided(
+            (_LARGE_NUMEL // 2, 1, 2), (2, 999999, 1)
+        )
+
+        rebuilt, num_buffers = _roundtrip_oob(obj)
+
+        assert num_buffers == 1
+        assert rebuilt.stride() == obj.stride()
+        assert torch.equal(rebuilt, obj)
+
+    def test_request_payload(self):
+        payload = [
+            {
+                "request_id": i,
+                "tokens": list(range(100)),
+                "embedding": torch.full((512, 128), float(i), dtype=torch.bfloat16),
+                "mrope_deltas": torch.tensor([i]),
+            }
+            for i in range(4)
+        ]
+
+        rebuilt, num_buffers = _roundtrip_oob(payload)
+
+        assert num_buffers == 4
+        for expected, actual in zip(payload, rebuilt):
+            assert actual["request_id"] == expected["request_id"]
+            assert actual["tokens"] == expected["tokens"]
+            assert torch.equal(actual["embedding"], expected["embedding"])
+            assert torch.equal(actual["mrope_deltas"], expected["mrope_deltas"])
+
+    @pytest.mark.parametrize("order", ["C", "F"])
+    def test_numpy_arrays(self, order):
+        values = np.arange(_LARGE_NUMEL, dtype=np.float64).reshape(256, -1)
+        obj = np.array(values, order=order)
+
+        rebuilt, num_buffers = _roundtrip_oob(obj)
+
+        assert num_buffers == 1
+        assert rebuilt.strides == obj.strides
+        np.testing.assert_array_equal(rebuilt, obj)
+
+    def test_reducer_temporary_stays_alive(self):
+        metadata, buffers = communicator._dumps_with_oob_buffers(_TemporaryTensor())
+        _churn = [torch.full((_LARGE_NUMEL,), 13.0) for _ in range(8)]
+
+        rebuilt = pickle.loads(bytes(metadata), buffers=[bytearray(buffer) for buffer in buffers])
+
+        assert rebuilt == 7.0
+
+    def test_special_tensors_use_default_reducer(self):
+        pickler = communicator._TensorOOBPickler(io.BytesIO(), protocol=5)
+        nested = torch.nested.nested_tensor(
+            [torch.zeros(2, 3), torch.zeros(4, 3)], layout=torch.strided
+        )
+        assert pickler.reducer_override(nested) is NotImplemented
+        if hasattr(torch, "_efficientzerotensor"):
+            storage_less = torch._efficientzerotensor(_LARGE_NUMEL)
+            assert pickler.reducer_override(storage_less) is NotImplemented
+
+    def test_tensor_subclass_is_preserved(self):
+        obj = torch.nn.Parameter(torch.zeros(_LARGE_NUMEL))
+        rebuilt, _ = _roundtrip_oob(obj)
+        assert isinstance(rebuilt, torch.nn.Parameter)
+        assert rebuilt.requires_grad
+        assert torch.equal(rebuilt, obj)
 
 
 if __name__ == "__main__":
