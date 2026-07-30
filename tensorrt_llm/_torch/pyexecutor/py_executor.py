@@ -1143,6 +1143,8 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.shutdown()
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()

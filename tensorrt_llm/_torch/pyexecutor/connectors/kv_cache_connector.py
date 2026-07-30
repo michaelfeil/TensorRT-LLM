@@ -110,6 +110,9 @@ class KvCacheConnectorWorker(ABC):
     def get_connector_meta(self) -> object:
         return self._metadata
 
+    def shutdown(self) -> None:
+        """Release resources owned by the connector worker."""
+
     def _clear_connector_meta(self):
         self._metadata = None
 
@@ -200,6 +203,9 @@ class KvCacheConnectorScheduler(ABC):
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
         super().__init__()
+
+    def shutdown(self) -> None:
+        """Release resources owned by the connector scheduler."""
 
     @abstractmethod
     def build_connector_meta(self, scheduler_output: SchedulerOutput):
@@ -477,6 +483,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self.worker = worker
         self.scheduler = scheduler
+        self._is_shutdown = False
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -492,6 +499,17 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self._scheduler_output = None
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
+
+    def shutdown(self) -> None:
+        if self._is_shutdown:
+            return
+        self._is_shutdown = True
+
+        try:
+            self.worker.shutdown()
+        finally:
+            if self.scheduler is not None:
+                self.scheduler.shutdown()
 
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """

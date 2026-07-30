@@ -24,15 +24,16 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (TYPE_CHECKING, Annotated, Any, ClassVar, Dict, List,
-                    Literal, Optional, Set, Tuple, Type, TypeAlias, TypeVar,
-                    Union, get_args, get_origin)
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Dict, List, Literal
+from typing import Mapping as TypingMapping
+from typing import (Optional, Set, Tuple, Type, TypeAlias, TypeVar, Union,
+                    get_args, get_origin)
 
 import torch
 import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
-from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
+from pydantic import (JsonValue, NonNegativeFloat, NonNegativeInt, PositiveInt,
                       PrivateAttr, field_validator, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
@@ -1625,6 +1626,10 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="URL for an external connector server "
         "(e.g. 'tcp://localhost:5555'). Connectors that run in "
         "multi-process mode use this to reach the cache server.")
+    connector_extra_config: Optional[TypingMapping[str, JsonValue]] = Field(
+        default=None,
+        description="Connector-specific JSON configuration passed through "
+        "to the selected connector implementation.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":

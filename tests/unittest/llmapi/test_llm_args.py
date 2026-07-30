@@ -40,7 +40,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           EncodeCudaGraphConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
-                                          KvCacheConfig,
+                                          KvCacheConfig, KvCacheConnectorConfig,
                                           LookaheadDecodingConfig, MoeConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           PybindMirror, RayPlacementConfig,
@@ -58,6 +58,27 @@ from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from tensorrt_llm.plugin import PluginConfig
 
 from .test_llm import llama_model_path
+
+
+def test_kv_cache_connector_extra_config():
+    config = KvCacheConnectorConfig(
+        connector_module="test.connector",
+        connector_scheduler_class="TestScheduler",
+        connector_worker_class="TestWorker",
+        connector_extra_config={
+            "g2pb_service": {
+                "spawn": True,
+                "host_blocks": 64,
+            },
+        },
+    )
+
+    assert config.connector_extra_config == {
+        "g2pb_service": {
+            "spawn": True,
+            "host_blocks": 64,
+        },
+    }
 
 
 def test_LookaheadDecodingConfig():

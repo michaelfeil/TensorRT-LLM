@@ -454,3 +454,17 @@ def test_connector_manager_on_rewind_forwards_to_scheduler():
     forwarded_req, forwarded_ids = scheduler.on_rewind.call_args.args
     assert forwarded_req is req
     assert forwarded_ids == [0, 1]
+
+
+def test_connector_manager_shutdown_is_ordered_and_idempotent():
+    shutdown_order = []
+    worker = MagicMock()
+    scheduler = MagicMock()
+    worker.shutdown.side_effect = lambda: shutdown_order.append("worker")
+    scheduler.shutdown.side_effect = lambda: shutdown_order.append("scheduler")
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+    manager.shutdown()
+    manager.shutdown()
+
+    assert shutdown_order == ["worker", "scheduler"]
