@@ -223,7 +223,9 @@ class TestDeepSeekSparseAttentionConfig:
         assert config.index_skip_topk_offset == 1
         assert config.index_share_for_mtp_iteration is True
         config_dump = config.model_dump(exclude_none=True)
-        assert config_dump["indexer_types"] == ["full", "shared", "shared", "full"]
+        assert config_dump["indexer_types"] == [
+            "full", "shared", "shared", "full"
+        ]
         assert config_dump["index_topk_freq"] == 2
         assert config_dump["index_topk_pattern"] == "NSS"
         assert config_dump["index_skip_topk_offset"] == 1
@@ -253,8 +255,6 @@ def test_deepseek_sparse_attention_config_rejects_invalid_indexer_types(
         indexer_types):
     with pytest.raises(ValidationError):
         DeepSeekSparseAttentionConfig(indexer_types=indexer_types)
-
-
 
 class TestYaml:
 
