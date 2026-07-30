@@ -256,6 +256,7 @@ def test_deepseek_sparse_attention_config_rejects_invalid_indexer_types(
     with pytest.raises(ValidationError):
         DeepSeekSparseAttentionConfig(indexer_types=indexer_types)
 
+
 class TestYaml:
 
     def _yaml_to_dict(self, yaml_content: str) -> dict:
