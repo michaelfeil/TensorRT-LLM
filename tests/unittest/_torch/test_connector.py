@@ -154,7 +154,23 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
 
         assert manager.get_finished() == [req]
 
+        worker.get_finished.reset_mock()
+        assert manager.get_finished() == []
+        worker.get_finished.assert_not_called()
+
     run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_connector_manager_get_finished_skips_empty_poll():
+    worker = MagicMock()
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+
+    with patch("tensorrt_llm._torch.pyexecutor.connectors."
+               "kv_cache_connector.mpi_allgather") as allgather:
+        assert manager.get_finished() == []
+
+    worker.get_finished.assert_not_called()
+    allgather.assert_not_called()
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

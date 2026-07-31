@@ -366,6 +366,10 @@ class AsyncRequests:
         """
         return set(self.loading.keys())
 
+    @property
+    def is_empty(self) -> bool:
+        return not self.saving and not self.loading
+
 
 class KvCacheConnectorSchedulerOutputRequest:
     def __init__(self):
@@ -692,6 +696,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The requests that have newly finished saving.
         """
+        # Admission/finalization decisions are broadcast, and a rank that
+        # finishes early retains the request locally until every rank agrees.
+        # Empty state is therefore rank-consistent and needs no collective.
+        if (self.new_async_requests.is_empty
+                and self.pending_async_requests.is_empty
+                and self.local_finished_async_requests.is_empty):
+            return []
+
         started_loading_req_ids = list(self.new_async_requests.loading_ids)
         finished_gen_req_ids = list(self.new_async_requests.saving_ids)
 
