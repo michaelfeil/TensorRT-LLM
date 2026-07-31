@@ -211,6 +211,8 @@ def test_connector_manager_skips_collective_for_device_complete_match(
         worker.can_skip_scheduler_match.assert_called_once_with(65, 64)
         broadcast.assert_not_called()
         if scheduler is not None:
+            scheduler.prepare_scheduler_match_skip.assert_called_once_with(
+                req, 64)
             scheduler.get_num_new_matched_tokens.assert_not_called()
 
     run_across_mpi(mpi_pool_executor, test, 2)

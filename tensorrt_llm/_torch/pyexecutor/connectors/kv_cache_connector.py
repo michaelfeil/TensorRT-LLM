@@ -245,6 +245,20 @@ class KvCacheConnectorScheduler(ABC):
             Whether the tokens will be loaded asynchronously.
         """
 
+    def prepare_scheduler_match_skip(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> None:
+        """Prepare leader state before a worker-approved scheduler-match skip.
+
+        Workers that opt into ``can_skip_scheduler_match`` must pair with a
+        scheduler that implements this hook. It runs only on the leader and
+        must not perform remote matching or distributed collectives.
+        """
+        raise RuntimeError(
+            "Connector worker skipped scheduler matching without a scheduler "
+            "implementation of prepare_scheduler_match_skip"
+        )
+
     @abstractmethod
     def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:
         """
@@ -539,6 +553,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if not request.multimodal_positions and self.worker.can_skip_scheduler_match(
             request_num_tokens, num_computed_tokens
         ):
+            if self.scheduler is not None:
+                self.scheduler.prepare_scheduler_match_skip(
+                    request, num_computed_tokens
+                )
             return 0
 
         num_tokens, load_kv_async = self._run_on_leader(
