@@ -15,7 +15,7 @@
 
 import pickle
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import cloudpickle
 import mpi4py
@@ -364,12 +364,14 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
     kv_cache_manager = MagicMock()
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    kv_cache_manager.tokens_per_block = 32
 
     # Create a mock request in generation state with draft tokens
     req = MagicMock()
     req.request_id = 42
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.get_tokens.return_value = [1, 2, 3, 4, 5]  # 5 tokens already generated
+    req.get_num_tokens.return_value = 5
     req.py_draft_tokens = [100, 101, 102]  # 3 MTP draft tokens
 
     scheduled_batch = ScheduledRequests()
@@ -389,18 +391,11 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
         f"Expected {expected_num_scheduled_tokens}, got {request_data.num_scheduled_tokens}"
 
 
-def test_scheduler_output_block_hashes_read_through():
-    """``RequestData.block_hashes`` reflects the chain returned by the KV cache manager.
-
-    The connector path does not recompute hashes Python-side; each scheduler step
-    is a pure pass-through of whatever ``commit_and_get_block_hashes`` returns.
-    A subsequent step that observes a longer chain simply forwards the longer
-    chain. The block-completion semantics (when the next hash actually appears)
-    are owned by the C++ KV cache manager and exercised by the C++ unit tests
-    for ``commitAndGetBlockHashesForRequest``.
-    """
+def test_scheduler_output_only_reads_hashes_at_block_boundaries():
+    """Unchanged cumulative block hashes are not rematerialized each step."""
     kv_cache_manager = MagicMock()
-    kv_cache_manager.get_cache_indices.return_value = [0]
+    kv_cache_manager.get_cache_indices.return_value = [0, 1]
+    kv_cache_manager.tokens_per_block = 4
     # Two consecutive scheduler steps: first sees no full block yet, second sees
     # one full block whose hash has just been committed by the manager.
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
@@ -410,6 +405,7 @@ def test_scheduler_output_block_hashes_read_through():
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.py_draft_tokens = []
     req.get_tokens.return_value = [1, 2, 3]
+    req.get_num_tokens.return_value = 3
 
     scheduled_batch = ScheduledRequests()
     scheduled_batch.generation_requests = [req]
@@ -422,16 +418,60 @@ def test_scheduler_output_block_hashes_read_through():
     assert output.cached_requests[0].block_hashes == []
 
     req.get_tokens.return_value = [1, 2, 3, 4]
+    req.get_num_tokens.return_value = 4
+    req.get_token.return_value = 4
     output = manager.build_scheduler_output(scheduled_batch,
                                             AsyncRequests({}, {}),
                                             kv_cache_manager)
     assert output.cached_requests[0].block_hashes == [12345]
 
-    # Each scheduler step asks the manager exactly once per request; no Python
-    # caching layer reshapes the request between calls.
+    # The next token stays within the same completed-block count, so neither the
+    # hash chain nor the stable block-ID vector is read back again.
+    req.get_num_tokens.return_value = 5
+    req.get_token.return_value = 5
+    output = manager.build_scheduler_output(scheduled_batch,
+                                            AsyncRequests({}, {}),
+                                            kv_cache_manager)
+    assert output.cached_requests[0].block_hashes is None
+
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
-    for call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
-        assert call.args == (req, )
+    for recorded_call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
+        assert recorded_call.args == (req, )
+    assert kv_cache_manager.get_cache_indices.call_count == 1
+    assert req.get_tokens.call_count == 1
+    assert req.get_token.call_args_list == [call(0, 3), call(0, 4)]
+
+
+def test_scheduler_output_refreshes_hashes_when_context_allocation_grows():
+    """Chunked prefill refreshes hashes when more prompt blocks are allocated."""
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 4
+    kv_cache_manager.get_cache_indices.side_effect = [[0], [0, 1]]
+    kv_cache_manager.commit_and_get_block_hashes.side_effect = [[11], [11, 22]]
+
+    req = MagicMock()
+    req.request_id = 42
+    req.state = LlmRequestState.CONTEXT_INIT
+    req.get_num_tokens.return_value = 8
+    req.get_tokens.return_value = list(range(8))
+    req.context_current_position = 0
+    req.context_remaining_length = 8
+    req.context_chunk_size = 4
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.context_requests_last_chunk = [req]
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    first = manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
+                                           kv_cache_manager)
+    second = manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
+                                            kv_cache_manager)
+
+    assert first.new_requests[0].block_hashes == [11]
+    assert second.cached_requests[0].new_block_ids == [1]
+    assert second.cached_requests[0].block_hashes == [11, 22]
+    assert req.get_tokens.call_count == 1
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
 
 
 def test_scheduler_output_on_rewind_trims_stale_block_ids():
@@ -459,9 +499,11 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     scheduled_batch.generation_requests = [req]
 
     manager = KvCacheConnectorSchedulerOutputManager()
+    kv_cache_manager.tokens_per_block = 2
 
     # Step 1: normal build — blocks [0, 1, 2], tokens [1..5]
     req.get_tokens.return_value = [1, 2, 3, 4, 5]
+    req.get_num_tokens.return_value = 5
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
@@ -474,6 +516,8 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     # block 2.  req.get_tokens now includes the accepted token [1..6],
     # but live cache indices shrank to [0, 1].
     req.get_tokens.return_value = [1, 2, 3, 4, 5, 6]
+    req.get_num_tokens.return_value = 6
+    req.get_token.return_value = 6
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
     manager.on_rewind(req, kv_cache_manager)
 

@@ -69,13 +69,12 @@ class RequestData:
     computed_position: int
     # The number of scheduled tokens for the upcoming forward pass.
     num_scheduled_tokens: int
-    # The cumulative chain of block hashes for full blocks of beam 0. Each entry
-    # is the hash that KV cache events will report for the corresponding block;
-    # the chain is read directly from the KV cache manager's stored block hashes
-    # rather than recomputed Python-side. May front-run the corresponding KV cache
-    # event emission slightly: when a block becomes full during generation, its
-    # hash is committed in the same scheduler step.
-    block_hashes: List[int] = field(default_factory=list)
+    # The cumulative chain of block hashes for full blocks of beam 0 when that
+    # chain changed in this scheduler step. ``None`` means the connector should
+    # retain the chain from the prior update. Each entry is the hash that KV
+    # cache events report for the corresponding block; the chain is read
+    # directly from the KV cache manager rather than recomputed Python-side.
+    block_hashes: Optional[List[int]] = None
     # The retention priorities for each new block (same length as new_block_ids).
     # Used for priority-based offload filtering. None means use default priority.
     priorities: Optional[List[int]] = None
@@ -383,34 +382,83 @@ class KvCacheConnectorSchedulerOutputRequest:
     def __init__(self):
         self.block_ids = []
         self.tokens = []
+        self.hash_probe_state = None
 
     def update_and_build_data(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
-        block_ids = kv_cache_manager.get_cache_indices(req)
-        tokens = req.get_tokens(0)
-
-        # Commit hashes for any blocks that have become full since the last call
-        # and read back the full cumulative chain. The C++ side sets each block's
-        # mBlockKey/mHash on first call, so subsequent calls become pure lookups.
-        block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
-
-        new_block_ids = block_ids[len(self.block_ids) :]
-        new_tokens = tokens[len(self.tokens) :]
-
-        self.block_ids.extend(new_block_ids)
-        self.tokens.extend(new_tokens)
-
+        num_tokens = req.get_num_tokens(0)
         if req.state in (
             LlmRequestState.CONTEXT_INIT,
             LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
         ):
+            is_generation = False
             computed_position = req.context_current_position
             num_scheduled_tokens = min(req.context_remaining_length, req.context_chunk_size)
         else:
-            computed_position = len(tokens) - 1
+            is_generation = True
+            computed_position = num_tokens - 1
             num_scheduled_tokens = 1 + get_draft_token_length(
                 req
             )  # Account for the next token plus any spec-dec draft tokens.
             # https://basetenlabs.slack.com/archives/C0BGBSQDQUS/p1784038072194869?thread_ts=1783883497.594279&cid=C0BGBSQDQUS
+
+        # Context scheduling is infrequent and may add a large token chunk, so
+        # retain the bulk read there. During generation, avoid converting the
+        # entire request (often tens of thousands of tokens) from C++ on every
+        # decode step just to retrieve the 1-4 newly accepted tokens.
+        if not self.tokens:
+            tokens = req.get_tokens(0)
+            num_tokens = len(tokens)
+            new_tokens = tokens
+        elif is_generation:
+            if num_tokens < len(self.tokens):
+                raise RuntimeError(
+                    "Connector token state exceeds the live request; "
+                    "on_rewind must run before the next scheduler update"
+                )
+            new_tokens = [
+                req.get_token(0, position)
+                for position in range(len(self.tokens), num_tokens)
+            ]
+        elif num_tokens == len(self.tokens):
+            new_tokens = []
+        else:
+            tokens = req.get_tokens(0)
+            if len(tokens) < len(self.tokens):
+                raise RuntimeError(
+                    "Connector token state exceeds the live context request"
+                )
+            num_tokens = len(tokens)
+            new_tokens = tokens[len(self.tokens) :]
+
+        tokens_per_block = kv_cache_manager.tokens_per_block
+
+        # Active generation keeps stable block IDs until its allocation grows.
+        # Avoid rematerializing the full block list on every decode step.
+        next_position = computed_position + num_scheduled_tokens
+        required_blocks = (next_position + tokens_per_block - 1) // tokens_per_block
+        if (
+            not is_generation
+            or not self.block_ids
+            or required_blocks > len(self.block_ids)
+        ):
+            block_ids = kv_cache_manager.get_cache_indices(req)
+            new_block_ids = block_ids[len(self.block_ids) :]
+            self.block_ids.extend(new_block_ids)
+        else:
+            new_block_ids = []
+
+        # Cumulative block hashes are immutable between full-block boundaries.
+        # Probe and forward the chain only when another block can have become
+        # full. Rewinds invalidate this marker in ``on_rewind``.
+        num_hashed_tokens = (num_tokens // tokens_per_block) * tokens_per_block
+        hash_probe_state = (num_hashed_tokens, len(self.block_ids))
+        if hash_probe_state != self.hash_probe_state:
+            block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+            self.hash_probe_state = hash_probe_state
+        else:
+            block_hashes = None
+
+        self.tokens.extend(new_tokens)
         # Get retention priority for each new block only if retention config is provided
         # (for priority-based offload filtering)
         priorities = None
@@ -499,6 +547,7 @@ class KvCacheConnectorSchedulerOutputManager:
         if req_state is None:
             return
         req_state.block_ids = list(kv_cache_manager.get_cache_indices(req))
+        req_state.hash_probe_state = None
         live_tokens = list(req.get_tokens(0))
         if len(live_tokens) < len(req_state.tokens):
             req_state.tokens = live_tokens
