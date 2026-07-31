@@ -135,6 +135,14 @@ class KvCacheConnectorWorker(ABC):
         """
         return False
 
+    def requires_layerwise_transfer_hooks(self) -> bool:
+        """Return whether the executor must invoke per-layer load/save hooks.
+
+        Connectors that perform transfers only at batch and whole-forward
+        boundaries may opt out to avoid two Python hooks per decoder layer.
+        """
+        return True
+
     def register_forward_pass_callable(self) -> Callable:
         """
         This callable will be called at the end of the forward pass.

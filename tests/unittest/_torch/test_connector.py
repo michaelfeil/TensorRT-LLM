@@ -275,6 +275,12 @@ def test_connector_schedulable_reuse_preview_is_opt_in():
     assert manager.supports_schedulable_reuse_preview()
 
 
+def test_connector_layerwise_transfer_hooks_are_enabled_by_default():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+
+    assert KvCacheConnectorWorker.requires_layerwise_transfer_hooks(worker)
+
+
 @pytest.mark.parametrize(
     ("connector_manager", "expected"),
     [

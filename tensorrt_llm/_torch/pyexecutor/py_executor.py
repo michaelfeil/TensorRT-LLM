@@ -921,14 +921,16 @@ class PyExecutor:
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
-            # For each of our layers, we need to register the pre/post hooks.
-            # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
-            for _name, module in self.model_engine.model.named_modules():
-                if isinstance(module, DecoderLayer):
-                    module.register_forward_pre_hook(
-                        self.kv_connector_manager.layer_pre_hook)
-                    module.register_forward_hook(
-                        self.kv_connector_manager.layer_post_hook)
+            if self.kv_connector_manager.worker.requires_layerwise_transfer_hooks(
+            ):
+                # These hooks let connectors synchronize transfers at layer
+                # boundaries, but add Python dispatch to every decoder layer.
+                for _name, module in self.model_engine.model.named_modules():
+                    if isinstance(module, DecoderLayer):
+                        module.register_forward_pre_hook(
+                            self.kv_connector_manager.layer_pre_hook)
+                        module.register_forward_hook(
+                            self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
 
