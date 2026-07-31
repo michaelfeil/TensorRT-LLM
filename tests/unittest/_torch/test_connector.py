@@ -205,6 +205,42 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_builds_scheduler_output_only_on_leader(
+        mpi_pool_executor):
+
+    def test():
+        worker = MagicMock()
+        scheduler = MagicMock() if mpi_rank() == 0 else None
+        if scheduler is not None:
+            scheduler.build_connector_meta.return_value = {"request_id": 42}
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+        manager.scheduler_output_manager.build_scheduler_output = MagicMock(
+            return_value="leader-output")
+        build_scheduler_output = (
+            manager.scheduler_output_manager.build_scheduler_output)
+
+        scheduled_batch = MagicMock()
+        kv_cache_manager = MagicMock()
+        manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+
+        if scheduler is not None:
+            build_scheduler_output.assert_called_once_with(
+                scheduled_batch, manager.new_async_requests, kv_cache_manager)
+        else:
+            build_scheduler_output.assert_not_called()
+            assert manager._scheduler_output is None
+
+        manager.handle_metadata()
+
+        if scheduler is not None:
+            scheduler.build_connector_meta.assert_called_once_with("leader-output")
+        worker.bind_connector_meta.assert_called_once_with({"request_id": 42})
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_connector_manager_skips_collective_for_device_complete_match(
         mpi_pool_executor):
 

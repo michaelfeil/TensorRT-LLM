@@ -592,6 +592,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.finished_async_loading_requests = dict()
 
         self._scheduler_output = None
+        self._metadata_pending = False
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
 
     def shutdown(self) -> None:
@@ -647,7 +648,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if load_kv_async:
             self.new_async_requests.loading[request.request_id] = request
 
-        self.scheduler_output_manager.record_new_matched_tokens(request, num_tokens)
+        if self.scheduler is not None:
+            self.scheduler_output_manager.record_new_matched_tokens(
+                request, num_tokens)
 
         request.py_num_connector_matched_tokens = num_tokens
 
@@ -663,9 +666,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
-        self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
-            scheduled_batch, self.new_async_requests, kv_cache_manager
-        )
+        self._metadata_pending = True
+        if self.scheduler is not None:
+            self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
+                scheduled_batch, self.new_async_requests, kv_cache_manager
+            )
 
     def on_rewind(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
         """Notify the connector that a request's KV cache was rewound.
@@ -674,8 +679,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         notifies the external scheduler (e.g. KVBM leader) so it can trim
         its own per-request slot state.
         """
-        self.scheduler_output_manager.on_rewind(req, kv_cache_manager)
         if self.scheduler is not None:
+            self.scheduler_output_manager.on_rewind(req, kv_cache_manager)
             live_block_ids = kv_cache_manager.get_cache_indices(req)
             self.scheduler.on_rewind(req, live_block_ids)
 
@@ -707,7 +712,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             setattr(scheduled_requests, key, allowed_context_requests)
 
     def handle_metadata(self) -> object:
-        if self._scheduler_output is None:
+        if not self._metadata_pending:
             return
 
         metadata = self._run_on_leader(
@@ -715,6 +720,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
 
         self._scheduler_output = None
+        self._metadata_pending = False
 
         self.worker.bind_connector_meta(metadata)
 
