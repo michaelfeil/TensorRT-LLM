@@ -161,6 +161,7 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
     def test():
         worker = MagicMock()
+        worker.can_skip_scheduler_match.return_value = False
 
         if mpi_rank() == 0:
             scheduler = MagicMock()
@@ -174,6 +175,7 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
         req.request_id = 42
         req.is_generation_only_request = False
+        req.multimodal_positions = []
 
         assert manager.get_num_new_matched_tokens(req, 32) == 16
 
@@ -186,10 +188,69 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_skips_collective_for_device_complete_match(
+        mpi_pool_executor):
+
+    def test():
+        worker = MagicMock()
+        worker.can_skip_scheduler_match.return_value = True
+
+        scheduler = MagicMock() if mpi_rank() == 0 else None
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 42
+        req.is_generation_only_request = False
+        req.multimodal_positions = []
+        req.get_tokens.return_value = list(range(65))
+
+        with patch("tensorrt_llm._torch.pyexecutor.connectors."
+                   "kv_cache_connector.mpi_broadcast") as broadcast:
+            assert manager.get_num_new_matched_tokens(req, 64) == 0
+
+        worker.can_skip_scheduler_match.assert_called_once_with(65, 64)
+        broadcast.assert_not_called()
+        if scheduler is not None:
+            scheduler.get_num_new_matched_tokens.assert_not_called()
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_does_not_skip_multimodal_scheduler_match(
+        mpi_pool_executor):
+
+    def test():
+        worker = MagicMock()
+        worker.can_skip_scheduler_match.return_value = True
+
+        scheduler = MagicMock() if mpi_rank() == 0 else None
+        if scheduler is not None:
+            scheduler.get_num_new_matched_tokens.return_value = (0, False)
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 42
+        req.is_generation_only_request = False
+        req.multimodal_positions = [MagicMock()]
+        req.get_tokens.return_value = list(range(65))
+
+        assert manager.get_num_new_matched_tokens(req, 64) == 0
+
+        worker.can_skip_scheduler_match.assert_not_called()
+        if scheduler is not None:
+            scheduler.get_num_new_matched_tokens.assert_called_once_with(
+                req, 64)
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
 
     def test():
         worker = MagicMock()
+        worker.can_skip_scheduler_match.return_value = False
 
         if mpi_rank() == 0:
             scheduler = MagicMock()
@@ -203,10 +264,12 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
         req0 = MagicMock()
         req0.request_id = 0
         req0.is_generation_only_request = False
+        req0.multimodal_positions = []
 
         req1 = MagicMock()
         req1.request_id = 1
         req1.is_generation_only_request = False
+        req1.multimodal_positions = []
 
         if mpi_rank() == 0:
             scheduler.get_num_new_matched_tokens.return_value = (16, True)

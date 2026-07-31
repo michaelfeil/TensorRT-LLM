@@ -116,6 +116,15 @@ class KvCacheConnectorWorker(ABC):
     def _clear_connector_meta(self):
         self._metadata = None
 
+    def can_skip_scheduler_match(self, request_num_tokens: int, num_computed_tokens: int) -> bool:
+        """Return whether scheduler-side matching cannot add reusable tokens.
+
+        Implementations that opt in must return the same result on every
+        distributed rank. The request will still be included in connector
+        metadata, but ``get_num_new_matched_tokens`` will not run.
+        """
+        return False
+
     def register_forward_pass_callable(self) -> Callable:
         """
         This callable will be called at the end of the forward pass.
@@ -525,6 +534,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
         if request.is_generation_only_request:
             raise RuntimeError("Connector API is not supported for generation-only requests!")
+
+        request_num_tokens = len(request.get_tokens(0))
+        if not request.multimodal_positions and self.worker.can_skip_scheduler_match(
+            request_num_tokens, num_computed_tokens
+        ):
+            return 0
 
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
