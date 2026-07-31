@@ -125,6 +125,16 @@ class KvCacheConnectorWorker(ABC):
         """
         return False
 
+    def supports_schedulable_reuse_preview(self) -> bool:
+        """Return whether local KV reuse may be previewed before scheduling.
+
+        The preview only changes the scheduler's compute estimate; allocation
+        still performs the authoritative local and connector lookups. A
+        connector must opt in only when it accepts a nonzero locally-computed
+        prefix in ``get_num_new_matched_tokens`` on every distributed rank.
+        """
+        return False
+
     def register_forward_pass_callable(self) -> Callable:
         """
         This callable will be called at the end of the forward pass.
@@ -581,6 +591,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         request.py_num_connector_matched_tokens = num_tokens
 
         return num_tokens
+
+    def supports_schedulable_reuse_preview(self) -> bool:
+        return self.worker.supports_schedulable_reuse_preview()
 
     def should_add_sequence(self, request: LlmRequest) -> bool:
         req_id = request.request_id

@@ -23,8 +23,9 @@ import pytest
 
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests, KvCacheConnectorManager,
+    AsyncRequests, KvCacheConnectorManager, KvCacheConnectorWorker,
     KvCacheConnectorSchedulerOutputManager)
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
@@ -245,6 +246,40 @@ def test_connector_manager_does_not_skip_multimodal_scheduler_match(
                 req, 64)
 
     run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_connector_schedulable_reuse_preview_is_opt_in():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_schedulable_reuse_preview.return_value = False
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+
+    assert not manager.supports_schedulable_reuse_preview()
+
+    worker.supports_schedulable_reuse_preview.return_value = True
+    assert manager.supports_schedulable_reuse_preview()
+
+
+@pytest.mark.parametrize(
+    ("connector_manager", "expected"),
+    [
+        (None, True),
+        (MagicMock(supports_schedulable_reuse_preview=lambda: False), False),
+        (MagicMock(supports_schedulable_reuse_preview=lambda: True), True),
+    ],
+)
+def test_schedulable_reuse_preview_respects_connector_opt_in(
+        connector_manager, expected):
+    executor = object.__new__(PyExecutor)
+    executor.enable_kv_cache_reuse = True
+    executor.kv_cache_manager = MagicMock(
+        enable_partial_reuse=False,
+        is_vswa=False,
+        has_linear_attention_layers=False,
+    )
+    executor.kv_cache_manager.estimate_reusable_prompt_len = MagicMock()
+    executor.kv_connector_manager = connector_manager
+
+    assert executor._should_apply_schedulable_reuse_preview() is expected
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

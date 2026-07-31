@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import datetime
 import functools
@@ -2338,15 +2353,20 @@ class PyExecutor:
         # into the same chunk when their actual remaining work is small. Apply
         # it only when local KV reuse can estimate whole-request reuse; partial
         # reuse, VSWA, and linear attention already have more specific
-        # allocation behavior, and the KV connector path should not mutate
-        # prepopulation state before connector-managed cache loading runs.
+        # allocation behavior. Connectors must explicitly accept a nonzero
+        # local prefix because the preview changes the input to their
+        # scheduler-side match hook.
+        connector_allows_preview = (
+            self.kv_connector_manager is None
+            or self.kv_connector_manager.supports_schedulable_reuse_preview()
+        )
         return (self.enable_kv_cache_reuse
                 and self.kv_cache_manager is not None and hasattr(
                     self.kv_cache_manager, "estimate_reusable_prompt_len")
                 and not self.kv_cache_manager.enable_partial_reuse
                 and not self.kv_cache_manager.is_vswa
                 and not self.kv_cache_manager.has_linear_attention_layers
-                and self.kv_connector_manager is None)
+                and connector_allows_preview)
 
     def _capture_schedulable_reuse_state(
             self, request: LlmRequest) -> Tuple[int, int, int]:
