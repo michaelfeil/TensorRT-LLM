@@ -13,6 +13,11 @@ on:
         required: true
         default: "100-real;103-real"
         type: string
+      build_wheel_jobs:
+        description: Parallel compile jobs for the wheel build
+        required: true
+        default: "32"
+        type: string
   push:
     branches:
       - b10-1.3.0rc19
@@ -51,4 +56,5 @@ jobs:
         env:
           CUDA_ARCHS_AMD64: ${{ inputs.amd64_cuda_archs || '80-real;86-real;90-real;100-real;103-real' }}
           CUDA_ARCHS_ARM64: ${{ inputs.arm64_cuda_archs || '100-real;103-real' }}
+          BUILD_WHEEL_JOBS: ${{ inputs.build_wheel_jobs || '32' }}
         run: scripts/build_trtllm_release_image.sh
