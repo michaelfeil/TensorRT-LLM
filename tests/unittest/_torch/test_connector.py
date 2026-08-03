@@ -577,8 +577,7 @@ def test_connector_manager_boundary_rewind_forces_one_exchange():
     manager._run_on_leader.assert_not_called()
 
 
-@pytest.mark.parametrize("force_reason",
-                         ["context", "paused", "async", "finish"])
+@pytest.mark.parametrize("force_reason", ["context", "paused", "async"])
 def test_connector_manager_non_decode_work_forces_metadata_exchange(
         force_reason):
     worker = MagicMock(spec=KvCacheConnectorWorker)
@@ -607,14 +606,51 @@ def test_connector_manager_non_decode_work_forces_metadata_exchange(
         scheduled_batch.paused_requests = [req]
     elif force_reason == "async":
         manager.pending_async_requests.loading[99] = MagicMock()
-    elif force_reason == "finish":
-        manager._run_on_leader = MagicMock(return_value=False)
-        manager.request_finished(req, [10])
     else:
         raise AssertionError(f"Unhandled force reason: {force_reason}")
 
     assert not manager._can_skip_metadata_exchange(scheduled_batch,
                                                    kv_cache_manager)
+
+
+@pytest.mark.parametrize("saving_async", [False, True])
+def test_connector_manager_finish_only_forces_when_saving_async(saving_async):
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    active_req, scheduled_batch = _make_generation_batch(10)
+    finished_req = MagicMock(request_id=99)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+
+    assert not manager._can_skip_metadata_exchange(scheduled_batch,
+                                                   kv_cache_manager)
+    assert manager._can_skip_metadata_exchange(scheduled_batch,
+                                               kv_cache_manager)
+    manager._run_on_leader = MagicMock(return_value=saving_async)
+
+    manager.request_finished(finished_req, [99])
+
+    assert manager._force_metadata_exchange is saving_async
+    assert manager._can_skip_metadata_exchange(
+        scheduled_batch, kv_cache_manager) is not saving_async
+    if saving_async:
+        assert manager.new_async_requests.saving == {99: finished_req}
+        assert finished_req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    else:
+        assert manager.new_async_requests.is_empty
+        assert active_req.request_id in manager._metadata_exchange_progress
+
+
+def test_connector_manager_synchronous_finish_preserves_existing_force():
+    manager = KvCacheConnectorManager(MagicMock(), scheduler=MagicMock())
+    manager._force_metadata_exchange = True
+    manager._run_on_leader = MagicMock(return_value=False)
+
+    manager.request_finished(MagicMock(request_id=99), [99])
+
+    assert manager._force_metadata_exchange
 
 
 def test_connector_layerwise_transfer_hooks_are_enabled_by_default():

@@ -838,7 +838,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             del self.finished_async_loading_requests[req.request_id]
         self._metadata_exchange_progress.pop(req.request_id, None)
         self._worker_visible_progress.pop(req.request_id, None)
-        self._force_metadata_exchange = True
 
         saving_async = self._run_on_leader(
             lambda: self.scheduler.request_finished(req, cache_block_ids)
@@ -847,6 +846,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # This is similar to take_scheduled_requests_pending_load.
         # We need to update the request's state to indicate that it's still being used, but isn't schedulable.
         if saving_async:
+            # Synchronous finish was already broadcast above and has no
+            # follow-up worker metadata. Async save keeps worker lifecycle
+            # state active and therefore retains the conservative full path.
+            self._force_metadata_exchange = True
             self.new_async_requests.saving[req.request_id] = req
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
