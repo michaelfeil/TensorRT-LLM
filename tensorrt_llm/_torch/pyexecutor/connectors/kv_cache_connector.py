@@ -694,6 +694,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ) -> bool:
         """Return a conservative decision that is identical on replicated ranks."""
+        if not self.worker.supports_rank_local_metadata_skip():
+            return False
+
         block_size = kv_cache_manager.tokens_per_block
         progress_changed = False
         active_request_ids = set()
@@ -739,8 +742,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             and self.local_finished_async_requests.is_empty
         )
         can_skip = (
-            self.worker.supports_rank_local_metadata_skip()
-            and not self._force_metadata_exchange
+            not self._force_metadata_exchange
             and not has_non_generation_work
             and not has_async_work
             and not progress_changed

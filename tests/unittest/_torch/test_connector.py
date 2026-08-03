@@ -653,6 +653,18 @@ def test_connector_manager_synchronous_finish_preserves_existing_force():
     assert manager._force_metadata_exchange
 
 
+def test_connector_manager_unsupported_skip_avoids_progress_scan():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = False
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    scheduled_batch = MagicMock(spec=ScheduledRequests)
+    scheduled_batch.all_requests.side_effect = AssertionError(
+        "unsupported metadata skip must not scan the scheduled batch")
+
+    assert not manager._can_skip_metadata_exchange(scheduled_batch, MagicMock())
+    scheduled_batch.all_requests.assert_not_called()
+
+
 def test_connector_layerwise_transfer_hooks_are_enabled_by_default():
     worker = MagicMock(spec=KvCacheConnectorWorker)
 
