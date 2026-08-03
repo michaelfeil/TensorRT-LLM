@@ -401,6 +401,128 @@ def test_connector_manager_skips_same_block_metadata_collective(
     run_across_mpi(mpi_pool_executor, test, 2)
 
 
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_mtp_lookahead_waits_for_accepted_block(
+        mpi_pool_executor):
+
+    def test():
+        worker = MagicMock(spec=KvCacheConnectorWorker)
+        worker.supports_rank_local_metadata_skip.return_value = True
+        scheduler = MagicMock() if mpi_rank() == 0 else None
+        if scheduler is not None:
+            scheduler.build_connector_meta.return_value = b"metadata"
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+        req, scheduled_batch = _make_generation_batch(28)
+        req.py_draft_tokens = [0, 0, 0]
+        kv_cache_manager = MagicMock()
+        kv_cache_manager.tokens_per_block = 32
+        kv_cache_manager.get_cache_indices.return_value = [10]
+        kv_cache_manager.commit_and_get_block_hashes.return_value = []
+
+        # Establish worker-visible progress below the lookahead boundary.
+        manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+        manager.handle_metadata()
+        worker.bind_connector_meta.reset_mock()
+        if scheduler is not None:
+            scheduler.build_connector_meta.reset_mock()
+
+        # MTP3 now schedules through position 32, but token 32 has not been
+        # accepted. KVBM cannot transfer that block, so only leader state moves.
+        req.get_num_tokens.return_value = 29
+        with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+            manager.handle_metadata()
+        broadcast.assert_not_called()
+        worker.bind_connector_meta.assert_not_called()
+        if scheduler is not None:
+            scheduler.advance_without_worker_metadata.assert_called_once()
+            scheduler.advance_without_worker_metadata.reset_mock()
+
+        # Lookahead allocation is also leader-local; it does not make the
+        # still-incomplete block transferable.
+        req.get_num_tokens.return_value = 30
+        kv_cache_manager.get_cache_indices.return_value = [10, 11]
+        with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+            manager.handle_metadata()
+        broadcast.assert_not_called()
+        worker.bind_connector_meta.assert_not_called()
+        if scheduler is not None:
+            scheduler.advance_without_worker_metadata.assert_called_once()
+            output = scheduler.advance_without_worker_metadata.call_args.args[0]
+            assert output.cached_requests[0].new_block_ids == [11]
+            scheduler.advance_without_worker_metadata.reset_mock()
+
+        # Once the accepted sequence itself completes the block, workers must
+        # receive the transfer/hash boundary.
+        req.get_num_tokens.return_value = 32
+        real_broadcast = kv_cache_connector.mpi_broadcast
+        with patch.object(kv_cache_connector,
+                          "mpi_broadcast",
+                          wraps=real_broadcast) as broadcast:
+            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+            manager.handle_metadata()
+        broadcast.assert_called_once()
+        worker.bind_connector_meta.assert_called_once_with(b"metadata")
+        if scheduler is not None:
+            scheduler.advance_without_worker_metadata.assert_not_called()
+            scheduler.build_connector_meta.assert_called_once()
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_connector_manager_mtp_allocation_rewind_stays_state_only():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    scheduler = MagicMock()
+    scheduler.build_connector_meta.return_value = b"metadata"
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    req, scheduled_batch = _make_generation_batch(28)
+    req.py_draft_tokens = [0, 0, 0]
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    manager._run_on_leader = MagicMock(return_value=b"metadata")
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    manager._run_on_leader.reset_mock()
+
+    # Lookahead allocates block 11 without crossing an accepted-token boundary.
+    req.get_num_tokens.return_value = 30
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    output = scheduler.advance_without_worker_metadata.call_args.args[0]
+    assert output.cached_requests[0].new_block_ids == [11]
+
+    # Rejecting the lookahead frees block 11. The rewind trims both TRT and
+    # connector leader state without forcing worker metadata.
+    scheduler.advance_without_worker_metadata.reset_mock()
+    req.get_num_tokens.return_value = 29
+    req.get_tokens.return_value = list(range(29))
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    manager.on_rewind(req, kv_cache_manager)
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+
+    manager._run_on_leader.assert_not_called()
+    scheduler.on_rewind.assert_called_once_with(req, [10])
+    scheduler.advance_without_worker_metadata.assert_called_once()
+
+    # A replacement lookahead allocation is emitted as a new leader-local ID.
+    scheduler.advance_without_worker_metadata.reset_mock()
+    req.get_num_tokens.return_value = 30
+    kv_cache_manager.get_cache_indices.return_value = [10, 12]
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    output = scheduler.advance_without_worker_metadata.call_args.args[0]
+    assert output.cached_requests[0].new_block_ids == [12]
+    manager._run_on_leader.assert_not_called()
+
+
 def test_connector_manager_same_block_rewinds_stay_state_only():
     worker = MagicMock(spec=KvCacheConnectorWorker)
     worker.supports_rank_local_metadata_skip.return_value = True

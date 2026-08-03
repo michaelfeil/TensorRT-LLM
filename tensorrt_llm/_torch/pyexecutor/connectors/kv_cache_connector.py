@@ -704,15 +704,19 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             completed_blocks = num_tokens // block_size
 
             if request_id in generation_request_ids:
-                next_position = num_tokens + get_draft_token_length(req)
+                # Draft lookahead reserves device capacity but cannot produce a
+                # worker transfer before those tokens are accepted into the
+                # request. Accepted full blocks are therefore the only
+                # worker-visible generation boundary.
+                transfer_boundary = completed_blocks
             else:
                 next_position = req.context_current_position + min(
                     req.context_remaining_length, req.context_chunk_size
                 )
+                transfer_boundary = next_position // block_size
             # New device block IDs are consumed by the leader-only state
             # advance. Workers need metadata only once the block can produce a
             # transfer or its completed hash chain changes.
-            transfer_boundary = next_position // block_size
             progress = (completed_blocks, transfer_boundary)
             if self._metadata_exchange_progress.get(request_id) != progress:
                 progress_changed = True
@@ -758,8 +762,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         num_tokens = req.get_num_tokens(0)
         completed_blocks = num_tokens // block_size
         live_block_ids = kv_cache_manager.get_cache_indices(req)
-        next_position = num_tokens + get_draft_token_length(req)
-        progress = (completed_blocks, next_position // block_size)
+        progress = (completed_blocks, completed_blocks)
         worker_visible_progress = self._worker_visible_progress.get(req.request_id)
         rewind_crossed_worker_boundary = worker_visible_progress != progress
         self._force_metadata_exchange |= rewind_crossed_worker_boundary
