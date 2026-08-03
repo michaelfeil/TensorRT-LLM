@@ -1231,12 +1231,19 @@ def _get_logprobs(worker,
                 return logprobs_result
 
         # TRT backend: compute both prompt and generation logprobs from logits
+        prompt_token_ids = None
+        if (logprob_params.prompt_logprobs is not None
+                and response.result.context_logits is not None):
+            prompt_token_ids = generation_result.prompt_token_ids[1:]
+            prompt_token_ids.extend(response.result.output_token_ids[0][:1])
+
         logprobs_result = compute_logprobs(
             logprob_params.prompt_logprobs,
             logprob_params.logprobs,
             response.result.context_logits,
             response.result.generation_logits,
             response.result.output_token_ids[0],
+            prompt_token_ids,
             simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
             simple_logprobs=logprob_params.logprobs_simple_format,
         )
