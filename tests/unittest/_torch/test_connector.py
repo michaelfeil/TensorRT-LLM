@@ -22,14 +22,16 @@ import mpi4py
 import pytest
 
 from tensorrt_llm import mpi_rank
+from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests, KvCacheConnectorManager, KvCacheConnectorWorker,
-    KvCacheConnectorSchedulerOutputManager)
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    AsyncRequests,
+    KvCacheConnectorManager,
+    KvCacheConnectorSchedulerOutputManager,
+    KvCacheConnectorWorker,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
-                                                             KVCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -234,7 +236,8 @@ def test_connector_manager_builds_scheduler_output_only_on_leader(
         manager.handle_metadata()
 
         if scheduler is not None:
-            scheduler.build_connector_meta.assert_called_once_with("leader-output")
+            scheduler.build_connector_meta.assert_called_once_with(
+                "leader-output")
         worker.bind_connector_meta.assert_called_once_with({"request_id": 42})
 
     run_across_mpi(mpi_pool_executor, test, 2)
@@ -309,6 +312,169 @@ def test_connector_schedulable_reuse_preview_is_opt_in():
 
     worker.supports_schedulable_reuse_preview.return_value = True
     assert manager.supports_schedulable_reuse_preview()
+
+
+def _make_generation_batch(num_tokens: int):
+    req = MagicMock()
+    req.request_id = 42
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_draft_tokens = []
+    req.get_num_tokens.return_value = num_tokens
+    req.get_tokens.return_value = list(range(num_tokens))
+    req.get_token.side_effect = lambda _beam, position: position
+    req.kv_cache_retention_config = None
+    req.cache_salt = None
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+    return req, scheduled_batch
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_skips_same_block_metadata_collective(
+        mpi_pool_executor):
+
+    def test():
+        worker = MagicMock(spec=KvCacheConnectorWorker)
+        worker.supports_rank_local_metadata_skip.return_value = True
+        scheduler = MagicMock() if mpi_rank() == 0 else None
+        if scheduler is not None:
+            scheduler.build_connector_meta.return_value = b"metadata"
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+        req, scheduled_batch = _make_generation_batch(30)
+        kv_cache_manager = MagicMock()
+        kv_cache_manager.tokens_per_block = 32
+        kv_cache_manager.get_cache_indices.return_value = [10]
+        kv_cache_manager.commit_and_get_block_hashes.return_value = []
+
+        # The first observation establishes worker-visible state.
+        manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+        manager.handle_metadata()
+        worker.bind_connector_meta.reset_mock()
+        if scheduler is not None:
+            scheduler.build_connector_meta.reset_mock()
+
+        # Token 31 remains in the same block and needs only leader state.
+        req.get_num_tokens.return_value = 31
+        with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+            manager.handle_metadata()
+        broadcast.assert_not_called()
+        worker.bind_connector_meta.assert_not_called()
+        if scheduler is not None:
+            scheduler.advance_without_worker_metadata.assert_called_once()
+            scheduler.advance_without_worker_metadata.reset_mock()
+
+        # Token 32 completes a block and must perform one real exchange.
+        req.get_num_tokens.return_value = 32
+        real_broadcast = kv_cache_connector.mpi_broadcast
+        with patch.object(kv_cache_connector,
+                          "mpi_broadcast",
+                          wraps=real_broadcast) as broadcast:
+            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+            manager.handle_metadata()
+        broadcast.assert_called_once()
+        worker.bind_connector_meta.assert_called_once_with(b"metadata")
+        if scheduler is not None:
+            scheduler.advance_without_worker_metadata.assert_not_called()
+            scheduler.build_connector_meta.assert_called_once()
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_connector_manager_same_block_rewinds_stay_state_only():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    scheduler = MagicMock()
+    scheduler.build_connector_meta.return_value = b"metadata"
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    req, scheduled_batch = _make_generation_batch(10)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    manager._run_on_leader = MagicMock(return_value=b"metadata")
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    manager._run_on_leader.reset_mock()
+
+    for _ in range(3):
+        manager.on_rewind(req, kv_cache_manager)
+        manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+        manager.handle_metadata()
+
+    manager._run_on_leader.assert_not_called()
+    assert scheduler.advance_without_worker_metadata.call_count == 3
+
+
+def test_connector_manager_boundary_rewind_forces_one_exchange():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    req, scheduled_batch = _make_generation_batch(32)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    manager._run_on_leader = MagicMock(return_value=b"metadata")
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    manager._run_on_leader.reset_mock()
+
+    req.get_num_tokens.return_value = 31
+    manager.on_rewind(req, kv_cache_manager)
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    manager._run_on_leader.assert_called_once()
+
+    manager._run_on_leader.reset_mock()
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    manager._run_on_leader.assert_not_called()
+
+
+@pytest.mark.parametrize("force_reason",
+                         ["context", "paused", "async", "finish"])
+def test_connector_manager_non_decode_work_forces_metadata_exchange(
+        force_reason):
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    scheduler = MagicMock()
+    scheduler.request_finished.return_value = False
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    req, scheduled_batch = _make_generation_batch(10)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+
+    # A new request exchanges once, then unchanged cached decode is eligible.
+    assert not manager._can_skip_metadata_exchange(scheduled_batch,
+                                                   kv_cache_manager)
+    assert manager._can_skip_metadata_exchange(scheduled_batch,
+                                               kv_cache_manager)
+
+    if force_reason == "context":
+        scheduled_batch.generation_requests = []
+        scheduled_batch.context_requests_last_chunk = [req]
+        req.context_current_position = 0
+        req.context_remaining_length = 10
+        req.context_chunk_size = 10
+    elif force_reason == "paused":
+        scheduled_batch.paused_requests = [req]
+    elif force_reason == "async":
+        manager.pending_async_requests.loading[99] = MagicMock()
+    elif force_reason == "finish":
+        manager._run_on_leader = MagicMock(return_value=False)
+        manager.request_finished(req, [10])
+    else:
+        raise AssertionError(f"Unhandled force reason: {force_reason}")
+
+    assert not manager._can_skip_metadata_exchange(scheduled_batch,
+                                                   kv_cache_manager)
 
 
 def test_connector_layerwise_transfer_hooks_are_enabled_by_default():
@@ -498,9 +664,11 @@ def test_scheduler_output_refreshes_hashes_when_context_allocation_grows():
     scheduled_batch.context_requests_last_chunk = [req]
     manager = KvCacheConnectorSchedulerOutputManager()
 
-    first = manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
+    first = manager.build_scheduler_output(scheduled_batch, AsyncRequests({},
+                                                                          {}),
                                            kv_cache_manager)
-    second = manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
+    second = manager.build_scheduler_output(scheduled_batch,
+                                            AsyncRequests({}, {}),
                                             kv_cache_manager)
 
     assert first.new_requests[0].block_hashes == [11]
