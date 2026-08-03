@@ -784,6 +784,41 @@ def test_scheduler_output_only_reads_hashes_at_block_boundaries():
     assert req.get_token.call_args_list == [call(0, 3), call(0, 4)]
 
 
+def test_scheduler_output_mtp_allocation_does_not_refresh_generation_hashes():
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
+
+    req, scheduled_batch = _make_generation_batch(28)
+    req.py_draft_tokens = [0, 0, 0]
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    initial = manager.build_scheduler_output(scheduled_batch,
+                                             AsyncRequests({}, {}),
+                                             kv_cache_manager)
+    assert initial.cached_requests[0].block_hashes == []
+
+    # MTP3 allocation grows before another accepted block exists. Physical
+    # capacity does not change the logical cumulative hash chain.
+    req.get_num_tokens.return_value = 30
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    allocation = manager.build_scheduler_output(scheduled_batch,
+                                                AsyncRequests({}, {}),
+                                                kv_cache_manager)
+    assert allocation.cached_requests[0].new_block_ids == [11]
+    assert allocation.cached_requests[0].block_hashes is None
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 1
+
+    # The accepted block completion is the next logical hash-chain change.
+    req.get_num_tokens.return_value = 32
+    completion = manager.build_scheduler_output(scheduled_batch,
+                                                AsyncRequests({}, {}),
+                                                kv_cache_manager)
+    assert completion.cached_requests[0].block_hashes == [12345]
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
+
+
 def test_scheduler_output_refreshes_hashes_when_context_allocation_grows():
     """Chunked prefill refreshes hashes when more prompt blocks are allocated."""
     kv_cache_manager = MagicMock()
@@ -884,6 +919,7 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
         f"Expected new_block_ids == [3], got {cached.new_block_ids}"
     assert cached.new_tokens == [6], \
         f"Expected accepted token 6 in new_tokens, got {cached.new_tokens}"
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
 
 
 def _make_kv_cache_manager_for_update_resources(is_draft: bool):

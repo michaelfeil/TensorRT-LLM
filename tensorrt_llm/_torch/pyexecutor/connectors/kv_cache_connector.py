@@ -463,7 +463,9 @@ class KvCacheConnectorSchedulerOutputRequest:
         # Probe and forward the chain only when another block can have become
         # full. Rewinds invalidate this marker in ``on_rewind``.
         num_hashed_tokens = (num_tokens // tokens_per_block) * tokens_per_block
-        hash_probe_state = (num_hashed_tokens, len(self.block_ids))
+        hash_probe_state = (
+            num_hashed_tokens if is_generation else (num_hashed_tokens, len(self.block_ids))
+        )
         if hash_probe_state != self.hash_probe_state:
             block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
             self.hash_probe_state = hash_probe_state
