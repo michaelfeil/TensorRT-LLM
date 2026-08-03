@@ -380,6 +380,24 @@ def test_connector_manager_skips_same_block_metadata_collective(
             scheduler.advance_without_worker_metadata.assert_not_called()
             scheduler.build_connector_meta.assert_called_once()
 
+        # Token 33 allocates the next device block, but no transfer can use it
+        # until a later full-block boundary. The leader consumes the new block
+        # ID without another worker metadata collective.
+        worker.bind_connector_meta.reset_mock()
+        if scheduler is not None:
+            scheduler.build_connector_meta.reset_mock()
+        req.get_num_tokens.return_value = 33
+        kv_cache_manager.get_cache_indices.return_value = [10, 11]
+        with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+            manager.handle_metadata()
+        broadcast.assert_not_called()
+        worker.bind_connector_meta.assert_not_called()
+        if scheduler is not None:
+            scheduler.advance_without_worker_metadata.assert_called_once()
+            output = scheduler.advance_without_worker_metadata.call_args.args[0]
+            assert output.cached_requests[0].new_block_ids == [11]
+
     run_across_mpi(mpi_pool_executor, test, 2)
 
 

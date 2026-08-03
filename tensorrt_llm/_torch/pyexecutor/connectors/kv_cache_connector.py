@@ -709,9 +709,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 next_position = req.context_current_position + min(
                     req.context_remaining_length, req.context_chunk_size
                 )
-            allocated_blocks = (next_position + block_size - 1) // block_size
+            # New device block IDs are consumed by the leader-only state
+            # advance. Workers need metadata only once the block can produce a
+            # transfer or its completed hash chain changes.
             transfer_boundary = next_position // block_size
-            progress = (completed_blocks, allocated_blocks, transfer_boundary)
+            progress = (completed_blocks, transfer_boundary)
             if self._metadata_exchange_progress.get(request_id) != progress:
                 progress_changed = True
             self._metadata_exchange_progress[request_id] = progress
@@ -740,10 +742,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if not can_skip:
             self._force_metadata_exchange = False
             for req in scheduled_batch.all_requests():
-                self._worker_visible_progress[req.request_id] = (
-                    req.get_num_tokens(0) // block_size,
-                    len(kv_cache_manager.get_cache_indices(req)),
-                )
+                self._worker_visible_progress[req.request_id] = self._metadata_exchange_progress[
+                    req.request_id
+                ]
         return can_skip
 
     def on_rewind(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
@@ -757,18 +758,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         num_tokens = req.get_num_tokens(0)
         completed_blocks = num_tokens // block_size
         live_block_ids = kv_cache_manager.get_cache_indices(req)
-        worker_visible_progress = self._worker_visible_progress.get(req.request_id)
-        rewind_crossed_worker_boundary = worker_visible_progress != (
-            completed_blocks,
-            len(live_block_ids),
-        )
-        self._force_metadata_exchange |= rewind_crossed_worker_boundary
         next_position = num_tokens + get_draft_token_length(req)
-        self._metadata_exchange_progress[req.request_id] = (
-            completed_blocks,
-            (next_position + block_size - 1) // block_size,
-            next_position // block_size,
-        )
+        progress = (completed_blocks, next_position // block_size)
+        worker_visible_progress = self._worker_visible_progress.get(req.request_id)
+        rewind_crossed_worker_boundary = worker_visible_progress != progress
+        self._force_metadata_exchange |= rewind_crossed_worker_boundary
+        self._metadata_exchange_progress[req.request_id] = progress
         if self.scheduler is not None:
             self.scheduler_output_manager.on_rewind(req, kv_cache_manager)
             self.scheduler.on_rewind(req, live_block_ids)
