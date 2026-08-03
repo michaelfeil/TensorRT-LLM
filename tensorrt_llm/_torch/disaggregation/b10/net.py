@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Any, Optional
 
 from tensorrt_llm import logger
@@ -186,6 +187,88 @@ def _advertised_ifname_from_ucx_net_devices() -> Optional[str]:
         if netdev is not None:
             return netdev
     return None
+
+
+# A NIC failure and a dead peer look identical from a transfer error: both end
+# in a timeout or an endpoint error. They need different responses, and only the
+# first one is what NIC failover covers - failover moves traffic to a surviving
+# local NIC, and can do nothing about a peer that is gone. Classify by looking
+# at the local RDMA devices: if one of ours is down, this is a NIC failure; if
+# they are all healthy, the peer stopped answering.
+_RDMA_HEALTH_CACHE_TTL_S = 2.0
+_rdma_health_cache: tuple[float, str] = (0.0, "")
+
+
+def _ib_port_dir(device: str, port: str) -> str:
+    return f"/sys/class/infiniband/{device}/ports/{port}"
+
+
+def _read_sysfs(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as sysfs_file:
+            return sysfs_file.readline().strip()
+    except OSError:
+        return ""
+
+
+def _ib_port_has_global_gid(port_dir: str) -> bool:
+    """Whether the port still has a routable (non link-local) GID.
+
+    Required in addition to the port state: on RoCE, removing the netdev IP
+    deletes the GID while the port keeps reporting ACTIVE, so the port state
+    alone would call a rail healthy when it can no longer address anyone. The
+    GID *index* is not stable, so scan rather than probe a fixed slot.
+    """
+    try:
+        gid_names = os.listdir(f"{port_dir}/gids")
+    except OSError:
+        return True  # cannot tell; do not claim the device is broken
+    for gid_name in gid_names:
+        gid = _read_sysfs(f"{port_dir}/gids/{gid_name}")
+        if gid and not gid.startswith("fe80") and set(gid) != {"0", ":"}:
+            return True
+    return False
+
+
+def _local_rdma_device_faults() -> list[str]:
+    """Return one description per configured local device that is not usable."""
+    faults = []
+    for device in _ucx_net_devices_from_env():
+        if device == "all" or device.startswith("^"):
+            continue
+        device_name, _, port = device.partition(":")
+        port_dir = _ib_port_dir(device_name, port or "1")
+        state = _read_sysfs(f"{port_dir}/state")
+        if not state:
+            continue  # not an RDMA device (e.g. a plain netdev), nothing to check
+        if "ACTIVE" not in state:
+            faults.append(f"{device_name}: state={state or 'unknown'}")
+        elif not _ib_port_has_global_gid(port_dir):
+            faults.append(f"{device_name}: no routable GID (address removed?)")
+    return faults
+
+
+def classify_transfer_failure_cause() -> str:
+    """One-line cause classification for a transfer failure log.
+
+    Cached briefly so a burst of failures does not re-read sysfs per transfer.
+    """
+    global _rdma_health_cache
+    now = time.monotonic()
+    cached_at, cached = _rdma_health_cache
+    if cached and (now - cached_at) < _RDMA_HEALTH_CACHE_TTL_S:
+        return cached
+
+    faults = _local_rdma_device_faults()
+    if faults:
+        cause = "cause=LOCAL_NIC_DOWN [" + "; ".join(faults) + "] (NIC failover applies)"
+    else:
+        cause = (
+            "cause=PEER_UNREACHABLE (all local RDMA devices healthy; peer "
+            "process/pod or its NIC is gone - NIC failover does not cover this)"
+        )
+    _rdma_health_cache = (now, cause)
+    return cause
 
 
 def _augment_ucx_net_devices_for_sockaddr() -> None:

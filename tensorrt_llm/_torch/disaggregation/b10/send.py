@@ -700,6 +700,10 @@ class SendPipeline:
             f"max_data_chunk_size={plan.max_wire_chunk_size} "
         )
         error_detail = "" if cancelled else f" error={type(exc).__name__}: {exc}"
+        # Say which kind of failure this is: a local NIC that went down (what
+        # NIC failover handles) or a peer that stopped answering (which it
+        # cannot). Both otherwise surface as the same timeout/endpoint error.
+        cause_detail = "" if cancelled else f" {b10_net.classify_transfer_failure_cause()}"
         logger.warning(
             f"B10 send transfer {plan.transfer_id} {ctx.status}: "
             f"remote={plan.remote_name} slot_index={lease.slot_index} "
@@ -707,7 +711,7 @@ class SendPipeline:
             f"descs={plan.desc_count} data_chunks={plan.wire_chunk_count} "
             f"total_bytes={plan.total_bytes} {failure_detail}"
             f"checked_out_staging_buffers={len(checked_out_views)}"
-            f"{error_detail}"
+            f"{error_detail}{cause_detail}"
         )
         self._endpoints._retire_send_endpoint(
             lease,

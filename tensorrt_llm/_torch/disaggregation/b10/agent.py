@@ -356,11 +356,33 @@ class B10CacheTransferAgent(BaseTransferAgent):
             )
         return B10AgentDescriptor(
             name=self.name,
-            host=self._ucxx.get_address(ifname=self._advertised_ifname),
+            host=self._resolve_advertised_host(),
             port=int(self._port),
             features=(_FEATURE_PACKED_DESCS,),
             worker_address=bytes(self._ucxx.get_worker_address()),
         )
+
+    def _resolve_advertised_host(self) -> str:
+        # The advertised host is informational for the AM wire plane (peers
+        # connect via the worker address blob, not host:port). The ifname
+        # derived from UCX_NET_DEVICES can be an L3-less RDMA netdev (e.g. a
+        # RoCE bond whose GIDs are IPv6-only), where SIOCGIFADDR raises
+        # OSError(99); fall back rather than failing agent startup.
+        try:
+            return self._ucxx.get_address(ifname=self._advertised_ifname)
+        except OSError as exc:
+            logger.warning(
+                f"B10 cannot resolve an IPv4 address for advertised ifname "
+                f"{self._advertised_ifname!r} ({exc}); falling back to the "
+                f"default interface"
+            )
+        try:
+            return self._ucxx.get_address()
+        except OSError:
+            # Nothing is bound to this: the value only travels in the descriptor
+            # as the peer's advertised address, and the AM plane connects via
+            # the worker address blob instead.
+            return "0.0.0.0"  # nosec B104 - advertised value, not a bind address
 
     async def _shutdown_async(self) -> None:
         for address, endpoint in list(self._recv._reply_endpoints.items()):
