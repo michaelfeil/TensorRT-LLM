@@ -20,13 +20,15 @@ import torch
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.b10.agent import create_b10_transfer_agent
+from tensorrt_llm._torch.disaggregation.b10.mla_root_fanout import MLARootFanout
 from tensorrt_llm._torch.disaggregation.b10.pools import _DEFAULT_STAGING_POOL_BUFFER_SIZE
 from tensorrt_llm._torch.disaggregation.base.agent import BaseTransferAgent
-from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, TokenRange, get_unique_rid
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import indexer_k_cache_enabled
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -118,6 +120,45 @@ class B10CacheTransceiver(KvCacheTransceiverV2):
                 )
 
         super().__init__(mapping, dist, kv_cache_manager, cache_transceiver_config)
+        self._mla_root_fanout = MLARootFanout.create_if_enabled(
+            mapping, dist, kv_cache_manager, self._page_table, self._device_id
+        )
+
+    def _create_kv_slice(
+        self,
+        req,
+        token_range: Optional[TokenRange] = None,
+        is_last_slice: bool = True,
+    ) -> KVSlice:
+        kv_slice = super()._create_kv_slice(req, token_range, is_last_slice)
+        if self._mla_root_fanout is not None and req.is_generation_only_request():
+            return self._mla_root_fanout.register_receive_slice(req, kv_slice)
+        return kv_slice
+
+    def request_and_receive_sync(self, req) -> None:
+        request_id = get_unique_rid(req)
+        already_receiving = request_id in self._recv_sessions
+        use_mla_fanout = self._mla_root_fanout is not None and req.is_generation_only_request()
+        if use_mla_fanout:
+            duplicate_sessions = self._dist.tp_allgather(already_receiving)
+            if any(duplicate_sessions) and not all(duplicate_sessions):
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                raise RuntimeError(
+                    "B10 MLA root fanout found inconsistent sync receive sessions: "
+                    f"rid={request_id} already_receiving={duplicate_sessions}"
+                )
+
+        local_error = None
+        try:
+            super().request_and_receive_sync(req)
+        except Exception as error:
+            local_error = error
+
+        if use_mla_fanout and not already_receiving:
+            assert self._mla_root_fanout is not None
+            self._mla_root_fanout.finish_sync_receive(req, local_error)
+        if local_error is not None:
+            raise local_error
 
     def _create_transfer_agent(self, name: str) -> BaseTransferAgent:
         timeout_s = (
@@ -223,6 +264,8 @@ class B10CacheTransceiver(KvCacheTransceiverV2):
             at_least_request_num, collect_kv_transfer_events=collect_kv_transfer_events
         )
         completed, failed, success_events, error_events = result
+        if self._mla_root_fanout is not None:
+            self._mla_root_fanout.finish_async_receives(completed, failed)
         return (
             [py_request_ids.get(rid, rid) for rid in completed],
             [py_request_ids.get(rid, rid) for rid in failed],
