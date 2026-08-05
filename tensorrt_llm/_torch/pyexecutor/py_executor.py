@@ -120,6 +120,9 @@ DISAGG_TRANSFER_BACKPRESSURE_LOG_INTERVAL_SEC = 1.0
 DISAGG_ERROR_FREE_DELAY_S = float(
     os.environ.get("TRTLLM_DISAGG_ERROR_FREE_DELAY_S", "1") or "1")
 
+DISAGG_DRAFT_NORMALIZATION_ENV_VAR_NAME = (
+    "TRTLLM_ENABLE_DISAGG_DRAFT_TOKEN_NORMALIZATION")
+
 
 def _format_cache_transfer_error(error_msg_prefix: str,
                                  executor_rank: int) -> str:
@@ -5099,6 +5102,17 @@ class PyExecutor:
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
+    @staticmethod
+    def _normalize_disagg_draft_tokens(
+            draft_tokens: list[int], max_total_draft_tokens: int) -> list[int]:
+        """Normalize context drafts to the decode MTP depth."""
+        if len(draft_tokens) > max_total_draft_tokens:
+            return draft_tokens[:max_total_draft_tokens]
+        if len(draft_tokens) < max_total_draft_tokens:
+            return draft_tokens + [0] * (max_total_draft_tokens -
+                                         len(draft_tokens))
+        return draft_tokens
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
         cache_trans_complete_requests = []
@@ -5133,6 +5147,16 @@ class PyExecutor:
                     ctx_draft_tokens = [
                         0
                     ] * self.model_engine.max_total_draft_tokens
+                elif (ctx_draft_tokens and self.model_engine.enable_spec_decode
+                      and os.environ.get(
+                          DISAGG_DRAFT_NORMALIZATION_ENV_VAR_NAME, "0") == "1"):
+                    # CTX may run a different draft length than this gen engine
+                    # (e.g. one prefill pool feeding decode pools with different
+                    # MTP depths). Drafts are sequential predictions, so longer
+                    # drafts truncate cleanly and shorter ones are dummy-padded.
+                    ctx_draft_tokens = self._normalize_disagg_draft_tokens(
+                        ctx_draft_tokens,
+                        self.model_engine.max_total_draft_tokens)
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.py_beam_width
                 if not self._update_sampler_state_for_disagg_gen_request(

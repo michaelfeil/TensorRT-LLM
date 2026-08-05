@@ -112,6 +112,18 @@ def mock_executor(mock_dist):
     return MockPyExecutor(dist=mock_dist)
 
 
+@pytest.mark.parametrize(
+    ("draft_tokens", "expected"),
+    [
+        ([1, 2, 3], [1, 2]),
+        ([1], [1, 0]),
+        ([1, 2], [1, 2]),
+    ],
+)
+def test_normalize_disagg_draft_tokens(draft_tokens, expected):
+    assert PyExecutor._normalize_disagg_draft_tokens(draft_tokens, 2) == expected
+
+
 def test_handle_special_queue_items(mock_executor):
     """Test special queue item handling."""
     # Create a mock request
