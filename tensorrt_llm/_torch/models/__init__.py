@@ -19,6 +19,7 @@ from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
 from .modeling_glm import Glm4MoeForCausalLM
+from .modeling_glm_moe_dsa_vl import GlmMoeDsaVLModel
 from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
@@ -107,6 +108,7 @@ __all__ = [
     "GptOssForCausalLM",
     "SeedOssForCausalLM",
     "Glm4MoeForCausalLM",
+    "GlmMoeDsaVLModel",
     "Qwen3VLModel",
     "MiniMaxM2ForCausalLM",
     "MiniMaxM3ForCausalLM",
