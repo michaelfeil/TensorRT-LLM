@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager,
     KvCacheConnectorSchedulerOutputManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
                                                              KVCacheManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -40,6 +41,63 @@ mpi4py.MPI.pickle.__init__(
 
 def run_across_mpi(executor, fun, num_ranks):
     return list(executor.starmap(fun, [() for i in range(num_ranks)]))
+
+
+def test_send_kv_async_skips_stale_finished_connector_request():
+    request = MagicMock(py_request_id=42, is_finished=True)
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+    executor.kv_cache_manager = MagicMock()
+    executor.kv_cache_manager.get_cache_indices.return_value = [1, 2]
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.request_finished.return_value = False
+    executor.async_transfer_manager = MagicMock()
+    executor.disable_overlap_scheduler = False
+    executor.previous_batch = MagicMock()
+    executor.previous_batch.scheduled_requests.all_requests.return_value = [
+        request
+    ]
+    executor.active_requests = [request]
+
+    executor._send_kv_async([])
+
+    executor.kv_cache_manager.get_cache_indices.assert_called_once_with(request)
+    executor.kv_connector_manager.request_finished.assert_called_once_with(
+        request, [1, 2])
+
+    executor.active_requests = []
+    executor._send_kv_async([])
+
+    executor.kv_cache_manager.get_cache_indices.assert_called_once_with(request)
+    executor.kv_connector_manager.request_finished.assert_called_once_with(
+        request, [1, 2])
+
+
+@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
+def test_send_kv_async_avoids_unnecessary_active_request_scan(
+        disable_overlap_scheduler: bool) -> None:
+    request = MagicMock(py_request_id=42, is_finished=True)
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+    executor.kv_cache_manager = MagicMock()
+    executor.kv_cache_manager.get_cache_indices.return_value = [1, 2]
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.request_finished.return_value = False
+    executor.async_transfer_manager = MagicMock()
+    executor.disable_overlap_scheduler = disable_overlap_scheduler
+    executor.previous_batch = None
+    executor.active_requests = MagicMock()
+    executor.active_requests.__iter__.side_effect = AssertionError(
+        "active requests should not be scanned")
+
+    scheduled_requests = [request] if disable_overlap_scheduler else []
+    executor._send_kv_async(scheduled_requests)
+
+    if disable_overlap_scheduler:
+        executor.kv_cache_manager.get_cache_indices.assert_called_once_with(
+            request)
+    else:
+        executor.kv_cache_manager.get_cache_indices.assert_not_called()
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

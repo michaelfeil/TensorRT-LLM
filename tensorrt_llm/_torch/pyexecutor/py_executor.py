@@ -5383,6 +5383,17 @@ class PyExecutor:
             if not self.disable_overlap_scheduler:
                 requests = self.previous_batch.scheduled_requests.all_requests(
                 ) if self.previous_batch is not None else []
+                if requests:
+                    # The overlap scheduler retains the previous batch after
+                    # response handling has released its request resources.
+                    active_request_ids = {
+                        request.py_request_id
+                        for request in self.active_requests
+                    }
+                    requests = [
+                        request for request in requests
+                        if request.py_request_id in active_request_ids
+                    ]
             else:
                 requests = scheduled_requests
             for req in requests:
