@@ -5380,24 +5380,23 @@ class PyExecutor:
                         req.py_kv_transfer_start_time = time.time()
 
         if self.kv_connector_manager:
+            active_request_ids_filter = None
             if not self.disable_overlap_scheduler:
                 requests = self.previous_batch.scheduled_requests.all_requests(
                 ) if self.previous_batch is not None else []
                 if requests:
                     # The overlap scheduler retains the previous batch after
                     # response handling has released its request resources.
-                    active_request_ids = {
+                    active_request_ids_filter = {
                         request.py_request_id
                         for request in self.active_requests
                     }
-                    requests = [
-                        request for request in requests
-                        if request.py_request_id in active_request_ids
-                    ]
             else:
                 requests = scheduled_requests
             for req in requests:
-                if req.is_finished:
+                if (req.is_finished and
+                    (active_request_ids_filter is None
+                     or req.py_request_id in active_request_ids_filter)):
                     kv_connector_request_finished(req)
 
         if self.kv_cache_transceiver:
