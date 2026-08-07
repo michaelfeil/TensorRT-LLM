@@ -3540,8 +3540,12 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
         auto const maxDraftTokensToAdd = std::min(req.getNumDraftTokens(), req.mMaxNewTokens);
+        // mNumExtraKvTokens mirrors the extra tokens prepare_resources() appends once at context
+        // admission for one-model speculative decoding; without them the capacity scheduler admits
+        // past what allocation will actually consume.
         auto const promptCacheLen
-            = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd,
+            = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd
+                    + mNumExtraKvTokens,
                   windowSize + mChunkSize)
             + mSinkBubbleLength;
         if (LinearAttentionMetadata::hasLinearCache(windowSize))
@@ -3595,9 +3599,22 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
 
         auto const numCurrTokens = getSequence(req.mRequestId).getNumTokens();
         auto const generatedTokens = numCurrTokens - req.getPromptLen();
-        auto const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens;
-        auto const tokensPerStep = req.getNumDraftTokens() + 1;
-        auto const maxTokensToAdd = std::min((twoStepsLookAhead ? 2 : 1) * tokensPerStep, maxTokensToAddToKVCache);
+        // prepare_resources() reserves max(draft_len, _kv_reserve_draft_tokens) draft KV slots on
+        // top of the new token every decode step; mReservedDraftTokensPerStep mirrors that static
+        // reserve so this budget matches actual allocation. The request's own draft count alone is
+        // not enough: one-model spec decode carries no draft tokens on the C++ request, and a
+        // dynamic drafter's draft length can shrink below the static reserve.
+        auto const tokensPerStep = std::max(req.getNumDraftTokens(), mReservedDraftTokensPerStep) + 1;
+        auto const floorTokens = (twoStepsLookAhead ? 2 : 1) * tokensPerStep;
+        // The allocator appends a full step (and rewinds unused slots afterwards) even on the
+        // request's final step, so with a draft reserve the per-step transient peak is not capped
+        // by the remaining output budget. Under pipeline-parallel two-step lookahead, two
+        // prepare_resources() calls can be in flight before the first rewind, so the transient
+        // scales with the lookahead depth (floorTokens), not a single step.
+        auto const remainingTokens = req.mMaxNewTokens - generatedTokens;
+        auto const maxTokensToAddToKVCache
+            = mReservedDraftTokensPerStep > 0 ? std::max(remainingTokens, floorTokens) : remainingTokens;
+        auto const maxTokensToAdd = std::min(floorTokens, maxTokensToAddToKVCache);
         auto const numNextTokens = numCurrTokens + maxTokensToAdd;
 
         if (LinearAttentionMetadata::hasLinearCache(windowSize))

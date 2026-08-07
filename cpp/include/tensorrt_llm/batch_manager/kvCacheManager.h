@@ -2005,6 +2005,18 @@ public:
         SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
         = 0;
 
+    /// @brief Register speculative-decoding token overheads that the Python-side allocator
+    ///        (KVCacheManager.prepare_resources) applies to every request but that the C++ request
+    ///        object does not carry: KV slots reserved every decode step for draft tokens
+    ///        (max(_kv_reserve_draft_tokens, dflash_block_size)) and extra tokens appended once at
+    ///        context admission (num_extra_kv_tokens, one-model speculative decoding). Consumed by
+    ///        getNeededBlocksOneStep so capacity scheduling (MAX_UTILIZATION in particular) budgets
+    ///        what allocation will actually consume. Both default to 0 (no effect) if never called.
+    virtual void setSpecSchedulingTokens(
+        SizeType32 /*reservedDraftTokensPerStep*/, SizeType32 /*numExtraKvTokens*/)
+    {
+    }
+
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
     /// maxNewTokens).
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
@@ -2457,6 +2469,12 @@ public:
     [[nodiscard]] SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead,
         SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const override;
 
+    void setSpecSchedulingTokens(SizeType32 reservedDraftTokensPerStep, SizeType32 numExtraKvTokens) override
+    {
+        mReservedDraftTokensPerStep = reservedDraftTokensPerStep;
+        mNumExtraKvTokens = numExtraKvTokens;
+    }
+
     /// @brief  Function that computes the number of KV cache blocks remaining to advance a request to completion (i.e.
     /// for maxNewTokens); the allocated blocks are excluded
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
@@ -2695,6 +2713,12 @@ private:
     SizeType32 mSinkBlockTokenLength;
     // Number of tokens in a chunk. If chunked-prefill is not enabled, this will be the same as max sequence length.
     SizeType32 mChunkSize;
+    // Speculative-decoding scheduling overheads mirrored from the Python allocator
+    // (KVCacheManager.prepare_resources): KV slots reserved every decode step for draft tokens,
+    // and extra tokens appended once at context admission. 0 unless setSpecSchedulingTokens is
+    // called; consumed by getNeededBlocksOneStep.
+    SizeType32 mReservedDraftTokensPerStep{0};
+    SizeType32 mNumExtraKvTokens{0};
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences

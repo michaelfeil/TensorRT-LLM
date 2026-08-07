@@ -673,6 +673,17 @@ class KVCacheManager(BaseResourceManager):
                     max_kv_event_entries=self.event_buffer_max_size)
 
         self.impl = KVCacheManagerCpp(**kwargs)
+        # Mirror the spec-decode token overheads prepare_resources() applies into the C++
+        # scheduling estimate (getNeededBlocksOneStep), so capacity scheduling
+        # (MAX_UTILIZATION in particular) budgets what allocation will actually consume:
+        # draft KV slots reserved every decode step and extra tokens appended once at
+        # context admission. No-op when both are 0 (no speculative decoding).
+        reserved_draft_tokens_per_step = self._kv_reserve_draft_tokens
+        if self.dflash_block_size is not None:
+            reserved_draft_tokens_per_step = max(self.dflash_block_size,
+                                                 reserved_draft_tokens_per_step)
+        self.impl.set_spec_scheduling_tokens(reserved_draft_tokens_per_step,
+                                             self.num_extra_kv_tokens)
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0
         self._warmup_missed_blocks = 0

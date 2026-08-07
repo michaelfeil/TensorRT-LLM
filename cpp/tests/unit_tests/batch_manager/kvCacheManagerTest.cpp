@@ -6511,6 +6511,74 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
             /* expectedNeededBlocksOneStep */ 0,
         }));
 
+// setSpecSchedulingTokens mirrors the token overheads the Python allocator
+// (KVCacheManager.prepare_resources) applies per decode step (draft-slot reserve) and per
+// context admission (num_extra_kv_tokens) into getNeededBlocksOneStep, so MAX_UTILIZATION
+// budgets what allocation will actually consume. tokensPerBlock is 16 throughout.
+TEST(SpecSchedulingTokensTest, NeededBlocksOneStepAccountsForSpecOverheads)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const kvParams = KvCacheManagerInstantiationParameters{
+        /* numLayers */ 1,
+        /* numHeads */ 1,
+        /* sizePerHead */ 1,
+        /* tokensPerBlock */ 16,
+        /* blocksPerWindow */ blocksAndWindow(/* numPrimaryBlocks */ 256, /* windowSize */ 512),
+        /* sinkTokenLength */ 0,
+        /* maxAttentionWindow */ 512,
+        /* maxBeamWidth */ 1,
+        /* maxNumTokens */ 513,
+        /* kvCacheBlockReuse */ false,
+    };
+
+    // Context admission: num_extra_kv_tokens must be budgeted, including when they span
+    // more than one block (17 extra tokens on a 16-token prompt: 1 block -> 3 blocks).
+    {
+        auto kvCacheManager = createKvCacheManager(kvParams, stream);
+        kvCacheManager->allocatePools(/*useUvm=*/false);
+        auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+        auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(16);
+        auto llmRequest = LlmRequest{0, 513, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, true};
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 1);
+        kvCacheManager->setSpecSchedulingTokens(/*reservedDraftTokensPerStep=*/0, /*numExtraKvTokens=*/17);
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 3);
+    }
+
+    // Generation: the per-step draft reserve must be budgeted even though the C++ request
+    // carries no draft tokens (one-model spec decode). 10 prompt tokens + a 16-token step
+    // crosses into a second block.
+    {
+        auto kvCacheManager = createKvCacheManager(kvParams, stream);
+        kvCacheManager->allocatePools(/*useUvm=*/false);
+        auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+        auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(10);
+        auto llmRequest = LlmRequest{0, 513, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, true};
+        kvCacheManager->addSequenceBatch({{{llmRequest.mRequestId, 10, 1}}}, {std::ref(llmRequest)});
+        llmRequest.setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 0);
+        kvCacheManager->setSpecSchedulingTokens(/*reservedDraftTokensPerStep=*/15, /*numExtraKvTokens=*/0);
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 1);
+    }
+
+    // Final step: prepare_resources appends a full step (and rewinds unused slots after), so
+    // with a reserve registered the transient peak is not capped by the remaining output
+    // budget (remaining = 1 here).
+    {
+        auto kvCacheManager = createKvCacheManager(kvParams, stream);
+        kvCacheManager->allocatePools(/*useUvm=*/false);
+        auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+        auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(16);
+        auto llmRequest = LlmRequest{0, /*maxNewTokens=*/2, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, true};
+        kvCacheManager->addSequenceBatch({{{llmRequest.mRequestId, 16, 1}}}, {std::ref(llmRequest)});
+        llmRequest.setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+        llmRequest.addNewToken(0, 0);
+        kvCacheManager->addToken(llmRequest.mRequestId);
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 0);
+        kvCacheManager->setSpecSchedulingTokens(/*reservedDraftTokensPerStep=*/15, /*numExtraKvTokens=*/0);
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 1);
+    }
+}
+
 TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAfterContextAllocation)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
