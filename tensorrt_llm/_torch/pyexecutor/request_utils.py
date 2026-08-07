@@ -823,6 +823,9 @@ class RequestBroadcaster:
             new_requests, "py_disaggregated_params"
         )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
+        py_external_request_id = collect_py_objects_from_requests(
+            new_requests, "py_external_request_id"
+        )
 
         return tuple(
             filter(
@@ -835,6 +838,7 @@ class RequestBroadcaster:
                     py_dynamic_temperature_rules,
                     py_disaggregated_params,
                     py_lora_path,
+                    py_external_request_id,
                 ],
             )
         )

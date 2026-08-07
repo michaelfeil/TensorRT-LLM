@@ -57,6 +57,8 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from . import hbm_stats
 from .adp_iter_stats import ADPIterStatsBuffer
+from .b10_pyexecutor_observer import (SLOW_UPDATE_WARN_S, B10PyExecutorObserver,
+                                      maybe_create_b10_pyexecutor_observer)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .dynamic_profiler import DYNAMIC_PROFILE_DIR_ENV, DynamicProfilerSession
@@ -338,6 +340,28 @@ class AsyncTransferManager:
 
     def has_any_inflight_requests(self) -> bool:
         return len(self._requests_in_transfer) > 0
+
+
+def _observed_phase(phase_name: str):
+    """Record the wrapped method's wall time as a loop phase (O(1))."""
+
+    def decorator(fn):
+
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            observer = getattr(self, "request_observer", None)
+            if observer is None:
+                return fn(self, *args, **kwargs)
+            phase_start = time.monotonic()
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                observer.record_phase(phase_name,
+                                      time.monotonic() - phase_start)
+
+        return wrapper
+
+    return decorator
 
 
 class PyExecutor:
@@ -655,6 +679,11 @@ class PyExecutor:
 
         self.hang_detector = HangDetector(timeout=hang_detection_timeout,
                                           on_detected=on_detected)
+        # Created lazily on the first loop iteration, after all ctor state
+        # (attention-dp flags, dist) is final. Stays None when disabled via
+        # TRTLLM_B10_PYEXECUTOR_OBSERVER=0.
+        self.request_observer: Optional[B10PyExecutorObserver] = None
+        self._request_observer_initialized: bool = False
 
         # request fetcher initialization
         self._set_global_steady_clock_offset()
@@ -3033,6 +3062,15 @@ class PyExecutor:
             self.kv_cache_manager.prefetch_for_context_tokens(candidates)
 
     def _prepare_and_schedule_batch(self):
+        if not self._request_observer_initialized:
+            self._request_observer_initialized = True
+            self.request_observer = maybe_create_b10_pyexecutor_observer(
+                rank=self.global_rank,
+                should_log_request_lines=(getattr(
+                    self, "enable_attention_dp", False) or self.dist.rank == 0))
+        if self.request_observer is not None:
+            self.request_observer.on_iteration_start(self.active_requests,
+                                                     len(self.waiting_queue))
         # Must run every iteration, else deferred requests strand their KV blocks (deadlock under KV exhaustion).
         self._drain_deferred_error_frees()
         new_requests = self._fetch_and_activate_new_requests_after_transfer_cleanup(
@@ -4560,6 +4598,7 @@ class PyExecutor:
         return context_requests
 
     @nvtx_range("_schedule")
+    @_observed_phase("schedule")
     def _schedule(self):
         previewed_states: Dict[int, Tuple[int, int, int]] = {}
         scheduled_context_requests: List[LlmRequest] = []
@@ -4780,6 +4819,7 @@ class PyExecutor:
             req.py_encoder_output = None
             req.py_skip_cross_kv_projection = True
 
+    @_observed_phase("disagg_status")
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
 
@@ -5970,6 +6010,7 @@ class PyExecutor:
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None,
                          scheduled_batch: Optional[ScheduledRequests] = None):
+        update_start = time.monotonic()
         try:
             self.sampler.update_requests(sample_state, resource_manager)
         except Exception as e:
@@ -5977,6 +6018,17 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+        if self.request_observer is not None:
+            update_s = time.monotonic() - update_start
+            if update_s > SLOW_UPDATE_WARN_S and scheduled_batch is not None:
+                requests = scheduled_batch.all_requests()
+                n_guided = sum(
+                    1 for r in requests
+                    if getattr(r, "guided_decoding_params", None) is not None)
+                self.request_observer.record_update_duration(
+                    update_s, len(requests), n_guided)
+            else:
+                self.request_observer.record_update_duration(update_s)
         # The sync above guarantees this batch's guided callbacks have run on
         # this rank, so their failures drain rank-consistently.
         self.guided_coordinator.drain_failures(scheduled_batch,
@@ -6394,6 +6446,7 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
+    @_observed_phase("respond")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
         requests_to_terminate = []

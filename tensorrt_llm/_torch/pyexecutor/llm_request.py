@@ -854,6 +854,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_encoder_output = return_encoder_output
         self.py_client_id = client_id
         self.py_request_id = self.request_id
+        # Caller-supplied correlation id (e.g. the b10 request id), forwarded
+        # from GenerationRequest.external_request_id for log joining.
+        self.py_external_request_id: Optional[str] = None
         self.py_llm_request_type = self.llm_request_type
         self.py_end_id = self.end_id
         self.py_prompt_len = self.prompt_len
@@ -1401,6 +1404,8 @@ def executor_request_to_llm_request(
                                                   None)
     llm_request.py_dynamic_temperature_rules = getattr(
         executor_request, "py_dynamic_temperature_rules", None)
+    llm_request.py_external_request_id = getattr(executor_request,
+                                                 "py_external_request_id", None)
     llm_request._initialize_dynamic_temperature_state()
     if child_req_ids:
         for child_id in child_req_ids:
