@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/radixBlockTree.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
@@ -32,12 +33,14 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/tllmBuffers.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <utility>
@@ -75,6 +78,28 @@ nvinfer1::DataType getPoolDataType(KVCacheBlockPool const& pool, nvinfer1::DataT
         poolDtype = nvinfer1::DataType::kUINT8;
     }
     return poolDtype;
+}
+
+//! Chunk size for page-locking the host offload pool per TLLM_KVCACHE_HOST_PIN_CHUNK_MB, or 0 for
+//! single-shot cudaHostAlloc (default). Chunked pinning releases the driver's node-global memory
+//! lock between chunks so co-located processes' CUDA allocations don't stall for seconds (MP-1435).
+std::size_t getHostPinChunkBytes(KVCacheBlockPool const& pool, nvinfer1::DataType poolDtype, bool layerFirstLayout)
+{
+    auto const chunkMb = tc::getIntEnv("TLLM_KVCACHE_HOST_PIN_CHUNK_MB");
+    if (!chunkMb || *chunkMb <= 0)
+    {
+        return 0;
+    }
+    // Round up to a multiple of the smallest contiguous offload copy unit (whole block, or
+    // per-layer row for layer-first layout) so no copy straddles a registration boundary and risks
+    // a pageable-path fallback, and of the 2 MiB alignment so chunk bases stay page-aligned.
+    auto const rowElems = static_cast<std::size_t>(layerFirstLayout ? 1 : pool.numLayers)
+        * static_cast<std::size_t>(pool.kvFactor) * static_cast<std::size_t>(pool.blockSize);
+    auto const rowBits = rowElems * BufferDataType(poolDtype).getSizeInBits();
+    TLLM_CHECK_WITH_INFO(rowBits % 8 == 0, "Host offload pool row size (%zu bits) is not a whole byte", rowBits);
+    auto const alignment = std::lcm(rowBits / 8, PinnedChunkedAllocator::kChunkAlignment);
+    auto const wantBytes = static_cast<std::size_t>(*chunkMb) << 20;
+    return (wantBytes + alignment - 1) / alignment * alignment;
 }
 
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
@@ -1219,7 +1244,17 @@ void WindowBlockManager::allocateSecondaryPools()
                 : ITensor::makeShape({secondaryBlockCount, pool.numLayers, mKVFactor, blockSize});
             TLLM_LOG_DEBUG("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
                 mLogPrefix.c_str(), secondaryBlockCount, pool.numLayers, pool.numKvHeads);
-            pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
+            auto const pinChunkBytes = getHostPinChunkBytes(pool, poolDtype, isRecurrentState());
+            if (pinChunkBytes > 0)
+            {
+                TLLM_LOG_INFO("[%s] Page-locking secondary pool in %zu MB chunks (TLLM_KVCACHE_HOST_PIN_CHUNK_MB)",
+                    mLogPrefix.c_str(), pinChunkBytes >> 20);
+                pool.secondaryPtr = BufferManager::pinnedChunked(cacheShapeOffload, poolDtype, pinChunkBytes);
+            }
+            else
+            {
+                pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
+            }
         }
         else if (mEnableTpMlaReplicatedHostOffload)
         {

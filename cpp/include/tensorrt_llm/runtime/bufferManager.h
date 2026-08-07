@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -87,6 +87,11 @@ public:
 
     //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU.
     [[nodiscard]] static ITensorPtr pinned(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU, page-locking it in
+    //! `chunkBytes` chunks (0 = single shot) so the driver's node-global memory lock is released
+    //! between chunks. `chunkBytes` must be a multiple of `PinnedChunkedAllocator::kChunkAlignment`.
+    [[nodiscard]] static ITensorPtr pinnedChunked(nvinfer1::Dims dims, nvinfer1::DataType type, std::size_t chunkBytes);
 
     //! \brief Allocates a pinned `IBuffer` of the given size on the CPU in the default memory pool.
     [[nodiscard]] static IBufferPtr pinnedPool(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);

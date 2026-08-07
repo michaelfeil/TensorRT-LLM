@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -110,6 +110,103 @@ TEST_F(TllmBuffersTest, PinnedAllocator)
     EXPECT_EQ(counters.getPinnedDiff(), -size);
     EXPECT_EQ(allocator.getMemoryType(), MemoryType::kPINNED);
     EXPECT_THROW(allocator.deallocate(ptr, size), std::runtime_error);
+}
+
+namespace
+{
+// True if ptr lies in host memory the CUDA driver knows about (i.e. page-locked and DMA-mapped).
+bool isHostRegistered(void const* ptr)
+{
+    cudaPointerAttributes attributes{};
+    if (::cudaPointerGetAttributes(&attributes, ptr) != cudaSuccess)
+    {
+        return false;
+    }
+    return attributes.type == cudaMemoryTypeHost && attributes.devicePointer != nullptr;
+}
+} // namespace
+
+TEST_F(TllmBuffersTest, PinnedChunkedAllocator)
+{
+    if (mDeviceCount == 0)
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+    auto constexpr chunk = PinnedChunkedAllocator::kChunkAlignment;
+    // Odd size on purpose: two full chunks plus a partial tail registration.
+    auto constexpr size = 2 * chunk + chunk / 2 + 4096;
+    PinnedChunkedAllocator allocator{chunk};
+    auto& counters = MemoryCounters::getInstance();
+    EXPECT_EQ(counters.getPinned(), 0);
+    auto ptr = allocator.allocate(size);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(ptr) % chunk, 0);
+    EXPECT_EQ(counters.getPinned(), size);
+    auto* bytes = static_cast<char*>(ptr);
+    EXPECT_TRUE(isHostRegistered(bytes));
+    EXPECT_TRUE(isHostRegistered(bytes + chunk));
+    EXPECT_TRUE(isHostRegistered(bytes + 2 * chunk));
+    EXPECT_TRUE(isHostRegistered(bytes + size - 1));
+    std::fill(bytes, bytes + size, 'x');
+    EXPECT_NO_THROW(allocator.deallocate(ptr, size));
+    EXPECT_EQ(counters.getPinned(), 0);
+    EXPECT_EQ(allocator.getMemoryType(), MemoryType::kPINNED);
+}
+
+TEST_F(TllmBuffersTest, PinnedChunkedAllocatorSingleShot)
+{
+    if (mDeviceCount == 0)
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+    auto constexpr size = PinnedChunkedAllocator::kChunkAlignment + 123;
+    PinnedChunkedAllocator allocator{};
+    auto& counters = MemoryCounters::getInstance();
+    auto ptr = allocator.allocate(size);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(counters.getPinned(), size);
+    EXPECT_TRUE(isHostRegistered(static_cast<char*>(ptr) + size - 1));
+    EXPECT_NO_THROW(allocator.deallocate(ptr, size));
+    EXPECT_EQ(counters.getPinned(), 0);
+    EXPECT_EQ(allocator.allocate(0), nullptr);
+    EXPECT_NO_THROW(allocator.deallocate(nullptr, 0));
+    EXPECT_EQ(counters.getPinned(), 0);
+}
+
+TEST_F(TllmBuffersTest, PinnedChunkedAllocatorRejectsUnalignedChunk)
+{
+    auto constexpr chunk = PinnedChunkedAllocator::kChunkAlignment + 4096;
+    PinnedChunkedAllocator allocator{chunk};
+    auto const pinnedBefore = MemoryCounters::getInstance().getPinned();
+    EXPECT_THROW(allocator.allocate(4 * chunk), std::runtime_error);
+    EXPECT_EQ(MemoryCounters::getInstance().getPinned(), pinnedBefore);
+}
+
+TEST_F(TllmBuffersTest, PinnedChunkedTensorRoundTrip)
+{
+    if (mDeviceCount == 0)
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+    auto constexpr chunk = PinnedChunkedAllocator::kChunkAlignment;
+    auto const dims = ITensor::makeShape({3, 1024, 1024});
+    auto tensor = BufferManager::pinnedChunked(dims, nvinfer1::DataType::kUINT8, chunk);
+    ASSERT_NE(tensor, nullptr);
+    EXPECT_EQ(tensor->getMemoryType(), MemoryType::kPINNED);
+    EXPECT_EQ(tensor->getSize(), static_cast<std::size_t>(ITensor::volume(dims)));
+    auto* data = bufferCast<std::uint8_t>(*tensor);
+    EXPECT_TRUE(isHostRegistered(data));
+    for (std::size_t i = 0; i < tensor->getSize(); ++i)
+    {
+        data[i] = static_cast<std::uint8_t>(i);
+    }
+    // Round-trip through the GPU: the copies span all chunk registrations and must stay lossless.
+    BufferManager manager{mStream};
+    auto deviceTensor = manager.copyFrom(*tensor, MemoryType::kGPU);
+    auto hostCopy = manager.copyFrom(*deviceTensor, MemoryType::kCPU);
+    manager.getStream().synchronize();
+    auto const* result = bufferCast<std::uint8_t>(*hostCopy);
+    EXPECT_TRUE(std::equal(data, data + tensor->getSize(), result));
 }
 
 TEST_F(TllmBuffersTest, HostAllocator)

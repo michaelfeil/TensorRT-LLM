@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -178,6 +178,83 @@ protected:
     {
         TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFreeHost(ptr));
     }
+};
+
+//! \brief Allocates one contiguous host buffer, page-locked with cudaHostRegister in chunks so the
+//! driver's node-global memory lock is released between chunks; unregistering is chunked too since
+//! it takes the same lock (MP-1435). chunkBytes must be a kChunkAlignment multiple; 0 = single shot.
+class PinnedChunkedAllocator : public BaseAllocator<PinnedChunkedAllocator, MemoryType::kPINNED>
+{
+    friend class BaseAllocator<PinnedChunkedAllocator, MemoryType::kPINNED>;
+
+public:
+    using Base = BaseAllocator<PinnedChunkedAllocator, MemoryType::kPINNED>;
+
+    //! Keeps chunk boundaries page-aligned on any host page size, else the driver's outward page
+    //! rounding would make adjacent registrations overlap and fail; 2 MiB is also THP-friendly.
+    static constexpr std::size_t kChunkAlignment = std::size_t{2} << 20;
+
+    explicit PinnedChunkedAllocator(std::size_t chunkBytes = 0) noexcept
+        : mChunkBytes{chunkBytes}
+    {
+    }
+
+protected:
+    void allocateImpl(PointerType* ptr, std::size_t n)
+    {
+        TLLM_CHECK_WITH_INFO(mChunkBytes % kChunkAlignment == 0,
+            "PinnedChunkedAllocator chunk size (%zu) must be a multiple of %zu bytes", mChunkBytes, kChunkAlignment);
+        // posix_memalign may legally return nullptr for n == 0; don't mistake that for OOM.
+        if (n == 0)
+        {
+            *ptr = nullptr;
+            return;
+        }
+        void* base = nullptr;
+        if (::posix_memalign(&base, kChunkAlignment, n) != 0 || base == nullptr)
+        {
+            throw std::bad_alloc();
+        }
+        auto const chunk = mChunkBytes > 0 ? mChunkBytes : n;
+        std::size_t registered = 0;
+        try
+        {
+            while (registered < n)
+            {
+                auto const cur = std::min(chunk, n - registered);
+                TLLM_CUDA_CHECK(
+                    ::cudaHostRegister(static_cast<char*>(base) + registered, cur, cudaHostRegisterDefault));
+                registered += cur;
+            }
+        }
+        catch (...)
+        {
+            for (std::size_t off = 0; off < registered; off += chunk)
+            {
+                TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaHostUnregister(static_cast<char*>(base) + off));
+            }
+            std::free(base);
+            throw;
+        }
+        *ptr = base;
+    }
+
+    void deallocateImpl(PointerType ptr, std::size_t n)
+    {
+        if (ptr == nullptr)
+        {
+            return;
+        }
+        auto const chunk = mChunkBytes > 0 ? mChunkBytes : n;
+        for (std::size_t off = 0; off < n; off += chunk)
+        {
+            TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaHostUnregister(static_cast<char*>(ptr) + off));
+        }
+        std::free(ptr);
+    }
+
+private:
+    std::size_t mChunkBytes;
 };
 
 class HostAllocator : public BaseAllocator<HostAllocator, MemoryType::kCPU>
@@ -862,6 +939,7 @@ using DeviceBuffer = GenericBuffer<CudaAllocatorAsync>;
 using StaticDeviceBuffer = GenericBuffer<CudaAllocator>;
 using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
+using PinnedChunkedBuffer = GenericBuffer<PinnedChunkedAllocator>;
 using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
 using UVMBuffer = GenericBuffer<UVMAllocator>;
 using VirtualAddressDeviceBuffer = GenericBuffer<CudaVirtualMemoryAllocatorAdaptor>;
@@ -1098,6 +1176,7 @@ using DeviceTensor = GenericTensor<CudaAllocatorAsync>;
 using StaticDeviceTensor = GenericTensor<CudaAllocator>;
 using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
+using PinnedChunkedTensor = GenericTensor<PinnedChunkedAllocator>;
 using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;
 using UVMTensor = GenericTensor<UVMAllocator>;
 using VirtualAddressDeviceTensor = GenericTensor<CudaVirtualMemoryAllocatorAdaptor>;

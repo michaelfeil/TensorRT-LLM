@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -101,6 +101,12 @@ BufferManager::IBufferPtr BufferManager::pinned(std::size_t size, nvinfer1::Data
 BufferManager::ITensorPtr BufferManager::pinned(nvinfer1::Dims dims, nvinfer1::DataType type)
 {
     return std::make_unique<PinnedTensor>(dims, type);
+}
+
+BufferManager::ITensorPtr BufferManager::pinnedChunked(
+    nvinfer1::Dims dims, nvinfer1::DataType type, std::size_t chunkBytes)
+{
+    return std::make_unique<PinnedChunkedTensor>(dims, type, PinnedChunkedAllocator{chunkBytes});
 }
 
 BufferManager::IBufferPtr BufferManager::pinnedPool(std::size_t size, nvinfer1::DataType type)
