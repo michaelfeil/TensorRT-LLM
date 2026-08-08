@@ -1,11 +1,16 @@
 #!/bin/bash
 set -ex
 
-UCX_VERSION="v1.21.x"
-UCX_COMMIT="167a4c6a311d9a42e30a37dcc01b8a3e73ea2826"
+# Built from the Baseten fork, which carries the rendezvous failover work KV
+# transfer depends on: rendezvous admitted under UCP_ERR_HANDLING_MODE_FAILOVER
+# for both the get and put schemes, and control-lane selection that avoids a
+# device whose lane has already failed. Without it a large KV transfer has no
+# failover-capable rendezvous protocol and falls back to eager.
+UCX_VERSION="master"
+UCX_COMMIT="7840331732594e1bd58ed22f7d03a414dd6a5078"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-UCX_REPO="https://github.com/openucx/ucx.git"
+UCX_REPO="https://github.com/basetenlabs/ucx.git"
 
 mkdir -p /third-party-source
 
