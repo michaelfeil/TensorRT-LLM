@@ -539,7 +539,9 @@ class KvCacheConnectorSchedulerOutputManager:
     def record_new_matched_tokens(self, request: LlmRequest, num_new_matched_tokens: int):
         self.external_loads[request.request_id] = num_new_matched_tokens
 
-    def on_rewind(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
+    def on_rewind(
+        self, req: LlmRequest, live_block_ids: List[int], num_tokens: int
+    ) -> Optional[List[int]]:
         """Re-sync connector bookkeeping after speculative-decoding rewind.
 
         When draft tokens are rejected and ``rewindKVCache`` frees blocks that
@@ -555,16 +557,35 @@ class KvCacheConnectorSchedulerOutputManager:
         ``tokens`` would suppress those accepted tokens from the next
         ``build_scheduler_output``'s ``new_tokens`` delta.  We only trim if the
         rewind actually shortened the token list (e.g. rejected draft tokens
-        were rolled back).
+        were rolled back). Returns the connector-visible block IDs only when
+        its scheduler state also requires a rewind.
         """
         req_state = self.requests.get(req.request_id)
         if req_state is None:
-            return
-        req_state.block_ids = list(kv_cache_manager.get_cache_indices(req))
-        req_state.hash_probe_state = None
-        live_tokens = list(req.get_tokens(0))
-        if len(live_tokens) < len(req_state.tokens):
-            req_state.tokens = live_tokens
+            return None
+
+        recorded_block_ids = req_state.block_ids
+        scheduler_live_block_ids: Optional[List[int]] = None
+        if len(live_block_ids) > len(recorded_block_ids):
+            if live_block_ids[: len(recorded_block_ids)] != recorded_block_ids:
+                raise RuntimeError(
+                    "Speculative allocation growth replaced connector-visible block IDs"
+                )
+            # The speculative suffix has not been sent to the connector. Keep
+            # the reported length so the next metadata update emits it.
+        elif live_block_ids != recorded_block_ids:
+            req_state.block_ids = list(live_block_ids)
+            scheduler_live_block_ids = req_state.block_ids
+
+        if num_tokens < len(req_state.tokens):
+            req_state.tokens = list(req.get_tokens(0))
+            # If accepted state also moved backward, synchronize the connector
+            # against only the prefix it has already seen.
+            if scheduler_live_block_ids is None:
+                scheduler_live_block_ids = list(req_state.block_ids)
+        if scheduler_live_block_ids is not None:
+            req_state.hash_probe_state = None
+        return scheduler_live_block_ids
 
 
 class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
@@ -772,8 +793,15 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._force_metadata_exchange |= rewind_crossed_worker_boundary
         self._metadata_exchange_progress[req.request_id] = progress
         if self.scheduler is not None:
-            self.scheduler_output_manager.on_rewind(req, kv_cache_manager)
-            self.scheduler.on_rewind(req, live_block_ids)
+            scheduler_live_block_ids = self.scheduler_output_manager.on_rewind(
+                req, live_block_ids, num_tokens
+            )
+            self.scheduler.on_rewind(
+                req,
+                live_block_ids
+                if scheduler_live_block_ids is None
+                else scheduler_live_block_ids,
+            )
 
     def take_scheduled_requests_pending_load(self, scheduled_requests: ScheduledRequests):
         """

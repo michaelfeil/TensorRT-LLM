@@ -946,7 +946,7 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     req.get_num_tokens.return_value = 6
     req.get_token.return_value = 6
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
-    manager.on_rewind(req, kv_cache_manager)
+    manager.on_rewind(req, [0, 1], 6)
 
     # block_ids trimmed to live indices
     assert req_state.block_ids == [0, 1], \
@@ -968,6 +968,36 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     assert cached.new_tokens == [6], \
         f"Expected accepted token 6 in new_tokens, got {cached.new_tokens}"
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
+
+
+def test_scheduler_output_on_rewind_preserves_unreported_speculative_growth():
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [0, 1]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+
+    req, scheduled_batch = _make_generation_batch(60)
+    req.py_draft_tokens = [0, 0, 0]
+    req.get_tokens.return_value = list(range(60))
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    manager.build_scheduler_output(
+        scheduled_batch, AsyncRequests({}, {}), kv_cache_manager
+    )
+    req.get_tokens.return_value = list(range(62))
+    req.get_num_tokens.return_value = 62
+
+    scheduler_live_block_ids = manager.on_rewind(req, [0, 1, 2], 62)
+
+    req_state = manager.requests[req.request_id]
+    assert scheduler_live_block_ids is None
+    assert req_state.block_ids == [0, 1]
+
+    kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+    output = manager.build_scheduler_output(
+        scheduled_batch, AsyncRequests({}, {}), kv_cache_manager
+    )
+    assert output.cached_requests[0].new_block_ids == [2]
 
 
 def _make_kv_cache_manager_for_update_resources(is_draft: bool):
@@ -1020,8 +1050,7 @@ def test_update_resources_draft_kv_manager_does_not_notify_connector():
 
 
 def test_connector_manager_on_rewind_forwards_to_scheduler():
-    """KvCacheConnectorManager.on_rewind must forward live_block_ids to the
-    external scheduler on rank 0."""
+    """The external scheduler receives only connector-visible live blocks."""
     worker = MagicMock()
     scheduler = MagicMock()
 
@@ -1029,9 +1058,11 @@ def test_connector_manager_on_rewind_forwards_to_scheduler():
 
     req = MagicMock()
     req.request_id = 42
+    req.get_num_tokens.return_value = 3
     req.get_tokens.return_value = [1, 2, 3]
 
     kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
 
     req_state = manager.scheduler_output_manager.requests[42]
@@ -1048,6 +1079,20 @@ def test_connector_manager_on_rewind_forwards_to_scheduler():
     forwarded_req, forwarded_ids = scheduler.on_rewind.call_args.args
     assert forwarded_req is req
     assert forwarded_ids == [0, 1]
+
+    # A speculative suffix that has not crossed a metadata boundary is not
+    # connector-visible. When accepted token state also rewinds, forward only
+    # the acknowledged prefix rather than the growing physical list.
+    scheduler.on_rewind.reset_mock()
+    req_state.block_ids = [0, 1]
+    req_state.tokens = list(range(64))
+    req.get_num_tokens.return_value = 60
+    req.get_tokens.return_value = list(range(60))
+    kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+
+    manager.on_rewind(req, kv_cache_manager)
+
+    scheduler.on_rewind.assert_called_once_with(req, [0, 1])
 
 
 def test_connector_manager_shutdown_is_ordered_and_idempotent():
