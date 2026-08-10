@@ -6568,7 +6568,8 @@ TEST(SpecSchedulingTokensTest, NeededBlocksOneStepAccountsForSpecOverheads)
         kvCacheManager->allocatePools(/*useUvm=*/false);
         auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
         auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(16);
-        auto llmRequest = LlmRequest{0, /*maxNewTokens=*/2, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, true};
+        auto llmRequest
+            = LlmRequest{0, /*maxNewTokens=*/2, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, true};
         kvCacheManager->addSequenceBatch({{{llmRequest.mRequestId, 16, 1}}}, {std::ref(llmRequest)});
         llmRequest.setState(LlmRequestState::kGENERATION_IN_PROGRESS);
         llmRequest.addNewToken(0, 0);
@@ -6577,6 +6578,100 @@ TEST(SpecSchedulingTokensTest, NeededBlocksOneStepAccountsForSpecOverheads)
         kvCacheManager->setSpecSchedulingTokens(/*reservedDraftTokensPerStep=*/15, /*numExtraKvTokens=*/0);
         EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 1);
     }
+}
+
+// setReserveAheadTokens anchors the MAX_UTILIZATION generation-phase reservation at R output
+// tokens measured from the prompt end. The invariant under test: while a request is within its
+// budget, consumed tokens grow and the reservation shrinks by the same amount (constant
+// footprint); overruns collapse to the per-step floor. tokensPerBlock is 16, window 512.
+TEST(ReserveAheadTokensTest, AnchoredReservationTapersAndCollapses)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const kvParams = KvCacheManagerInstantiationParameters{
+        /* numLayers */ 1,
+        /* numHeads */ 1,
+        /* sizePerHead */ 1,
+        /* tokensPerBlock */ 16,
+        /* blocksPerWindow */ blocksAndWindow(/* numPrimaryBlocks */ 256, /* windowSize */ 512),
+        /* sinkTokenLength */ 0,
+        /* maxAttentionWindow */ 512,
+        /* maxBeamWidth */ 1,
+        /* maxNumTokens */ 513,
+        /* kvCacheBlockReuse */ false,
+    };
+
+    {
+        auto kvCacheManager = createKvCacheManager(kvParams, stream);
+        kvCacheManager->allocatePools(/*useUvm=*/false);
+        auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+        auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(16);
+        auto llmRequest = LlmRequest{0, 513, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, true};
+        kvCacheManager->addSequenceBatch({{{llmRequest.mRequestId, 16, 1}}}, {std::ref(llmRequest)});
+        llmRequest.setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+
+        // R = 0 baseline: one step ahead of a full block needs 1 new block.
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 1);
+
+        // Anchored: 16 prompt + 64 reserved -> 80 tokens -> 5 blocks, 1 allocated.
+        kvCacheManager->setReserveAheadTokens(64);
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 4);
+
+        // Taper: after 32 generated tokens the reservation shrinks by 32, so the anchored
+        // horizon stays 80 tokens (constant footprint): 5 blocks total, 3 allocated.
+        for (SizeType32 i = 0; i < 32; ++i)
+        {
+            llmRequest.addNewToken(0, 0);
+            kvCacheManager->addToken(llmRequest.mRequestId);
+        }
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 2);
+
+        // Collapse: past the budget (70 > 64) the reservation is the 1-token floor;
+        // 86 -> 87 tokens stays within the 6th block.
+        for (SizeType32 i = 0; i < 38; ++i)
+        {
+            llmRequest.addNewToken(0, 0);
+            kvCacheManager->addToken(llmRequest.mRequestId);
+        }
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 0);
+    }
+
+    // Window clamp: an anchored R larger than the attention window must reserve up to the
+    // window bound (31 blocks here), not trip the legacy "window full" early return of 0.
+    {
+        auto kvCacheManager = createKvCacheManager(kvParams, stream);
+        kvCacheManager->allocatePools(/*useUvm=*/false);
+        auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+        auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(16);
+        auto llmRequest = LlmRequest{0, 513, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, true};
+        kvCacheManager->addSequenceBatch({{{llmRequest.mRequestId, 16, 1}}}, {std::ref(llmRequest)});
+        llmRequest.setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+        kvCacheManager->setReserveAheadTokens(1024);
+        EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, onlyWindowSize), 31);
+    }
+}
+
+TEST(ReserveAheadTokensTest, ClampOnlySlidingWindowPools)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr slidingWindow = 128;
+    auto constexpr maxSequenceLength = 1024;
+    auto const blocksPerWindow = BlocksPerWindow{{slidingWindow, {256, 0}}, {maxSequenceLength, {256, 0}}};
+    auto kvCacheManager = std::make_shared<KVCacheManager>(std::vector<SizeType32>{1, 1}, /*sizePerHead=*/1,
+        tokensPerBlock, blocksPerWindow, /*maxNumSequences=*/256, /*maxBeamWidth=*/1,
+        std::vector<SizeType32>{slidingWindow, maxSequenceLength}, nvinfer1::DataType::kFLOAT,
+        /*sinkTokenLength=*/0, stream, maxSequenceLength, maxSequenceLength, /*kvCacheBlockReuse=*/false,
+        CacheType::kSELF);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+
+    auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(tokensPerBlock);
+    auto llmRequest = LlmRequest{0, maxSequenceLength, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, true};
+    kvCacheManager->addSequenceBatch({{{llmRequest.mRequestId, tokensPerBlock, 1}}}, {std::ref(llmRequest)});
+    llmRequest.setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    kvCacheManager->setReserveAheadTokens(512);
+
+    EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, slidingWindow), 8);
+    EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(llmRequest, false, maxSequenceLength), 32);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAfterContextAllocation)

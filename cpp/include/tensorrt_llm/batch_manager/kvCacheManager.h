@@ -2012,10 +2012,16 @@ public:
     ///        context admission (num_extra_kv_tokens, one-model speculative decoding). Consumed by
     ///        getNeededBlocksOneStep so capacity scheduling (MAX_UTILIZATION in particular) budgets
     ///        what allocation will actually consume. Both default to 0 (no effect) if never called.
-    virtual void setSpecSchedulingTokens(
-        SizeType32 /*reservedDraftTokensPerStep*/, SizeType32 /*numExtraKvTokens*/)
-    {
-    }
+    virtual void setSpecSchedulingTokens(SizeType32 /*reservedDraftTokensPerStep*/, SizeType32 /*numExtraKvTokens*/) {}
+
+    /// @brief Set the MAX_UTILIZATION reserve-ahead token count. When > 0, the generation-phase
+    ///        reservation in getNeededBlocksOneStep is anchored at this many output tokens measured
+    ///        from the prompt end and tapers as the request generates: requests finishing within the
+    ///        budget keep a constant footprint (GuaranteedNoEvict-like completion), while overruns
+    ///        collapse to the per-step floor and become the natural pause victims. Consulted only by
+    ///        getNeededBlocksOneStep, so GUARANTEED_NO_EVICT scheduling is unaffected. 0 (default)
+    ///        preserves the 1-2 step lookahead exactly.
+    virtual void setReserveAheadTokens(SizeType32 /*reserveAheadTokens*/) {}
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
     /// maxNewTokens).
@@ -2475,6 +2481,11 @@ public:
         mNumExtraKvTokens = numExtraKvTokens;
     }
 
+    void setReserveAheadTokens(SizeType32 reserveAheadTokens) override
+    {
+        mReserveAheadTokens = reserveAheadTokens;
+    }
+
     /// @brief  Function that computes the number of KV cache blocks remaining to advance a request to completion (i.e.
     /// for maxNewTokens); the allocated blocks are excluded
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
@@ -2719,6 +2730,10 @@ private:
     // called; consumed by getNeededBlocksOneStep.
     SizeType32 mReservedDraftTokensPerStep{0};
     SizeType32 mNumExtraKvTokens{0};
+    // MAX_UTILIZATION reserve-ahead token count (anchored at the prompt end, tapering as the
+    // request generates). 0 unless setReserveAheadTokens is called; consumed only by
+    // getNeededBlocksOneStep's generation branch.
+    SizeType32 mReserveAheadTokens{0};
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences

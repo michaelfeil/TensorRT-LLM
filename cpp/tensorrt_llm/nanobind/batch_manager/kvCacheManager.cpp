@@ -444,6 +444,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("set_spec_scheduling_tokens", &BaseKVCacheManager::setSpecSchedulingTokens,
             nb::arg("reserved_draft_tokens_per_step"), nb::arg("num_extra_kv_tokens"))
+        .def("set_reserve_ahead_tokens", &BaseKVCacheManager::setReserveAheadTokens, nb::arg("reserve_ahead_tokens"))
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion, nb::arg("req"),
             nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())

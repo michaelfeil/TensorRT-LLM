@@ -680,10 +680,26 @@ class KVCacheManager(BaseResourceManager):
         # context admission. No-op when both are 0 (no speculative decoding).
         reserved_draft_tokens_per_step = self._kv_reserve_draft_tokens
         if self.dflash_block_size is not None:
-            reserved_draft_tokens_per_step = max(self.dflash_block_size,
-                                                 reserved_draft_tokens_per_step)
+            reserved_draft_tokens_per_step = max(
+                self.dflash_block_size, reserved_draft_tokens_per_step)
         self.impl.set_spec_scheduling_tokens(reserved_draft_tokens_per_step,
                                              self.num_extra_kv_tokens)
+        # MAX_UTILIZATION reserve-ahead: anchor ~n output tokens per request so requests
+        # finishing within the budget are never paused, while overruns collapse to per-step
+        # reservation and become the pause victims. Consulted only by the generation branch
+        # of getNeededBlocksOneStep, so GUARANTEED_NO_EVICT deployments are unaffected.
+        # Runtime-adjustable via self.impl.set_reserve_ahead_tokens(n).
+        reserve_ahead_raw = os.environ.get(
+            "TRT_LLM_MAX_UTIL_RESERVE_AHEAD_TOKENS", "")
+        if reserve_ahead_raw:
+            try:
+                reserve_ahead_tokens = min(512 * 1024,
+                                           max(0, int(reserve_ahead_raw)))
+                self.impl.set_reserve_ahead_tokens(reserve_ahead_tokens)
+            except ValueError:
+                logger.warning(
+                    "Invalid TRT_LLM_MAX_UTIL_RESERVE_AHEAD_TOKENS="
+                    f"{reserve_ahead_raw!r}; keeping 0 (current behavior).")
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0
         self._warmup_missed_blocks = 0

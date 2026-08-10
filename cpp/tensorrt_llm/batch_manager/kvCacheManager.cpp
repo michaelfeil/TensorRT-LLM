@@ -3578,10 +3578,9 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         // mNumExtraKvTokens mirrors the extra tokens prepare_resources() appends once at context
         // admission for one-model speculative decoding; without them the capacity scheduler admits
         // past what allocation will actually consume.
-        auto const promptCacheLen
-            = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd
-                    + mNumExtraKvTokens,
-                  windowSize + mChunkSize)
+        auto const promptCacheLen = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen)
+                                            + maxDraftTokensToAdd + mNumExtraKvTokens,
+                                        windowSize + mChunkSize)
             + mSinkBubbleLength;
         if (LinearAttentionMetadata::hasLinearCache(windowSize))
         {
@@ -3649,7 +3648,25 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const remainingTokens = req.mMaxNewTokens - generatedTokens;
         auto const maxTokensToAddToKVCache
             = mReservedDraftTokensPerStep > 0 ? std::max(remainingTokens, floorTokens) : remainingTokens;
-        auto const maxTokensToAdd = std::min(floorTokens, maxTokensToAddToKVCache);
+
+        // mReserveAheadTokens == 0 (the default) is the historical 1-2 step lookahead. When > 0,
+        // anchor the reservation at the prompt end and taper it as the request generates: consumed
+        // tokens grow and the reservation shrinks by the same amount, so a request's footprint is
+        // constant while within its budget and the in-flight set's total demand never grows from
+        // generation alone. Overruns collapse to the floor and become the natural pause victims.
+        SizeType32 maxTokensToAdd;
+        if (mReserveAheadTokens == 0)
+        {
+            maxTokensToAdd = std::min(floorTokens, maxTokensToAddToKVCache);
+        }
+        else
+        {
+            auto const& windowMetadata = mBlockManager.getWindowSizeMetadata(windowSize);
+            auto const reserveLimit
+                = windowMetadata.isSWA ? std::min(mReserveAheadTokens, windowSize) : mReserveAheadTokens;
+            auto const reserveAhead = std::max(floorTokens, reserveLimit - generatedTokens);
+            maxTokensToAdd = std::min(reserveAhead, maxTokensToAddToKVCache);
+        }
         auto const numNextTokens = numCurrTokens + maxTokensToAdd;
 
         if (LinearAttentionMetadata::hasLinearCache(windowSize))
@@ -3660,7 +3677,21 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
 
         if (numNextTokens > mBlockManager.getWindowSizeMetadata(windowSize).maxTokenNum)
         {
-            return 0;
+            // The mReserveAheadTokens == 0 path keeps this early return exactly as-is.
+            if (mReserveAheadTokens == 0)
+            {
+                return 0;
+            }
+            // An anchored reservation larger than the attention window would trip this early
+            // return far from the real window edge on SWA models and silently disable
+            // reservation; clamp to the remaining window headroom instead. Degenerates to 0
+            // needed blocks when the window is full, matching the legacy early return.
+            auto const windowMaxTokenNum = mBlockManager.getWindowSizeMetadata(windowSize).maxTokenNum;
+            auto const windowHeadroom = std::max<SizeType32>(0, windowMaxTokenNum - numCurrTokens);
+            auto const clampedNextTokens = numCurrTokens + std::min(maxTokensToAdd, windowHeadroom);
+            auto const numCurrBlocks = tc::ceilDiv(numCurrTokens, getTokensPerBlock());
+            auto const clampedNextBlocks = tc::ceilDiv(clampedNextTokens, getTokensPerBlock());
+            return (clampedNextBlocks - numCurrBlocks) * req.mSamplingConfig.beamWidth;
         }
 
         auto const numCurrBlocks = tc::ceilDiv(numCurrTokens, getTokensPerBlock());
