@@ -473,9 +473,7 @@ class KvCacheConnectorSchedulerOutputRequest:
         # Probe and forward the chain only when another block can have become
         # full. Rewinds invalidate this marker in ``on_rewind``.
         hashed_position = computed_position if is_generation else num_tokens
-        num_hashed_tokens = (
-            hashed_position // tokens_per_block
-        ) * tokens_per_block
+        num_hashed_tokens = (hashed_position // tokens_per_block) * tokens_per_block
         hash_probe_state = (
             num_hashed_tokens if is_generation else (num_hashed_tokens, len(self.block_ids))
         )
@@ -632,13 +630,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._sparse_metadata_updates_enabled = (
             self.worker.supports_sparse_metadata_updates() is True
         )
-        if (
-            self._sparse_metadata_updates_enabled
-            and not self._rank_local_metadata_skip_enabled
-        ):
-            raise ValueError(
-                "Sparse connector metadata updates require rank-local metadata skip"
-            )
+        if self._sparse_metadata_updates_enabled and not self._rank_local_metadata_skip_enabled:
+            raise ValueError("Sparse connector metadata updates require rank-local metadata skip")
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -838,9 +831,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             )
             self.scheduler.on_rewind(
                 req,
-                live_block_ids
-                if scheduler_live_block_ids is None
-                else scheduler_live_block_ids,
+                live_block_ids if scheduler_live_block_ids is None else scheduler_live_block_ids,
             )
 
     def take_scheduled_requests_pending_load(self, scheduled_requests: ScheduledRequests):
@@ -894,10 +885,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def start_worker_batch(self, scheduled_requests: ScheduledRequests) -> bool:
         """Run metadata-driven worker hooks for the next forward pass."""
-        if (
-            self._sparse_metadata_updates_enabled
-            and not self._worker_batch_hooks_pending
-        ):
+        if self._sparse_metadata_updates_enabled and not self._worker_batch_hooks_pending:
             return False
 
         self.take_scheduled_requests_pending_load(scheduled_requests)

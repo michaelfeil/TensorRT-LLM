@@ -24,14 +24,12 @@ import pytest
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests,
-    KvCacheConnectorManager,
-    KvCacheConnectorSchedulerOutputManager,
-    KvCacheConnectorWorker,
-)
+    AsyncRequests, KvCacheConnectorManager,
+    KvCacheConnectorSchedulerOutputManager, KvCacheConnectorWorker)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
+                                                             KVCacheManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -345,9 +343,8 @@ def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
-    with patch.object(
-        kv_cache_connector.torch.cuda, "current_stream"
-    ) as current_stream:
+    with patch.object(kv_cache_connector.torch.cuda,
+                      "current_stream") as current_stream:
         assert manager.start_worker_batch(scheduled_batch)
     current_stream.assert_called_once()
 
@@ -359,9 +356,8 @@ def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
     req.get_num_tokens.return_value = 31
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
-    with patch.object(
-        kv_cache_connector.torch.cuda, "current_stream"
-    ) as current_stream:
+    with patch.object(kv_cache_connector.torch.cuda,
+                      "current_stream") as current_stream:
         assert not manager.start_worker_batch(scheduled_batch)
     current_stream.assert_not_called()
     scheduler.build_connector_meta.assert_not_called()
@@ -407,11 +403,9 @@ def test_executor_skips_idle_metadata_driven_worker_hooks():
     executor._kv_connector_wait_for_save()
 
     executor.kv_connector_manager.start_worker_batch.assert_called_once_with(
-        scheduled_batch
-    )
+        scheduled_batch)
     executor.model_engine.set_forward_pass_callable_enabled.assert_called_once_with(
-        False
-    )
+        False)
     executor.kv_connector_manager.worker.wait_for_save.assert_not_called()
 
 
@@ -1081,9 +1075,8 @@ def test_scheduler_output_on_rewind_preserves_unreported_speculative_growth():
     req.get_tokens.return_value = list(range(60))
     manager = KvCacheConnectorSchedulerOutputManager()
 
-    manager.build_scheduler_output(
-        scheduled_batch, AsyncRequests({}, {}), kv_cache_manager
-    )
+    manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
+                                   kv_cache_manager)
     req.get_tokens.return_value = list(range(62))
     req.get_num_tokens.return_value = 62
 
@@ -1094,9 +1087,9 @@ def test_scheduler_output_on_rewind_preserves_unreported_speculative_growth():
     assert req_state.block_ids == [0, 1]
 
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
-    output = manager.build_scheduler_output(
-        scheduled_batch, AsyncRequests({}, {}), kv_cache_manager
-    )
+    output = manager.build_scheduler_output(scheduled_batch,
+                                            AsyncRequests({}, {}),
+                                            kv_cache_manager)
     assert output.cached_requests[0].new_block_ids == [2]
 
 
