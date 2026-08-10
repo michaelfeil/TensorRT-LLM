@@ -110,6 +110,10 @@ class ModelEngine(ABC):
         """
         return
 
+    def set_forward_pass_callable_enabled(self, enabled: bool) -> None:
+        """Enable or disable an optional connector forward callback."""
+        return
+
 
 def _filter_piecewise_capture_num_tokens(
     candidate_num_tokens: list[int],
@@ -281,6 +285,7 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_restore_mode=None,
     ):
         self.forward_pass_callable = None
+        self.forward_pass_callable_enabled = True
         self.ub_buffers = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
@@ -743,6 +748,9 @@ class PyTorchModelEngine(ModelEngine):
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
+
+    def set_forward_pass_callable_enabled(self, enabled: bool) -> None:
+        self.forward_pass_callable_enabled = enabled
 
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
@@ -5142,7 +5150,8 @@ class PyTorchModelEngine(ModelEngine):
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
 
-            if self.forward_pass_callable is not None:
+            if (self.forward_pass_callable is not None
+                    and self.forward_pass_callable_enabled):
                 self.forward_pass_callable()
 
             self._execute_logit_post_processors(scheduled_requests, outputs)

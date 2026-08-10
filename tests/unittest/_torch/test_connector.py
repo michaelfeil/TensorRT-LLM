@@ -330,6 +330,91 @@ def _make_generation_batch(num_tokens: int):
     return req, scheduled_batch
 
 
+def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    worker.supports_sparse_metadata_updates.return_value = True
+    scheduler = MagicMock()
+    scheduler.build_connector_meta.return_value = b"metadata"
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    req, scheduled_batch = _make_generation_batch(30)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    with patch.object(
+        kv_cache_connector.torch.cuda, "current_stream"
+    ) as current_stream:
+        assert manager.start_worker_batch(scheduled_batch)
+    current_stream.assert_called_once()
+
+    scheduler.build_connector_meta.reset_mock()
+    worker.bind_connector_meta.reset_mock()
+    worker.start_load_kv.reset_mock()
+
+    # Same-block decode has no connector scheduler, PyO3, MPI, or worker work.
+    req.get_num_tokens.return_value = 31
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    with patch.object(
+        kv_cache_connector.torch.cuda, "current_stream"
+    ) as current_stream:
+        assert not manager.start_worker_batch(scheduled_batch)
+    current_stream.assert_not_called()
+    scheduler.build_connector_meta.assert_not_called()
+    scheduler.advance_without_worker_metadata.assert_not_called()
+    worker.bind_connector_meta.assert_not_called()
+    worker.start_load_kv.assert_not_called()
+
+    # Token 32 is sampled but not computed, so the suffix remains deferred.
+    req.get_num_tokens.return_value = 32
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    scheduler.build_connector_meta.assert_not_called()
+
+    # Token 33 proves that 32 KV positions exist and carries the full delta.
+    req.get_num_tokens.return_value = 33
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    output = scheduler.build_connector_meta.call_args.args[0]
+    assert output.cached_requests[0].new_tokens == [30, 31, 32]
+    assert output.cached_requests[0].new_block_ids == [11]
+    worker.bind_connector_meta.assert_called_once_with(b"metadata")
+
+
+def test_sparse_metadata_updates_require_rank_local_skip():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = False
+    worker.supports_sparse_metadata_updates.return_value = True
+
+    with pytest.raises(ValueError, match="require rank-local metadata skip"):
+        KvCacheConnectorManager(worker, scheduler=MagicMock())
+
+
+def test_executor_skips_idle_metadata_driven_worker_hooks():
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = MagicMock()
+    executor.model_engine = MagicMock()
+    executor._kv_connector_worker_hooks_active = True
+    scheduled_batch = ScheduledRequests()
+    executor.kv_connector_manager.start_worker_batch.return_value = False
+
+    executor._kv_connector_start_batch(scheduled_batch)
+    executor._kv_connector_wait_for_save()
+
+    executor.kv_connector_manager.start_worker_batch.assert_called_once_with(
+        scheduled_batch
+    )
+    executor.model_engine.set_forward_pass_callable_enabled.assert_called_once_with(
+        False
+    )
+    executor.kv_connector_manager.worker.wait_for_save.assert_not_called()
+
+
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_connector_manager_skips_same_block_metadata_collective(
         mpi_pool_executor):
@@ -366,8 +451,21 @@ def test_connector_manager_skips_same_block_metadata_collective(
             scheduler.advance_without_worker_metadata.assert_called_once()
             scheduler.advance_without_worker_metadata.reset_mock()
 
-        # Token 32 completes a block and must perform one real exchange.
+        # Token 32 is sampled but has not produced KV, so it stays state-only.
         req.get_num_tokens.return_value = 32
+        with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+            manager.handle_metadata()
+        broadcast.assert_not_called()
+        worker.bind_connector_meta.assert_not_called()
+        if scheduler is not None:
+            scheduler.advance_without_worker_metadata.assert_called_once()
+            scheduler.advance_without_worker_metadata.reset_mock()
+
+        # Token 33 proves that 32 positions were computed. The transfer
+        # boundary and next-block allocation travel in one real exchange.
+        req.get_num_tokens.return_value = 33
+        kv_cache_manager.get_cache_indices.return_value = [10, 11]
         real_broadcast = kv_cache_connector.mpi_broadcast
         with patch.object(kv_cache_connector,
                           "mpi_broadcast",
@@ -379,23 +477,7 @@ def test_connector_manager_skips_same_block_metadata_collective(
         if scheduler is not None:
             scheduler.advance_without_worker_metadata.assert_not_called()
             scheduler.build_connector_meta.assert_called_once()
-
-        # Token 33 allocates the next device block, but no transfer can use it
-        # until a later full-block boundary. The leader consumes the new block
-        # ID without another worker metadata collective.
-        worker.bind_connector_meta.reset_mock()
-        if scheduler is not None:
-            scheduler.build_connector_meta.reset_mock()
-        req.get_num_tokens.return_value = 33
-        kv_cache_manager.get_cache_indices.return_value = [10, 11]
-        with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
-            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
-            manager.handle_metadata()
-        broadcast.assert_not_called()
-        worker.bind_connector_meta.assert_not_called()
-        if scheduler is not None:
-            scheduler.advance_without_worker_metadata.assert_called_once()
-            output = scheduler.advance_without_worker_metadata.call_args.args[0]
+            output = scheduler.build_connector_meta.call_args.args[0]
             assert output.cached_requests[0].new_block_ids == [11]
 
     run_across_mpi(mpi_pool_executor, test, 2)
@@ -454,9 +536,19 @@ def test_connector_manager_mtp_lookahead_waits_for_accepted_block(
             assert output.cached_requests[0].new_block_ids == [11]
             scheduler.advance_without_worker_metadata.reset_mock()
 
-        # Once the accepted sequence itself completes the block, workers must
-        # receive the transfer/hash boundary.
+        # Token 32 is sampled but has no KV yet.
         req.get_num_tokens.return_value = 32
+        with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+            manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+            manager.handle_metadata()
+        broadcast.assert_not_called()
+        worker.bind_connector_meta.assert_not_called()
+        if scheduler is not None:
+            scheduler.advance_without_worker_metadata.assert_called_once()
+            scheduler.advance_without_worker_metadata.reset_mock()
+
+        # Token 33 proves the full accepted block exists on device.
+        req.get_num_tokens.return_value = 33
         real_broadcast = kv_cache_connector.mpi_broadcast
         with patch.object(kv_cache_connector,
                           "mpi_broadcast",
@@ -554,7 +646,7 @@ def test_connector_manager_boundary_rewind_forces_one_exchange():
     worker.supports_rank_local_metadata_skip.return_value = True
     scheduler = MagicMock()
     manager = KvCacheConnectorManager(worker, scheduler=scheduler)
-    req, scheduled_batch = _make_generation_batch(32)
+    req, scheduled_batch = _make_generation_batch(33)
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
@@ -565,7 +657,8 @@ def test_connector_manager_boundary_rewind_forces_one_exchange():
     manager.handle_metadata()
     manager._run_on_leader.reset_mock()
 
-    req.get_num_tokens.return_value = 31
+    req.get_num_tokens.return_value = 32
+    req.get_tokens.return_value = list(range(32))
     manager.on_rewind(req, kv_cache_manager)
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
@@ -786,8 +879,7 @@ def test_scheduler_output_only_reads_hashes_at_block_boundaries():
     kv_cache_manager = MagicMock()
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
     kv_cache_manager.tokens_per_block = 4
-    # Two consecutive scheduler steps: first sees no full block yet, second sees
-    # one full block whose hash has just been committed by the manager.
+    # The sampled token is not computed until the following scheduler step.
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
 
     req = MagicMock()
@@ -813,16 +905,16 @@ def test_scheduler_output_only_reads_hashes_at_block_boundaries():
     output = manager.build_scheduler_output(scheduled_batch,
                                             AsyncRequests({}, {}),
                                             kv_cache_manager)
-    assert output.cached_requests[0].block_hashes == [12345]
+    assert output.cached_requests[0].block_hashes is None
 
-    # The next token stays within the same completed-block count, so neither the
-    # hash chain nor the stable block-ID vector is read back again.
+    # The next token proves that four KV positions were computed, so the
+    # cumulative hash chain advances once.
     req.get_num_tokens.return_value = 5
     req.get_token.return_value = 5
     output = manager.build_scheduler_output(scheduled_batch,
                                             AsyncRequests({}, {}),
                                             kv_cache_manager)
-    assert output.cached_requests[0].block_hashes is None
+    assert output.cached_requests[0].block_hashes == [12345]
 
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
     for recorded_call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
@@ -858,8 +950,16 @@ def test_scheduler_output_mtp_allocation_does_not_refresh_generation_hashes():
     assert allocation.cached_requests[0].block_hashes is None
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 1
 
-    # The accepted block completion is the next logical hash-chain change.
+    # Token 32 is sampled but still has no KV.
     req.get_num_tokens.return_value = 32
+    completion = manager.build_scheduler_output(scheduled_batch,
+                                                AsyncRequests({}, {}),
+                                                kv_cache_manager)
+    assert completion.cached_requests[0].block_hashes is None
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 1
+
+    # Token 33 proves that 32 KV positions were computed.
+    req.get_num_tokens.return_value = 33
     completion = manager.build_scheduler_output(scheduled_batch,
                                                 AsyncRequests({}, {}),
                                                 kv_cache_manager)

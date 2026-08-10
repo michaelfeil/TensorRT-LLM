@@ -127,9 +127,19 @@ class KvCacheConnectorWorker(ABC):
     def supports_rank_local_metadata_skip(self) -> bool:
         """Return whether every rank can make the same metadata-skip decision.
 
-        Opting in requires rank-identical scheduling. The connector scheduler
-        must also implement ``advance_without_worker_metadata`` so leader-owned
-        request state still advances on skipped exchanges.
+        Opting in requires rank-identical scheduling. Unless
+        ``supports_sparse_metadata_updates`` is also enabled, the connector
+        scheduler must implement ``advance_without_worker_metadata`` so
+        leader-owned request state still advances on skipped exchanges.
+        """
+        return False
+
+    def supports_sparse_metadata_updates(self) -> bool:
+        """Return whether unchanged decode steps may defer connector state.
+
+        The paired scheduler must consume the complete token and block delta
+        at the next worker-visible boundary. Worker batch, forward, and save
+        hooks must only be needed after a real metadata bind.
         """
         return False
 
@@ -462,7 +472,10 @@ class KvCacheConnectorSchedulerOutputRequest:
         # Cumulative block hashes are immutable between full-block boundaries.
         # Probe and forward the chain only when another block can have become
         # full. Rewinds invalidate this marker in ``on_rewind``.
-        num_hashed_tokens = (num_tokens // tokens_per_block) * tokens_per_block
+        hashed_position = computed_position if is_generation else num_tokens
+        num_hashed_tokens = (
+            hashed_position // tokens_per_block
+        ) * tokens_per_block
         hash_probe_state = (
             num_hashed_tokens if is_generation else (num_hashed_tokens, len(self.block_ids))
         )
@@ -613,6 +626,19 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.worker = worker
         self.scheduler = scheduler
         self._is_shutdown = False
+        self._rank_local_metadata_skip_enabled = (
+            self.worker.supports_rank_local_metadata_skip() is True
+        )
+        self._sparse_metadata_updates_enabled = (
+            self.worker.supports_sparse_metadata_updates() is True
+        )
+        if (
+            self._sparse_metadata_updates_enabled
+            and not self._rank_local_metadata_skip_enabled
+        ):
+            raise ValueError(
+                "Sparse connector metadata updates require rank-local metadata skip"
+            )
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -629,6 +655,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._scheduler_output = None
         self._metadata_pending = False
         self._skip_metadata_exchange = False
+        self._worker_batch_hooks_pending = False
         self._force_metadata_exchange = False
         self._metadata_exchange_progress = {}
         self._worker_visible_progress = {}
@@ -702,10 +729,17 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
-        self._metadata_pending = True
         self._skip_metadata_exchange = self._can_skip_metadata_exchange(
             scheduled_batch, kv_cache_manager
         )
+        if self._skip_metadata_exchange and self._sparse_metadata_updates_enabled:
+            # Leave SchedulerOutputManager's token/block cursor untouched so
+            # the next visible boundary carries the complete accumulated delta.
+            self._scheduler_output = None
+            self._metadata_pending = False
+            return
+
+        self._metadata_pending = True
         if self.scheduler is not None:
             self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
                 scheduled_batch, self.new_async_requests, kv_cache_manager
@@ -715,7 +749,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ) -> bool:
         """Return a conservative decision that is identical on replicated ranks."""
-        if not self.worker.supports_rank_local_metadata_skip():
+        if not self._rank_local_metadata_skip_enabled:
             return False
 
         block_size = kv_cache_manager.tokens_per_block
@@ -727,22 +761,27 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             request_id = req.request_id
             active_request_ids.add(request_id)
             num_tokens = req.get_num_tokens(0)
-            completed_blocks = num_tokens // block_size
 
             if request_id in generation_request_ids:
+                # The newest sampled token is input to the next forward and
+                # therefore has no KV yet. Only accepted, already-computed
+                # positions can make a generation block transferable.
+                completed_blocks = max(num_tokens - 1, 0) // block_size
                 # Draft lookahead reserves device capacity but cannot produce a
                 # worker transfer before those tokens are accepted into the
                 # request. Accepted full blocks are therefore the only
                 # worker-visible generation boundary.
                 transfer_boundary = completed_blocks
             else:
+                completed_blocks = num_tokens // block_size
                 next_position = req.context_current_position + min(
                     req.context_remaining_length, req.context_chunk_size
                 )
                 transfer_boundary = next_position // block_size
             # New device block IDs are consumed by the leader-only state
-            # advance. Workers need metadata only once the block can produce a
-            # transfer or its completed hash chain changes.
+            # advance or retained for the next sparse delta. Workers need
+            # metadata only once the block can produce a transfer or its
+            # completed hash chain changes.
             progress = (completed_blocks, transfer_boundary)
             if self._metadata_exchange_progress.get(request_id) != progress:
                 progress_changed = True
@@ -785,7 +824,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         """
         block_size = kv_cache_manager.tokens_per_block
         num_tokens = req.get_num_tokens(0)
-        completed_blocks = num_tokens // block_size
+        # The final live token is the next-forward input and has no KV yet.
+        completed_blocks = max(num_tokens - 1, 0) // block_size
         live_block_ids = kv_cache_manager.get_cache_indices(req)
         progress = (completed_blocks, completed_blocks)
         worker_visible_progress = self._worker_visible_progress.get(req.request_id)
@@ -850,6 +890,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         if not metadata_exchange_skipped:
             self.worker.bind_connector_meta(metadata)
+            self._worker_batch_hooks_pending = True
+
+    def start_worker_batch(self, scheduled_requests: ScheduledRequests) -> bool:
+        """Run metadata-driven worker hooks for the next forward pass."""
+        if (
+            self._sparse_metadata_updates_enabled
+            and not self._worker_batch_hooks_pending
+        ):
+            return False
+
+        self.take_scheduled_requests_pending_load(scheduled_requests)
+        self.worker.start_load_kv(torch.cuda.current_stream())
+        self._worker_batch_hooks_pending = False
+        return True
 
     def request_finished(self, req: LlmRequest, cache_block_ids: List[int]) -> bool:
         """

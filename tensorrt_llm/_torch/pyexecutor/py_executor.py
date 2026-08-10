@@ -850,6 +850,7 @@ class PyExecutor:
         self._broadcast_mpi_comm = None
 
         self.kv_connector_manager = kv_connector_manager
+        self._kv_connector_worker_hooks_active = False
 
         self._maybe_init_kv_connector_manager()
 
@@ -3286,11 +3287,10 @@ class PyExecutor:
 
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
-            self.kv_connector_manager.take_scheduled_requests_pending_load(
-                scheduled_batch)
-            self.kv_connector_manager.handle_metadata()
-            self.kv_connector_manager.worker.start_load_kv(
-                torch.cuda.current_stream())
+            self._kv_connector_worker_hooks_active = (
+                self.kv_connector_manager.start_worker_batch(scheduled_batch))
+            self.model_engine.set_forward_pass_callable_enabled(
+                self._kv_connector_worker_hooks_active)
 
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
@@ -3299,7 +3299,8 @@ class PyExecutor:
                 self._end_transfer_and_maybe_terminate(req)
 
     def _kv_connector_wait_for_save(self):
-        if self.kv_connector_manager is not None:
+        if (self.kv_connector_manager is not None
+                and self._kv_connector_worker_hooks_active):
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
 
