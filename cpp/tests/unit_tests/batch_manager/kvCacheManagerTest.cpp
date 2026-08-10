@@ -10316,8 +10316,7 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
     auto cachedRequest = std::make_shared<LlmRequest>(
         /*requestId=*/1, /*maxNewTokens=*/0, cachedTokens, samplingConfig, /*isStreaming=*/false);
     cachedRequest->setKvCacheRetentionConfig(KvCacheRetentionConfig(
-        {KvCacheRetentionConfig::TokenRangeRetentionConfig(
-            0, 4, KvCacheRetentionConfig::kMinRetentionPriority)},
+        {KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, KvCacheRetentionConfig::kMinRetentionPriority)},
         KvCacheRetentionConfig::kDefaultRetentionPriority));
     mgr->addSequenceBatch(
         {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});

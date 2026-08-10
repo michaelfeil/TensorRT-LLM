@@ -5435,8 +5435,7 @@ class PyExecutor:
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
         uses_secondary_staging = (
-            self.kv_connector_manager is not None
-            and self.kv_connector_manager.
+            self.kv_connector_manager is not None and self.kv_connector_manager.
             uses_secondary_kv_pool_as_persistence_staging())
 
         def kv_connector_request_finished(req: LlmRequest):
@@ -5453,8 +5452,7 @@ class PyExecutor:
                         f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"
                     )
                     return
-            if self.kv_connector_manager.request_finished(req,
-                                                          cache_block_ids):
+            if self.kv_connector_manager.request_finished(req, cache_block_ids):
                 self.async_transfer_manager.start_transfer(
                     req, source="kv_cache_connector")
 

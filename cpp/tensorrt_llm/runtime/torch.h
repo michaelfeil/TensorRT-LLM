@@ -35,11 +35,11 @@ public:
     static at::Tensor tensor(ITensor::SharedPtr tensor)
     {
         auto const memoryType = tensor->getMemoryType();
-        auto const tensorOptions = at::device(TorchUtils::device((*tensor).data()))
-                                       .pinned_memory(
-                                           memoryType == MemoryType::kPINNED || memoryType == MemoryType::kPINNEDPOOL)
-                                       .dtype(TorchUtils::dataType((*tensor).getDataType()))
-                                       .layout(at::kStrided);
+        auto const tensorOptions
+            = at::device(TorchUtils::device((*tensor).data()))
+                  .pinned_memory(memoryType == MemoryType::kPINNED || memoryType == MemoryType::kPINNEDPOOL)
+                  .dtype(TorchUtils::dataType((*tensor).getDataType()))
+                  .layout(at::kStrided);
         return at::for_blob(tensor->data(), TorchUtils::shape(tensor->getShape())) // NOLINT(*-use-after-move)
             .options(tensorOptions)
             .deleter(

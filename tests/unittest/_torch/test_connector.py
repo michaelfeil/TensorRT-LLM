@@ -275,9 +275,8 @@ def test_persistence_staging_reaps_coordinated_terminal_lease_without_mpi():
     assert manager.take_pending_persistence_leases() == []
 
     worker.poll_globally_completed_persistence_leases.return_value = [7]
-    with patch(
-            "tensorrt_llm._torch.pyexecutor.connectors."
-            "kv_cache_connector.mpi_allgather") as allgather:
+    with patch("tensorrt_llm._torch.pyexecutor.connectors."
+               "kv_cache_connector.mpi_allgather") as allgather:
         assert manager.get_finished() == []
 
     allgather.assert_not_called()
