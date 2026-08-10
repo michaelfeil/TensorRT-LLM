@@ -1,6 +1,8 @@
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import gc
 import random
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -112,6 +114,45 @@ def test_tx_session_wait_complete_nonblocking_does_not_wait_on_pending_task():
 
     assert session.wait_complete(blocking=False) is None
     assert task.wait_calls == []
+
+
+def test_receiver_expects_transfer_only_while_session_is_registered():
+    """Expectation predicate follows the RxSession registration.
+
+    A transfer agent uses it to reject a retry that arrives after the request
+    already finished, so it must track what setup_session/clear_session
+    maintain, and must not be fooled by a session that was garbage collected
+    without closing.
+    """
+
+    class FakeRxSession:
+        pass
+
+    receiver = transfer_mod.Receiver.__new__(transfer_mod.Receiver)
+    receiver._sessions = {}
+    receiver._sessions_lock = threading.Lock()
+    receiver._pre_cancelled_rids = set()
+
+    assert receiver._is_expecting_transfer(7) is False
+
+    session = FakeRxSession()
+    session.disagg_request_id = 7
+    receiver.setup_session(session)
+    assert receiver._is_expecting_transfer(7) is True
+    # Another request is unaffected.
+    assert receiver._is_expecting_transfer(8) is False
+
+    receiver.clear_session(7)
+    assert receiver._is_expecting_transfer(7) is False
+
+    # A dropped session still holds a dict entry until clear_session runs; the
+    # dead weakref must read as "not expecting", not as expecting.
+    session2 = FakeRxSession()
+    session2.disagg_request_id = 9
+    receiver.setup_session(session2)
+    del session2
+    gc.collect()
+    assert receiver._is_expecting_transfer(9) is False
 
 
 def test_layer_range_valid():

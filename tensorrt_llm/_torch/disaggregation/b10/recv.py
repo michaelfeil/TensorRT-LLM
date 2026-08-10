@@ -82,6 +82,7 @@ from tensorrt_llm._torch.disaggregation.b10.protocol import (
     _B10_PROTOCOL,
     _B10_PROTOCOL_VERSION,
     _DEFAULT_TAG_QUARANTINE_TTL_S,
+    _ENDPOINT_GENERATION_RING,
     _am_send_message,
     _AmHeader,
     _request_id_from_sync_message,
@@ -124,6 +125,31 @@ def _dst_descs_from_control(
     return _DescArrayView(arr[0], arr[1], arr[2])
 
 
+# Identity of one logical incoming transfer: (sender worker address, transfer
+# id). The sender's worker address is stable across its endpoint rebuilds -
+# unlike the inbound endpoint handle, which changes on exactly the retry this
+# has to recognise - and the transfer id is unchanged by a retry, so together
+# they name the same logical transfer across attempts while separating
+# concurrent senders whose id rings are independent. What a key maps to is the
+# endpoint generation of the attempt currently receiving it, i.e. the live one.
+_AttemptKey = tuple[bytes, int]
+
+
+def _generation_is_newer(candidate: int, live: int) -> bool:
+    """Whether `candidate` is a later endpoint generation than `live`.
+
+    Generations wrap (see _next_endpoint_generation), and plain ordering would
+    read a wrap as a huge regression and reject a real retry as stale. Compare
+    by forward distance instead, treating less than half the ring as "ahead" -
+    the serial-number arithmetic of RFC 1982, which is also how TCP orders
+    wrapping sequence numbers (RFC 7323 PAWS). At the full uint32 the counter
+    now spans, wrapping is unreachable in practice; this keeps the ordering
+    correct by construction rather than by argument.
+    """
+    forward = (candidate - live) % _ENDPOINT_GENERATION_RING
+    return 0 < forward < _ENDPOINT_GENERATION_RING // 2
+
+
 class _RecvRequestRegistry:
     """Request cancellation and scheduler-visible receive activity.
 
@@ -140,6 +166,16 @@ class _RecvRequestRegistry:
         self._active_copy_counts: dict[int, int] = {}
         self._cancelled_until: dict[int, float] = {}
         self._tasks_by_request_id: dict[int, set[asyncio.Task]] = {}
+        # Attempt key -> endpoint_generation of the attempt currently being
+        # received, and the handler task receiving it. A sender that loses a NIC
+        # retires its endpoint and retries on a fresh one, so generations rise
+        # for a given attempt and identify which one is live; see
+        # _classify_incoming_attempt(). Keyed per SENDER, never per request: a
+        # request whose peer layout overlaps several sender ranks is written by
+        # all of them concurrently, and their transfer ids and generations are
+        # sender-local (see _RecvTransfer.src_ep_handle).
+        self._attempt_generations: dict[_AttemptKey, int] = {}
+        self._tasks_by_attempt: dict[_AttemptKey, asyncio.Task] = {}
 
     def has_active_transfer(self, request_id: int) -> bool:
         with self._lock:
@@ -176,23 +212,60 @@ class _RecvRequestRegistry:
         return True
 
     @contextmanager
-    def track_task(self, request_id: Optional[int]) -> Iterator[None]:
-        """Make the current endpoint handler cancellable by request ID."""
+    def track_task(
+        self, request_id: Optional[int], attempt_key: Optional[_AttemptKey] = None
+    ) -> Iterator[None]:
+        """Make the current endpoint handler cancellable.
 
-        if request_id is None:
-            yield
-            return
-        request_id = int(request_id)
+        By request ID, which cancels every transfer for the request (what an
+        aborted request wants), and by attempt key, which cancels only this one
+        (what superseding wants - concurrent senders each write part of the
+        same request and must not cancel one another).
+        """
+
         task = asyncio.current_task()
         assert task is not None
-        tasks = self._tasks_by_request_id.setdefault(request_id, set())
-        tasks.add(task)
+        tasks = None
+        if request_id is not None:
+            request_id = int(request_id)
+            tasks = self._tasks_by_request_id.setdefault(request_id, set())
+            tasks.add(task)
+        if attempt_key is not None:
+            self._tasks_by_attempt[attempt_key] = task
         try:
             yield
         finally:
-            tasks.discard(task)
-            if not tasks and self._tasks_by_request_id.get(request_id) is tasks:
-                del self._tasks_by_request_id[request_id]
+            if tasks is not None:
+                tasks.discard(task)
+                if not tasks and self._tasks_by_request_id.get(request_id) is tasks:
+                    del self._tasks_by_request_id[request_id]
+            if attempt_key is not None and self._tasks_by_attempt.get(attempt_key) is task:
+                del self._tasks_by_attempt[attempt_key]
+
+    def current_attempt_generation(self, attempt_key: _AttemptKey) -> Optional[int]:
+        with self._lock:
+            return self._attempt_generations.get(attempt_key)
+
+    def begin_attempt(self, attempt_key: _AttemptKey, endpoint_generation: int) -> None:
+        with self._lock:
+            self._attempt_generations[attempt_key] = int(endpoint_generation)
+
+    def end_attempt(self, attempt_key: _AttemptKey, endpoint_generation: int) -> None:
+        """Forget an attempt, unless a newer one already superseded it."""
+        with self._lock:
+            if self._attempt_generations.get(attempt_key) == int(endpoint_generation):
+                del self._attempt_generations[attempt_key]
+
+    def supersede_attempt(self, attempt_key: _AttemptKey) -> None:
+        """Cancel one attempt's handler without tombstoning the request.
+
+        Unlike cancel(), the request itself stays receivable and its other
+        senders keep transferring: only the superseded attempt is unwound, and
+        a newer attempt of it is about to take over. Cancellation runs the old
+        handler through its normal failure path, which releases its staging
+        buffers into quarantine and unregisters its data sink.
+        """
+        self._loop.call_soon_threadsafe(self._cancel_attempt_task, attempt_key)
 
     def _cancel_tasks(self, request_id: int) -> None:
         # Consume on first cancellation so retry polling cannot re-cancel the
@@ -200,6 +273,13 @@ class _RecvRequestRegistry:
         for task in self._tasks_by_request_id.pop(request_id, ()):
             if not task.done():
                 task.cancel()
+
+    def _cancel_attempt_task(self, attempt_key: _AttemptKey) -> None:
+        # Consumed like _cancel_tasks, so a repeated supersede cannot re-cancel
+        # a handler that is already unwinding.
+        task = self._tasks_by_attempt.pop(attempt_key, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     def _start_transfer(self, request_id: int) -> None:
         with self._lock:
@@ -313,11 +393,16 @@ class _RecvTransfer:
     chunk_dst_spans: list[b10_memory._SpanArrays] = field(default_factory=list)
     # Reverse endpoint for READY/RESULT (assigned after validation).
     endpoint: Any = None
+
     # Per-chunk delivery futures fed by the AM dispatcher's data sink;
     # `_receive_one` awaits its own index. Created when the sink registers
     # (before READY, so no DATA can precede them).
     am_chunks: dict[int, asyncio.Future] = field(default_factory=dict)
     am_sink_registered: bool = False
+
+    @property
+    def attempt_key(self) -> _AttemptKey:
+        return (self.src_worker_address, self.transfer_id)
 
     def __post_init__(self) -> None:
         self.dst_descs_have_overlap = _has_overlapping_descs(self.dst_descs)
@@ -351,6 +436,10 @@ class RecvPipeline:
         self._reply_endpoints: dict[bytes, Any] = {}
         dispatcher.set_control_handler(self._on_am_control)
         self._incoming_write_listener: Optional[Callable[[int, bool], None]] = None
+        # Predicate answering "is this request still expecting data?". Installed
+        # by the owner of the receive-session table; absent for direct agent
+        # users, in which case every request counts as expected.
+        self._expectation_check: Optional[Callable[[int], bool]] = None
         self._recv_scratch_buffer_slots = asyncio.BoundedSemaphore(
             core.recv_scratch_buffer_pool.num_buffers
         )
@@ -358,6 +447,11 @@ class RecvPipeline:
         self._retired_recv_scratch_views: list[_BufferView] = []
         self._request_scatter_reservation_lock = asyncio.Lock()
         self._request_level_recv_scatter_admissions = 0
+        # Attempt-classification counters (see _classify_incoming_attempt).
+        self._duplicate_attempts_dropped = 0
+        self._stale_attempts_rejected = 0
+        self._attempts_superseded = 0
+        self._unexpected_attempts_rejected = 0
         cancelled_recv_ttl_s = _DEFAULT_TAG_QUARANTINE_TTL_S
         if core.transfer_timeout_s is not None:
             cancelled_recv_ttl_s = max(cancelled_recv_ttl_s, 2.0 * core.transfer_timeout_s)
@@ -380,6 +474,30 @@ class RecvPipeline:
         the sender's KV_AGENT_RESULT notification. Runs on the agent's event
         loop thread; keep it brief and non-blocking."""
         self._incoming_write_listener = listener
+
+    def set_transfer_expectation_check(self, check: Callable[[int], bool]) -> None:
+        """Register check(request_id) -> bool, answering whether the request is
+        still expecting data to land. Without it, an attempt for a request with
+        no in-flight attempt is indistinguishable from a first attempt, so a
+        retry arriving after the transfer already completed would be accepted
+        and would write a destination the session layer has since released.
+
+        Called from the agent's event loop thread on every incoming control
+        message; keep it to a membership test."""
+        self._expectation_check = check
+
+    def _is_expected_transfer(self, request_id: int) -> bool:
+        check = self._expectation_check
+        if check is None:
+            # No session layer to ask; preserve the pre-existing behaviour of
+            # treating any uncorrelated attempt as a first attempt.
+            return True
+        try:
+            return bool(check(request_id))
+        except Exception as exc:
+            # A broken predicate must not reject live transfers.
+            logger.warning(f"B10 recv expectation check failed for request {request_id}: {exc}")
+            return True
 
     def _notify_incoming_write_listener(self, request_id: Optional[int], recv_status: str) -> None:
         listener = self._incoming_write_listener
@@ -612,14 +730,85 @@ class RecvPipeline:
 
     async def _handle_incoming_write(self, src_ep_handle: int, control: dict[str, Any]) -> None:
         ctx = self._validate_and_prepare(src_ep_handle, control)
+        # Classify before reserving anything: a duplicate must cost a dictionary
+        # lookup, not staging buffers and a second destination write.
+        decision = self._classify_incoming_attempt(ctx)
+        if decision == "drop_duplicate":
+            self._duplicate_attempts_dropped += 1
+            logger.info(
+                f"B10 recv dropped duplicate transfer {ctx.transfer_id}: "
+                f"request={ctx.request_id} "
+                f"endpoint_generation={ctx.endpoint_generation} already in "
+                f"flight from this sender "
+                f"(dropped={self._duplicate_attempts_dropped})"
+            )
+            return
+        if decision == "reject_unexpected":
+            self._unexpected_attempts_rejected += 1
+            logger.warning(
+                f"B10 recv rejected unexpected transfer {ctx.transfer_id}: "
+                f"request={ctx.request_id} is not awaiting data, so this "
+                f"endpoint_generation={ctx.endpoint_generation} attempt arrived "
+                f"after the request already reached a terminal state "
+                f"(rejected={self._unexpected_attempts_rejected})"
+            )
+            return
+        if decision == "reject_stale":
+            self._stale_attempts_rejected += 1
+            logger.warning(
+                f"B10 recv rejected stale transfer {ctx.transfer_id}: "
+                f"request={ctx.request_id} "
+                f"endpoint_generation={ctx.endpoint_generation} is older than "
+                f"the in-flight "
+                f"{self._requests.current_attempt_generation(ctx.attempt_key)} "
+                f"(rejected={self._stale_attempts_rejected})"
+            )
+            return
+        if decision == "supersede":
+            self._attempts_superseded += 1
+            logger.warning(
+                f"B10 recv superseding transfer {ctx.transfer_id}: "
+                f"request={ctx.request_id} endpoint_generation "
+                f"{self._requests.current_attempt_generation(ctx.attempt_key)} "
+                f"-> {ctx.endpoint_generation}; the older attempt cannot "
+                f"complete (superseded={self._attempts_superseded})"
+            )
+            self._requests.supersede_attempt(ctx.attempt_key)
+        self._requests.begin_attempt(ctx.attempt_key, ctx.endpoint_generation)
         # Reverse endpoint for READY/RESULT, from the sender's worker address
         # in the control message (self-contained; no registration-plane
         # dependency). DATA needs no endpoint object at all — it arrives via
         # the worker-scoped dispatcher.
-        ctx.endpoint = await self._get_reply_endpoint(ctx.src_worker_address, ctx.deadline)
+        #
+        # Connecting back to the sender is the one step that owns an attempt
+        # slot without yet being cancellable, since track_task() below is what
+        # registers this handler. So release the slot by hand if the connect
+        # fails - the sender just lost a NIC, which is exactly when connecting
+        # back to it times out, and a slot left behind would make every later
+        # attempt of this transfer look like a duplicate forever.
+        try:
+            ctx.endpoint = await self._get_reply_endpoint(ctx.src_worker_address, ctx.deadline)
+        except BaseException:
+            self._requests.end_attempt(ctx.attempt_key, ctx.endpoint_generation)
+            raise
+        # For the same reason, a newer attempt that arrived while we were
+        # connecting could not cancel this handler; it only took the slot. Yield
+        # to it here, before reserving resources or writing the destination it
+        # now owns.
+        if self._requests.current_attempt_generation(ctx.attempt_key) != ctx.endpoint_generation:
+            self._attempts_superseded += 1
+            logger.warning(
+                f"B10 recv abandoning superseded transfer {ctx.transfer_id}: "
+                f"request={ctx.request_id} endpoint_generation "
+                f"{ctx.endpoint_generation} lost the attempt to "
+                f"{self._requests.current_attempt_generation(ctx.attempt_key)} "
+                f"while connecting back to the sender "
+                f"(superseded={self._attempts_superseded})"
+            )
+            return
         # No await separates tombstone validation from task registration, so
         # cancellation is caught by one or the other without a race window.
-        with self._requests.track_task(ctx.request_id):
+        with self._requests.track_task(ctx.request_id, ctx.attempt_key):
             ready_sent = False
             try:
                 await self._reserve_transfer_resources(ctx)
@@ -635,6 +824,50 @@ class RecvPipeline:
                 raise
             finally:
                 self._finish_transfer(ctx)
+
+    def _classify_incoming_attempt(self, ctx: _RecvTransfer) -> str:
+        """Decide what to do with an incoming transfer.
+
+        A control message can arrive more than once for the same transfer: the
+        transport may retransmit it after a lane failure, and a sender that lost
+        a NIC retires its endpoint and retries on a fresh one. Deciding by
+        ``endpoint_generation`` separates those cases, because a retry that
+        followed an endpoint rebuild necessarily carries a later generation while
+        a pure retransmission carries the same one.
+
+        Generations are only comparable **within one sender**, since each
+        sender's counter lives on its own endpoint slot, so the comparison is
+        scoped to ``ctx.attempt_key``. Whether the request still wants data is a
+        separate, request-scoped question, and only the session layer can answer
+        it.
+
+        Returns "accept", "drop_duplicate", "supersede", "reject_stale" or
+        "reject_unexpected".
+        """
+        live = self._requests.current_attempt_generation(ctx.attempt_key)
+        if live is None:
+            # Nothing in flight for this transfer. Either it is the first
+            # attempt, or every earlier one already reached a terminal state -
+            # including success, after which the destination belongs to the
+            # session layer again and must not be written.
+            if ctx.request_id is None:
+                # Nothing to ask the session layer about; behave as before.
+                return "accept"
+            if not self._is_expected_transfer(ctx.request_id):
+                return "reject_unexpected"
+            return "accept"
+        if ctx.endpoint_generation == live:
+            # Same endpoint, so this is the same attempt arriving twice. The
+            # in-flight handler owns the single READY/RESULT pair the sender is
+            # waiting for; answering again would double-reserve resources and
+            # write the destination twice.
+            return "drop_duplicate"
+        if _generation_is_newer(ctx.endpoint_generation, live):
+            # The sender rebuilt its endpoint, so the attempt we are still
+            # holding cannot complete - its data will never arrive. Hand over
+            # rather than making the sender wait out a timeout.
+            return "supersede"
+        return "reject_stale"
 
     def _validate_and_prepare(self, src_ep_handle: int, control: dict[str, Any]) -> _RecvTransfer:
         deadline = _TransferDeadline(self._core.transfer_timeout_s)
@@ -1219,6 +1452,9 @@ class RecvPipeline:
             )
 
     def _finish_transfer(self, ctx: _RecvTransfer) -> None:
+        # Release the attempt slot first: a retry of this transfer may already
+        # be waiting, and must not be mistaken for a duplicate of this one.
+        self._requests.end_attempt(ctx.attempt_key, ctx.endpoint_generation)
         ctx.request_activity.finish()
         self._clear_request_scatter_admission(ctx)
         # After this, a late DATA for this transfer has no sink and is

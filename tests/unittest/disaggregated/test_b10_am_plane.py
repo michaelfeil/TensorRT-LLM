@@ -309,3 +309,265 @@ def test_release_staging_slots_skips_am_direct_views():
     _AgentCore._release_staging_slots_for_views(core, [direct, normal])
     with pytest.raises(ValueError):
         slots.release()
+
+
+def _attempt_classifier(expectation_check=None, loop=None):
+    """A RecvPipeline carrying only what attempt classification reads.
+
+    The full pipeline needs a UCX worker, CUDA pools and a dispatcher;
+    classification is pure policy over the attempt registry, so it is built
+    directly rather than standing all of that up.
+    """
+    from tensorrt_llm._torch.disaggregation.b10.recv import RecvPipeline, _RecvRequestRegistry
+
+    pipeline = RecvPipeline.__new__(RecvPipeline)
+    pipeline._requests = _RecvRequestRegistry(loop or asyncio.new_event_loop(), 120.0)
+    pipeline._expectation_check = expectation_check
+    return pipeline
+
+
+def _control_ctx(request_id, endpoint_generation, sender=b"sender-a", transfer_id=999):
+    """A stand-in for the fields _classify_incoming_attempt reads.
+
+    attempt_key mirrors _RecvTransfer.attempt_key, which is what scopes a
+    generation comparison to the sender that produced it.
+    """
+    return types.SimpleNamespace(
+        request_id=request_id,
+        endpoint_generation=endpoint_generation,
+        transfer_id=transfer_id,
+        src_worker_address=sender,
+        attempt_key=(sender, transfer_id),
+        deadline=None,
+        endpoint=None,
+    )
+
+
+def test_classify_attempt_decides_by_endpoint_generation():
+    pipeline = _attempt_classifier()
+    ctx = _control_ctx(7, 3)
+
+    # Nothing in flight yet: the first attempt is accepted, and no expectation
+    # check is installed, so an uncorrelated attempt stays acceptable.
+    assert pipeline._classify_incoming_attempt(ctx) == "accept"
+    pipeline._requests.begin_attempt(ctx.attempt_key, 3)
+
+    # Same generation is the same attempt arriving twice.
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 3)) == "drop_duplicate"
+    # A later generation means the sender rebuilt its endpoint, so the attempt
+    # being held can never complete.
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 4)) == "supersede"
+    # An earlier generation is from an endpoint already written off.
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 2)) == "reject_stale"
+    # A transfer with no request id is still tracked per attempt.
+    assert pipeline._classify_incoming_attempt(_control_ctx(None, 3)) == "drop_duplicate"
+
+    # Ending the live attempt reopens it, absent an expectation check.
+    pipeline._requests.end_attempt(ctx.attempt_key, 3)
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 3)) == "accept"
+
+
+def test_classify_attempt_scopes_generations_to_one_sender():
+    """Concurrent senders for one request must not classify each other.
+
+    When ctx and gen parallel layouts differ, several sender ranks write the
+    same request at once. Each carries its own transfer id and its own
+    endpoint generation, drawn from its own endpoint slot, so comparing them
+    across senders would drop or cancel legitimate transfers.
+    """
+    pipeline = _attempt_classifier()
+
+    a = _control_ctx(7, 3, sender=b"rank-0", transfer_id=100)
+    assert pipeline._classify_incoming_attempt(a) == "accept"
+    pipeline._requests.begin_attempt(a.attempt_key, a.endpoint_generation)
+
+    # Same request, different sender. Every generation relationship that would
+    # mean something within one sender must mean nothing across two.
+    for generation in (3, 4, 2):
+        b = _control_ctx(7, generation, sender=b"rank-1", transfer_id=250)
+        assert pipeline._classify_incoming_attempt(b) == "accept"
+
+    # Same sender and request but a different transfer is also independent.
+    other = _control_ctx(7, 3, sender=b"rank-0", transfer_id=101)
+    assert pipeline._classify_incoming_attempt(other) == "accept"
+
+    # ...while the original attempt still classifies against itself.
+    assert pipeline._classify_incoming_attempt(a) == "drop_duplicate"
+
+
+def test_endpoint_generation_uses_the_whole_header_field():
+    """A narrow counter makes attempt ordering ambiguous once it wraps.
+
+    The header field is a uint32, so the counter must use all of it rather than
+    the 12 bits it was limited to when identity shared a 64-bit UCX tag.
+    """
+    from tensorrt_llm._torch.disaggregation.b10.protocol import (
+        _MAX_ENDPOINT_GENERATION,
+        _pack_am_header,
+        _unpack_am_header,
+    )
+
+    assert _MAX_ENDPOINT_GENERATION == (1 << 32) - 1
+    # The widest generation still round-trips through the wire header.
+    hdr = _unpack_am_header(_pack_am_header(_AM_KIND_CONTROL, 1, 0, _MAX_ENDPOINT_GENERATION, 0))
+    assert hdr.endpoint_generation == _MAX_ENDPOINT_GENERATION
+
+
+def test_classify_attempt_survives_generation_wraparound():
+    """The generation counter wraps, so ordering cannot be a plain compare."""
+    from tensorrt_llm._torch.disaggregation.b10.protocol import (
+        _MAX_ENDPOINT_GENERATION,
+        _next_endpoint_generation,
+    )
+
+    pipeline = _attempt_classifier()
+    last = _MAX_ENDPOINT_GENERATION
+    wrapped = _next_endpoint_generation(last)
+    assert wrapped < last, "expected the counter to wrap for this test to mean anything"
+
+    ctx = _control_ctx(7, last)
+    pipeline._requests.begin_attempt(ctx.attempt_key, last)
+    # A retry across the wrap is newer, not stale.
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, wrapped)) == "supersede"
+
+    # And the reverse still reads as stale: an attempt from just before the
+    # wrap arriving after it must not supersede.
+    pipeline._requests.begin_attempt(ctx.attempt_key, wrapped)
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, last)) == "reject_stale"
+
+
+def test_classify_attempt_rejects_retry_after_request_finished():
+    expecting = {7}
+    pipeline = _attempt_classifier(expectation_check=lambda rid: rid in expecting)
+    ctx = _control_ctx(7, 3)
+
+    assert pipeline._classify_incoming_attempt(ctx) == "accept"
+    pipeline._requests.begin_attempt(ctx.attempt_key, 3)
+    pipeline._requests.end_attempt(ctx.attempt_key, 3)
+
+    # The request is still awaiting data, so a fresh attempt is a real retry.
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 4)) == "accept"
+
+    # Once the session layer stops expecting data, the destination is no longer
+    # this transfer's to write: a retry from a written-off NIC must be rejected
+    # rather than treated as a first attempt.
+    expecting.clear()
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 4)) == "reject_unexpected"
+    # Another sender's first attempt for the same finished request is rejected
+    # too - the request, not the sender, is what stopped expecting data.
+    other = _control_ctx(7, 1, sender=b"rank-1", transfer_id=250)
+    assert pipeline._classify_incoming_attempt(other) == "reject_unexpected"
+
+    # An attempt already in flight still classifies by generation - the
+    # expectation check only resolves the "nothing in flight" case.
+    pipeline._requests.begin_attempt(ctx.attempt_key, 4)
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 4)) == "drop_duplicate"
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 5)) == "supersede"
+
+
+def test_classify_attempt_fails_open_when_expectation_check_raises():
+    def broken(_rid):
+        raise RuntimeError("session table unavailable")
+
+    pipeline = _attempt_classifier(expectation_check=broken)
+    # A broken predicate must never reject a live transfer.
+    assert pipeline._classify_incoming_attempt(_control_ctx(7, 3)) == "accept"
+
+
+def _write_handler_pipeline(reply_endpoint, loop, expectation_check=None):
+    """A RecvPipeline that can run _handle_incoming_write's prologue.
+
+    Classifying, taking the attempt slot and connecting back to the sender all
+    happen before any transport or CUDA resource is touched, so everything past
+    that point is recorded rather than performed.
+    """
+    pipeline = _attempt_classifier(expectation_check=expectation_check, loop=loop)
+    pipeline._duplicate_attempts_dropped = 0
+    pipeline._unexpected_attempts_rejected = 0
+    pipeline._stale_attempts_rejected = 0
+    pipeline._attempts_superseded = 0
+    pipeline._get_reply_endpoint = reply_endpoint
+    pipeline.performed = []
+
+    async def _record(step):
+        pipeline.performed.append(step)
+
+    pipeline._reserve_transfer_resources = lambda _ctx: _record("reserve")
+    pipeline._send_ready = lambda _ctx: _record("ready")
+    pipeline._receive_chunks = lambda _ctx: _record("chunks")
+    pipeline._finalize_success = lambda _ctx: _record("success")
+    pipeline._finish_transfer = lambda _ctx: pipeline.performed.append("finish")
+    return pipeline
+
+
+def test_handler_releases_the_attempt_slot_when_connecting_back_fails():
+    """A slot taken before the reply endpoint exists must not outlive a failure.
+
+    Connecting back to the sender is deadline-bounded, and it fails precisely
+    when the sender lost a NIC - the case this classification exists for. The
+    slot is taken before that connect and released by _finish_transfer, which
+    only runs once the handler is cancellable, so a failed connect would leave
+    the slot behind permanently and make every later attempt of the transfer
+    read as a duplicate of an attempt nobody is running.
+    """
+
+    async def scenario():
+        async def refuse_connect(_address, _deadline):
+            raise TimeoutError("reply endpoint timed out")
+
+        pipeline = _write_handler_pipeline(refuse_connect, asyncio.get_running_loop())
+        ctx = _control_ctx(7, 3)
+        pipeline._validate_and_prepare = lambda _handle, _control: ctx
+
+        with pytest.raises(TimeoutError):
+            await pipeline._handle_incoming_write(1, {})
+
+        assert pipeline._requests.current_attempt_generation(ctx.attempt_key) is None
+        assert pipeline.performed == []
+        # So the sender's retry on that same endpoint is a first attempt again.
+        assert pipeline._classify_incoming_attempt(_control_ctx(7, 3)) == "accept"
+
+    asyncio.run(scenario())
+
+
+def test_handler_yields_to_an_attempt_that_took_over_while_connecting():
+    """Superseding cannot cancel a handler that is still connecting back.
+
+    track_task() is what makes a handler cancellable, and it is reached only
+    after the reply endpoint exists. An attempt superseded before that point
+    therefore keeps running, and must notice it no longer owns the slot before
+    reserving anything - otherwise both attempts write the same destination,
+    which is the outcome superseding exists to prevent.
+    """
+
+    async def scenario():
+        connected = asyncio.Event()
+
+        async def slow_connect(_address, _deadline):
+            await connected.wait()
+            return object()
+
+        pipeline = _write_handler_pipeline(slow_connect, asyncio.get_running_loop())
+        first = _control_ctx(7, 3)
+        pipeline._validate_and_prepare = lambda _handle, _control: first
+
+        handler = asyncio.ensure_future(pipeline._handle_incoming_write(1, {}))
+        await asyncio.sleep(0)  # let it park on the connect
+        assert pipeline._requests.current_attempt_generation(first.attempt_key) == 3
+
+        # The retry arrives while the first attempt is still connecting, so
+        # there is no handler task registered for it to cancel: superseding can
+        # only take the slot.
+        retry = _control_ctx(7, 4)
+        assert pipeline._classify_incoming_attempt(retry) == "supersede"
+        pipeline._requests.supersede_attempt(retry.attempt_key)
+        pipeline._requests.begin_attempt(retry.attempt_key, retry.endpoint_generation)
+
+        connected.set()
+        await handler
+
+        assert pipeline.performed == []
+        # And it left the retry's slot alone on the way out.
+        assert pipeline._requests.current_attempt_generation(first.attempt_key) == 4
+
+    asyncio.run(scenario())

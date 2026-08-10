@@ -1515,7 +1515,26 @@ class Receiver(ReceiverBase):
         set_incoming_write_listener = getattr(agent, "set_incoming_write_listener", None)
         if set_incoming_write_listener is not None:
             set_incoming_write_listener(self._process_local_agent_result)
+        # _sessions answers whether a request is still expecting data: an
+        # RxSession registers before it requests any and unregisters when it
+        # closes. Agents that retry a write use that to decide what to do with
+        # an attempt this session no longer owns.
+        set_transfer_expectation_check = getattr(agent, "set_transfer_expectation_check", None)
+        if set_transfer_expectation_check is not None:
+            set_transfer_expectation_check(self._is_expecting_transfer)
         logger.info(f"Receiver init with endpoint: {self._messenger.endpoint}")
+
+    def _is_expecting_transfer(self, unique_rid: int) -> bool:
+        """Whether a live RxSession is still awaiting data for unique_rid.
+
+        Runs on the transfer agent's event loop thread for every incoming
+        control message, so it stays a locked dictionary lookup. Deliberately
+        avoids _get_session(), whose warning on a garbage-collected session
+        would fire on the ordinary post-completion path.
+        """
+        with self._sessions_lock:
+            session_ref = self._sessions.get(unique_rid)
+        return session_ref is not None and session_ref() is not None
 
     @property
     def endpoint(self):

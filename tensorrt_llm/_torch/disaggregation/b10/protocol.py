@@ -38,10 +38,20 @@ _FEATURE_PACKED_DESCS = "packed_descs"
 
 _CHUNK_INDEX_BITS = 16
 _TRANSFER_ID_BITS = 32
-_ENDPOINT_GENERATION_BITS = 12
+# Full width of the header's endpoint_generation field. It was 12 bits back when
+# transfer identity had to share a single 64-bit UCX tag with the chunk index and
+# transfer id; identity now rides the 32-byte AM header, where the field is a
+# whole uint32, so the counter uses all of it. Receivers compare generations to
+# order attempts, and a narrow counter makes that ordering ambiguous once it
+# wraps - at 12 bits, only 4095 endpoint rebuilds on one slot.
+_ENDPOINT_GENERATION_BITS = 32
 _MAX_CHUNK_INDEX = (1 << _CHUNK_INDEX_BITS) - 1
 _MAX_TRANSFER_ID = (1 << _TRANSFER_ID_BITS) - 1
 _MAX_ENDPOINT_GENERATION = (1 << _ENDPOINT_GENERATION_BITS) - 1
+# Modulus for comparing two endpoint generations. Wrapping is now unreachable in
+# practice, but ordering by forward distance costs nothing and keeps the
+# comparison correct by construction rather than by argument.
+_ENDPOINT_GENERATION_RING = 1 << _ENDPOINT_GENERATION_BITS
 
 # Named for the TRTLLM_B10_UCXX_TAG_* env knobs they back (kept stable for
 # deployments); they now size the transfer-id ring and its quarantine TTL.
@@ -283,6 +293,7 @@ class B10TransferIdAllocator:
 
 
 def _next_endpoint_generation(generation: int) -> int:
+    """Advance a slot's generation, keeping 0 reserved for "never leased"."""
     generation = (generation + 1) & _MAX_ENDPOINT_GENERATION
     return 1 if generation == 0 else generation
 

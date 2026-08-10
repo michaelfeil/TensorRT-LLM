@@ -250,6 +250,12 @@ class B10CacheTransferAgent(BaseTransferAgent):
         # supports it.
         self._recv.set_incoming_write_listener(listener)
 
+    def set_transfer_expectation_check(self, check: Callable[[int], bool]) -> None:
+        # Same discovery pattern as the incoming-write listener: optional on the
+        # agent, so the session layer probes for it with getattr(). See the
+        # RecvPipeline method for the predicate contract.
+        self._recv.set_transfer_expectation_check(check)
+
     def register_memory(self, descs: RegMemoryDescs) -> None:
         pass
 
