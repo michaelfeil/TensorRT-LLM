@@ -45,7 +45,9 @@ class Config:
 
 class DummyKvCacheConnectorWorker(KvCacheConnectorWorker):
 
-    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+    def register_kv_caches(self,
+                           kv_cache_tensor: torch.Tensor,
+                           secondary_kv_cache_tensor: torch.Tensor = None):
         pass
 
 

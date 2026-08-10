@@ -62,6 +62,18 @@ void checkFilled(IBuffer& buffer, int fillValue)
 }
 } // namespace
 
+TEST_F(TorchTest, MarksPinnedBuffersAsPinned)
+{
+    BufferManager manager(mStream);
+    auto const shape = ITensor::makeShape({1});
+
+    for (auto memoryType : {MemoryType::kPINNED, MemoryType::kPINNEDPOOL})
+    {
+        ITensor::SharedPtr tensorTllm{manager.allocate(memoryType, shape, nvinfer1::DataType::kFLOAT)};
+        EXPECT_TRUE(Torch::tensor(std::move(tensorTllm)).is_pinned());
+    }
+}
+
 TEST_F(TorchTest, Aten)
 {
     BufferManager manager(mStream);

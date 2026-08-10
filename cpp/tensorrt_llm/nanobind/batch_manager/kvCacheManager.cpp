@@ -556,6 +556,11 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_unique_secondary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniqueSecondaryPool(); },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("complete_persistence_leases", &tbk::BaseKVCacheManager::completePersistenceLeases, nb::arg("lease_ids"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)

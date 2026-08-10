@@ -43,6 +43,7 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 
 namespace tc = tensorrt_llm::common;
@@ -830,6 +831,8 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mTpHostOffloadTopology{std::move(tpHostOffloadTopology)}
     , mWorldRank{worldRankOverride.value_or(0)}
     , mKvCacheConnectorManager{std::move(kvCacheConnectorManager)}
+    , mUseSecondaryKvPoolAsPersistenceStaging{mKvCacheConnectorManager != nullptr
+          && mKvCacheConnectorManager->usesSecondaryKvPoolAsPersistenceStaging()}
     , mEnableIndexerKCache{enableIndexerKCache}
     , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
     , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
@@ -837,6 +840,8 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mLinearAttentionMetadata{std::move(linearAttentionMetadata)}
 {
     TLLM_LOG_DEBUG("Creating WindowBlockManager for windowSize=%d", windowSize);
+    TLLM_CHECK_WITH_INFO(!mUseSecondaryKvPoolAsPersistenceStaging || mNumSecondaryBlocks > 0,
+        "A connector using secondary-pool persistence staging requires a non-empty secondary pool.");
     if (mEnableTpMlaReplicatedHostOffload)
     {
         TLLM_CHECK_WITH_INFO(!mEnablePartialReuse,
@@ -1378,8 +1383,8 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     // 1. Block is registered for reuse and contains state
     // 2. Eviction policy indicated block can be offloaded
     // 3. At least one free block in secondary memory
-    if (!wantPlaceholder && isRegisteredForReuse && !block->getUniqueTokens().empty() && canOffload
-        && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
+    if (!wantPlaceholder && isRegisteredForReuse && !block->getUniqueTokens().empty()
+        && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
     {
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
@@ -1397,15 +1402,38 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
 
-        if (mEventManager && blockInRadixTree(block))
+        if (!mUseSecondaryKvPoolAsPersistenceStaging && mEventManager && blockInRadixTree(block))
         {
             mEventManager->enqueueUpdatedEvent(
                 tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
                 mWindowSize);
         }
-        // Release block (now secondary after swap) into secondary block queue,
-        // preserving its existing priority.
-        mEvictionPolicy->releaseBlock(block);
+        if (mUseSecondaryKvPoolAsPersistenceStaging)
+        {
+            // The connector owns persistence and native reuse must not observe this block while it is staged.
+            // Keep the secondary slot claimed until terminal completion so a later eviction cannot overwrite it.
+            {
+                std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
+                if (mEventManager && blockInRadixTree(block))
+                {
+                    mEventManager->enqueueRemovedEvent(block, mWindowSize);
+                }
+                block->detachFromLookupNode();
+            }
+            auto const leaseId = mNextPersistenceLeaseId++;
+            auto const [leaseIt, inserted] = mPersistenceLeases.emplace(leaseId, block);
+            TLLM_CHECK_WITH_INFO(
+                inserted, "Persistence lease ID %llu already exists.", static_cast<unsigned long long>(leaseId));
+            (void) leaseIt;
+            mUnreportedPersistenceLeases.emplace_back(kv_connector::KvCachePersistenceLease{leaseId,
+                static_cast<executor::IdType>(block->getHash()),
+                static_cast<SizeType32>(block->getMemoryPoolBlockIndex()), block->getPriority()});
+        }
+        else
+        {
+            // Preserve native host-cache behavior when connector staging is disabled.
+            mEvictionPolicy->releaseBlock(block);
+        }
         // offloadBlock (now primary after swap) is already claimed above.
         // The final claimBlock() below will be a no-op for the queue but still
         // applies the caller's priority/durationMs.
@@ -1435,6 +1463,34 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         block->getBlockId(), sequence.getRequestId());
 
     return block;
+}
+
+void WindowBlockManager::completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds)
+{
+    std::unordered_set<std::uint64_t> uniqueLeaseIds;
+    for (auto const leaseId : leaseIds)
+    {
+        TLLM_CHECK_WITH_INFO(uniqueLeaseIds.insert(leaseId).second,
+            "Persistence lease ID %llu was completed more than once in the same call.",
+            static_cast<unsigned long long>(leaseId));
+        TLLM_CHECK_WITH_INFO(mPersistenceLeases.count(leaseId) == 1,
+            "Unknown or already completed persistence lease ID %llu.", static_cast<unsigned long long>(leaseId));
+    }
+
+    for (auto const leaseId : leaseIds)
+    {
+        auto node = mPersistenceLeases.extract(leaseId);
+        auto const& block = node.mapped();
+        TLLM_CHECK_WITH_INFO(!block->isPrimary(), "Persistence lease ID %llu does not refer to a secondary block.",
+            static_cast<unsigned long long>(leaseId));
+        block->setBlockKey(BlockKey{}, false);
+        block->setPrevBlockInSeq(nullptr);
+        block->setHash(0);
+        block->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
+        block->setDurationMs(std::nullopt);
+        block->setExpirationTime(std::nullopt);
+        mEvictionPolicy->releaseBlock(block);
+    }
 }
 
 void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape,
@@ -2298,6 +2354,13 @@ void WindowBlockManager::refreshBlocks()
 {
     mEvictionPolicy->refresh();
     mTransferManager->syncTransfers();
+    if (!mUnreportedPersistenceLeases.empty())
+    {
+        // syncTransfers has made the model stream wait for every native D2H copy issued this iteration. Publish one
+        // batch now so the connector can record a model-stream event before forward and overlap persistence with it.
+        mKvCacheConnectorManager->addPersistenceLeases(mUnreportedPersistenceLeases);
+        mUnreportedPersistenceLeases.clear();
+    }
 }
 
 void BlockManager::truncateBlocks(
@@ -3317,6 +3380,13 @@ void BlockManager::schedulingReleaseBlocks(RequestIdType requestId)
     {
         manager.schedulingReleaseBlocks(requestId);
     }
+}
+
+void BlockManager::completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds)
+{
+    TLLM_CHECK_WITH_INFO(mWindowBlockManagers.size() == 1,
+        "Persistence staging lease completion is only supported for a single window size.");
+    mWindowBlockManagers.begin()->second.completePersistenceLeases(leaseIds);
 }
 
 void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
@@ -4792,6 +4862,15 @@ runtime::ITensor::SharedPtr KVCacheManager::getUniquePrimaryPool() const
     TLLM_CHECK_WITH_INFO(mBlockManager.getWindowSizesMetadata().size() == 1,
         "getUniquePrimaryPool is only supported for a single window size");
     return mBlockManager.getPrimaryPool(0);
+}
+
+runtime::ITensor::SharedPtr KVCacheManager::getUniqueSecondaryPool() const
+{
+    TLLM_CHECK_WITH_INFO(mBlockManager.getWindowSizesMetadata().size() == 1,
+        "getUniqueSecondaryPool is only supported for a single window size");
+    auto const secondaryPool = mBlockManager.getSecondaryPool(0);
+    TLLM_CHECK_WITH_INFO(secondaryPool != nullptr, "The secondary KV cache pool has not been allocated.");
+    return secondaryPool;
 }
 
 runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx) const

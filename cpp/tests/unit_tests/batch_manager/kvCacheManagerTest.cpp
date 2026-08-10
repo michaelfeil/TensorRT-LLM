@@ -10123,8 +10123,9 @@ namespace
 class MockKvCacheConnectorManager : public kv_connector::KvCacheConnectorManager
 {
 public:
-    explicit MockKvCacheConnectorManager(SizeType32 numNewMatchedTokens)
+    explicit MockKvCacheConnectorManager(SizeType32 numNewMatchedTokens, bool usesSecondaryStaging = false)
         : mNumNewMatchedTokens(numNewMatchedTokens)
+        , mUsesSecondaryStaging(usesSecondaryStaging)
     {
     }
 
@@ -10139,9 +10140,33 @@ public:
         return mCallCount;
     }
 
+    [[nodiscard]] bool usesSecondaryKvPoolAsPersistenceStaging() const override
+    {
+        return mUsesSecondaryStaging;
+    }
+
+    void addPersistenceLeases(std::vector<kv_connector::KvCachePersistenceLease> const& leases) override
+    {
+        ++mAddPersistenceLeasesCallCount;
+        mPersistenceLeases.insert(mPersistenceLeases.end(), leases.begin(), leases.end());
+    }
+
+    [[nodiscard]] std::vector<kv_connector::KvCachePersistenceLease> const& getPersistenceLeases() const
+    {
+        return mPersistenceLeases;
+    }
+
+    [[nodiscard]] SizeType32 getAddPersistenceLeasesCallCount() const
+    {
+        return mAddPersistenceLeasesCallCount;
+    }
+
 private:
     SizeType32 mNumNewMatchedTokens{0};
     SizeType32 mCallCount{0};
+    bool mUsesSecondaryStaging{false};
+    std::vector<kv_connector::KvCachePersistenceLease> mPersistenceLeases;
+    SizeType32 mAddPersistenceLeasesCallCount{0};
 };
 
 // Build a small KVCacheManager wired to the supplied connector. tokensPerBlock=4
@@ -10149,14 +10174,13 @@ private:
 // scenarios below.
 std::unique_ptr<KVCacheManager> makeConnectorTestKVCacheManager(
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> const& stream,
-    std::shared_ptr<kv_connector::KvCacheConnectorManager> connector)
+    std::shared_ptr<kv_connector::KvCacheConnectorManager> connector, SizeType32 blocksInPrimaryPool = 16,
+    SizeType32 blocksInSecondaryPool = 0)
 {
     auto constexpr numLayers = 1;
     auto constexpr numKvHeads = 1;
     auto constexpr sizePerHead = 16;
     auto constexpr tokensPerBlock = 4;
-    auto constexpr blocksInPrimaryPool = 16;
-    auto constexpr blocksInSecondaryPool = 0;
     auto constexpr maxNumSequences = 4;
     auto constexpr beamWidth = 1;
     auto constexpr maxAttentionWindow = tokensPerBlock * 8;
@@ -10176,9 +10200,146 @@ std::unique_ptr<KVCacheManager> makeConnectorTestKVCacheManager(
             /*eventManager*/ nullptr,
             /*enablePartialReuse*/ true,
             /*copyOnPartialReuse*/ true,
+            /*enableTpMlaReplicatedHostOffload*/ false,
+            /*tpGroupRanks*/ std::vector<SizeType32>{},
             /*kvCacheConnectorManager*/ std::move(connector));
     mgr->allocatePools(false);
     return mgr;
+}
+
+TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingLeaseLifecycle)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(
+        /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
+    auto mgr
+        = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/3, /*blocksInSecondaryPool=*/1);
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
+
+    auto cacheCompletedRequest = [&](LlmRequest::RequestIdType requestId, VecTokens tokens)
+    {
+        auto inputTokens = std::make_shared<VecTokens>(std::move(tokens));
+        auto request = std::make_shared<LlmRequest>(
+            requestId, /*maxNewTokens=*/0, inputTokens, samplingConfig, /*isStreaming=*/false);
+        mgr->addSequenceBatch(
+            {{{requestId, static_cast<SizeType32>(inputTokens->size()), /*beamWidth=*/1}}}, {std::ref(*request)});
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        mgr->storeContextBlocks(*request);
+        (void) mgr->removeSequence(requestId, request);
+    };
+
+    // Five prompt tokens materialize and retain one full four-token block;
+    // the trailing partial block is returned to the primary free queue.
+    cacheCompletedRequest(1, {1, 2, 3, 4, 5});
+    cacheCompletedRequest(2, {6, 7, 8, 9, 10});
+
+    auto makeActiveRequest = [&](LlmRequest::RequestIdType requestId, VecTokens tokens)
+    {
+        auto inputTokens = std::make_shared<VecTokens>(std::move(tokens));
+        auto request = std::make_shared<LlmRequest>(
+            requestId, /*maxNewTokens=*/0, inputTokens, samplingConfig, /*isStreaming=*/false);
+        mgr->addSequenceBatch(
+            {{{requestId, static_cast<SizeType32>(inputTokens->size()), /*beamWidth=*/1}}}, {std::ref(*request)});
+        return request;
+    };
+
+    auto request3 = makeActiveRequest(3, {11, 12, 13, 14});
+    EXPECT_TRUE(connector->getPersistenceLeases().empty());
+    auto request4 = makeActiveRequest(4, {15, 16, 17, 18});
+    // Allocation only accumulates leases. refreshBlocks first orders native D2H before the model stream, then crosses
+    // into the connector once for the complete scheduler-iteration batch.
+    EXPECT_TRUE(connector->getPersistenceLeases().empty());
+    mgr->refreshBlocks();
+    ASSERT_EQ(connector->getPersistenceLeases().size(), 1);
+    EXPECT_EQ(connector->getAddPersistenceLeasesCallCount(), 1);
+    mgr->refreshBlocks();
+    EXPECT_EQ(connector->getAddPersistenceLeasesCallCount(), 1);
+    auto const& lease = connector->getPersistenceLeases().front();
+    EXPECT_EQ(lease.leaseId, 1);
+    EXPECT_EQ(lease.secondaryBlockIndex, 0);
+    BlockPtr leasedBlock;
+    for (KVCacheBlock::IdType blockId = 0; blockId < 4; ++blockId)
+    {
+        auto const candidate = mgr->getBlockManager().getBlockById(blockId, windowSize);
+        if (!candidate->isPrimary() && candidate->getMemoryPoolBlockIndex() == lease.secondaryBlockIndex)
+        {
+            leasedBlock = candidate;
+            break;
+        }
+    }
+    ASSERT_NE(leasedBlock, nullptr);
+    EXPECT_EQ(lease.blockHash, leasedBlock->getHash());
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 0);
+
+    // A full staging pool must not stall allocation or overwrite the leased slot.
+    auto request5 = makeActiveRequest(5, {19, 20, 21, 22});
+    mgr->refreshBlocks();
+    EXPECT_EQ(connector->getPersistenceLeases().size(), 1);
+    EXPECT_EQ(connector->getAddPersistenceLeasesCallCount(), 1);
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 0);
+
+    mgr->completePersistenceLeases({lease.leaseId});
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
+    EXPECT_TRUE(leasedBlock->getUniqueTokens().empty());
+    EXPECT_THROW(mgr->completePersistenceLeases({lease.leaseId}), std::exception);
+    EXPECT_TRUE(mgr->getBlockManager().verifyQueueIntegrity(windowSize));
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request3);
+    (void) mgr->removeSequence(3, request3);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request4);
+    (void) mgr->removeSequence(4, request4);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request5);
+    (void) mgr->removeSequence(5, request5);
+}
+
+TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingRequiresHostPool)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(
+        /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
+    EXPECT_THROW(
+        makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2, /*blocksInSecondaryPool=*/0),
+        std::exception);
+}
+
+TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreservesNativeOffloadThreshold)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(
+        /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
+    auto mgr
+        = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2, /*blocksInSecondaryPool=*/1);
+    tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
+
+    auto cachedTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5});
+    auto cachedRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/1, /*maxNewTokens=*/0, cachedTokens, samplingConfig, /*isStreaming=*/false);
+    cachedRequest->setKvCacheRetentionConfig(KvCacheRetentionConfig(
+        {KvCacheRetentionConfig::TokenRangeRetentionConfig(
+            0, 4, KvCacheRetentionConfig::kMinRetentionPriority)},
+        KvCacheRetentionConfig::kDefaultRetentionPriority));
+    mgr->addSequenceBatch(
+        {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
+    mgr->storeContextBlocks(*cachedRequest);
+    (void) mgr->removeSequence(1, cachedRequest);
+
+    // Consume both primary blocks so eviction reaches the reusable priority-0
+    // block. Connector staging must honor the native offload threshold and
+    // drop it instead of creating D2H/publication work.
+    auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
+    auto activeRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/2, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{2, static_cast<SizeType32>(activeTokens->size()), /*beamWidth=*/1}}}, {std::ref(*activeRequest)});
+    mgr->refreshBlocks();
+
+    EXPECT_TRUE(connector->getPersistenceLeases().empty());
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
+    (void) mgr->removeSequence(2, activeRequest);
 }
 
 // Drive a single-request decode loop until mNumTokens reaches `targetNumTokens`,

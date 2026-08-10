@@ -1900,6 +1900,14 @@ class KVCacheManager(BaseResourceManager):
         # the pool is a list of block, each of which stores a fixed amount of KV cache data
         return self.impl.get_unique_primary_pool()
 
+    def get_unique_secondary_pool(self) -> torch.Tensor:
+        """Return the single-window secondary KV cache pool used for staging."""
+        return self.impl.get_unique_secondary_pool()
+
+    def complete_persistence_leases(self, lease_ids: List[int]) -> None:
+        """Release connector staging slots after terminal persistence completion."""
+        self.impl.complete_persistence_leases(lease_ids)
+
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         block_ids_per_seq_tensors = [

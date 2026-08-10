@@ -46,7 +46,7 @@ from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.internal.batch_manager import (
     KvCacheConnectorManager as KvCacheConnectorManagerCpp,
 )
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+from tensorrt_llm.bindings.internal.batch_manager import KvCachePersistenceLease, LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from ..llm_request import get_draft_token_length
@@ -161,6 +161,48 @@ class KvCacheConnectorWorker(ABC):
         """
         return True
 
+    def uses_secondary_kv_pool_as_persistence_staging(self) -> bool:
+        """Return whether native host memory is borrowed as connector staging.
+
+        Connectors that opt in must persist every lease before reporting its ID
+        as terminally complete. Until then TensorRT-LLM keeps the secondary slot
+        pinned and unavailable for another eviction.
+        """
+        return False
+
+    def bind_persistence_lease_manager(self, manager: Any) -> None:
+        """Bind the manager drained by pre-forward persistence submission."""
+        raise NotImplementedError(
+            "Secondary-pool persistence staging requires a bound lease manager"
+        )
+
+    def poll_globally_completed_persistence_leases(self) -> List[int]:
+        """Return lease IDs coordinated for release at this rank-lockstep epoch."""
+        raise NotImplementedError(
+            "Secondary-pool persistence staging requires coordinated completion polling"
+        )
+
+    def submit_pending_persistence_leases(self, stream: torch.cuda.Stream) -> None:
+        """Drain and submit staged leases after native D2H is ordered on stream.
+
+        Workers using secondary-pool persistence staging must record readiness
+        on ``stream`` and return without synchronizing the CPU.
+        """
+        raise NotImplementedError(
+            "Secondary-pool persistence staging requires pre-forward lease submission"
+        )
+
+    def request_finished_without_save(self, request_id: int) -> None:
+        """Retire rank-local request state without dispatching persistence.
+
+        Workers using secondary-pool persistence staging must implement this
+        hook because those requests never enter the asynchronous save lifecycle
+        consumed by ``get_finished``.
+        """
+        raise NotImplementedError(
+            "Secondary-pool persistence staging requires explicit worker no-save cleanup"
+        )
+
     def register_forward_pass_callable(self) -> Callable:
         """
         This callable will be called at the end of the forward pass.
@@ -174,13 +216,19 @@ class KvCacheConnectorWorker(ABC):
         """
 
     @abstractmethod
-    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+    def register_kv_caches(
+        self,
+        kv_cache_tensor: torch.Tensor,
+        secondary_kv_cache_tensor: Optional[torch.Tensor] = None,
+    ):
         """
         Register the KV cache tensors to the worker.
         This can be used for something like NIXL registration.
 
         Args:
             kv_cache_tensor: The contiguous KV cache tensor.
+            secondary_kv_cache_tensor: The optional contiguous secondary pool
+                used by connectors that opt into persistence staging.
         """
 
     @abstractmethod
@@ -319,6 +367,17 @@ class KvCacheConnectorScheduler(ABC):
             to deallocate the blocks until the saving has completed
             (determined by ``get_finished`` on the workers).
         """
+
+    def request_finished_without_save(self, request: LlmRequest) -> None:
+        """Retire request state without dispatching connector persistence.
+
+        Connectors using secondary-pool persistence staging must implement
+        explicit no-save cleanup; falling back to ``request_finished`` would
+        reintroduce request-scoped D2H transfers.
+        """
+        raise NotImplementedError(
+            "Secondary-pool persistence staging requires explicit no-save request cleanup"
+        )
 
     @abstractmethod
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
@@ -629,6 +688,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.worker = worker
         self.scheduler = scheduler
         self._is_shutdown = False
+        self._uses_secondary_persistence_staging = (
+            self.worker.uses_secondary_kv_pool_as_persistence_staging() is True
+        )
         self._rank_local_metadata_skip_enabled = (
             self.worker.supports_rank_local_metadata_skip() is True
         )
@@ -659,6 +721,78 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._metadata_exchange_progress = {}
         self._worker_visible_progress = {}
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
+        self._pending_persistence_leases: List[KvCachePersistenceLease] = []
+        self._outstanding_persistence_lease_ids: Set[int] = set()
+        self._kv_cache_manager: Optional["KVCacheManager"] = None
+        if self._uses_secondary_persistence_staging:
+            self.worker.bind_persistence_lease_manager(self)
+
+    def uses_secondary_kv_pool_as_persistence_staging(self) -> bool:
+        """Expose the worker capability to the C++ cache-manager constructor."""
+        return self._uses_secondary_persistence_staging
+
+    def add_persistence_leases(self, leases: List[KvCachePersistenceLease]) -> None:
+        """Receive one scheduler iteration's staged blocks from C++."""
+        lease_ids = [lease.lease_id for lease in leases]
+        unique_lease_ids = set(lease_ids)
+        if len(unique_lease_ids) != len(lease_ids):
+            raise RuntimeError(f"Duplicate persistence lease IDs in batch: {lease_ids}")
+        duplicate_lease_ids = unique_lease_ids & self._outstanding_persistence_lease_ids
+        if duplicate_lease_ids:
+            raise RuntimeError(
+                f"Duplicate outstanding persistence lease IDs: {sorted(duplicate_lease_ids)}"
+            )
+        self._outstanding_persistence_lease_ids.update(unique_lease_ids)
+        self._pending_persistence_leases.extend(leases)
+
+    def take_pending_persistence_leases(self) -> List[KvCachePersistenceLease]:
+        """Take leases staged since the previous connector publication pass."""
+        leases = self._pending_persistence_leases
+        self._pending_persistence_leases = []
+        return leases
+
+    def has_pending_persistence_leases(self) -> bool:
+        """Return whether native D2H produced leases awaiting publication."""
+        return bool(self._pending_persistence_leases)
+
+    def submit_pending_persistence_leases(self, stream: torch.cuda.Stream) -> None:
+        """Submit the full D2H-ready batch before forward without CPU waiting."""
+        if (
+            not self._uses_secondary_persistence_staging
+            or not self.has_pending_persistence_leases()
+        ):
+            return
+        self.worker.submit_pending_persistence_leases(stream)
+        if self.has_pending_persistence_leases():
+            raise RuntimeError("Persistence staging worker did not drain all pending leases")
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        """Bind terminal lease completion to the cache manager that owns the slots."""
+        self._kv_cache_manager = kv_cache_manager
+
+    def complete_persistence_leases(self, lease_ids: List[int]) -> None:
+        """Release only leases whose persistence reached terminal completion."""
+        if self._kv_cache_manager is None:
+            raise RuntimeError("Persistence lease completion requires a bound KV cache manager")
+        self._kv_cache_manager.complete_persistence_leases(lease_ids)
+
+    def _reap_completed_persistence_leases(self) -> None:
+        if not self._outstanding_persistence_lease_ids:
+            return
+
+        terminal_ids = set(self.worker.poll_globally_completed_persistence_leases())
+        unknown_terminal = terminal_ids - self._outstanding_persistence_lease_ids
+        if unknown_terminal:
+            raise RuntimeError(
+                "Connector globally completed unknown persistence lease IDs: "
+                f"{sorted(unknown_terminal)}"
+            )
+        if not terminal_ids:
+            return
+
+        ordered_terminal_ids = sorted(terminal_ids)
+        self.complete_persistence_leases(ordered_terminal_ids)
+        self._outstanding_persistence_lease_ids.difference_update(terminal_ids)
 
     def shutdown(self) -> None:
         if self._is_shutdown:
@@ -935,6 +1069,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._metadata_exchange_progress.pop(req.request_id, None)
         self._worker_visible_progress.pop(req.request_id, None)
 
+        if self.uses_secondary_kv_pool_as_persistence_staging():
+            # Resident primary blocks remain in TRT's radix cache. The connector
+            # persists only blocks that TRT actually evicts into leased staging
+            # slots, so request completion must not trigger an eager D2H save.
+            self._run_on_leader(lambda: self.scheduler.request_finished_without_save(req))
+            self.worker.request_finished_without_save(req.request_id)
+            self.scheduler_output_manager.requests.pop(req.request_id, None)
+            self.scheduler_output_manager.external_loads.pop(req.request_id, None)
+            return False
+
         saving_async = self._run_on_leader(
             lambda: self.scheduler.request_finished(req, cache_block_ids)
         )
@@ -958,6 +1102,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The requests that have newly finished saving.
         """
+        self._reap_completed_persistence_leases()
+
         # Admission/finalization decisions are broadcast, and a rank that
         # finishes early retains the request locally until every rank agrees.
         # Empty state is therefore rank-consistent and needs no collective.

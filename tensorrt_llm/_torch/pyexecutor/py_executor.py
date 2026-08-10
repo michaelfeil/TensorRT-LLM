@@ -889,7 +889,12 @@ class PyExecutor:
                     "distinguished from real requests.")
 
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
-            if kv_cache_config is not None and kv_cache_config.host_cache_size:
+            uses_secondary_staging = (
+                self.kv_connector_manager.
+                uses_secondary_kv_pool_as_persistence_staging())
+            has_host_cache = (kv_cache_config is not None
+                              and bool(kv_cache_config.host_cache_size))
+            if has_host_cache and not uses_secondary_staging:
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with KV cache host "
                     "offloading (KvCacheConfig.host_cache_size). The connector "
@@ -898,6 +903,10 @@ class PyExecutor:
                     "secondary (host) pool, and the connector's load/save "
                     "streams are not synchronized with the internal "
                     "onboard/offload streams.")
+            if uses_secondary_staging and not has_host_cache:
+                raise ValueError(
+                    "A KV Cache Connector using secondary-pool persistence "
+                    "staging requires KvCacheConfig.host_cache_size > 0.")
 
             if self.kv_cache_manager is None:
                 raise ValueError(
@@ -920,7 +929,19 @@ class PyExecutor:
                     "transfer for those layers.")
 
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
-            self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
+            secondary_kv_tensor = None
+            if uses_secondary_staging:
+                secondary_kv_tensor = (
+                    self.kv_cache_manager.get_unique_secondary_pool())
+            self.kv_connector_manager.bind_kv_cache_manager(
+                self.kv_cache_manager)
+            if uses_secondary_staging:
+                self.kv_connector_manager.worker.register_kv_caches(
+                    kv_tensor, secondary_kv_tensor)
+            else:
+                # Preserve compatibility with connectors that implement the
+                # original one-argument registration contract.
+                self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             if self.kv_connector_manager.worker.requires_layerwise_transfer_hooks(
             ):
@@ -3286,6 +3307,10 @@ class PyExecutor:
 
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
+            # refreshBlocks has already ordered native D2H before this model
+            # stream. Publishing now lets persistence overlap model forward.
+            self.kv_connector_manager.submit_pending_persistence_leases(
+                self.execution_stream)
             self._kv_connector_worker_hooks_active = (
                 self.kv_connector_manager.start_worker_batch(scheduled_batch))
             self.model_engine.set_forward_pass_callable_enabled(
@@ -5409,19 +5434,29 @@ class PyExecutor:
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+        uses_secondary_staging = (
+            self.kv_connector_manager is not None
+            and self.kv_connector_manager.
+            uses_secondary_kv_pool_as_persistence_staging())
 
         def kv_connector_request_finished(req: LlmRequest):
-            try:
-                cache_block_ids = self.kv_cache_manager.get_cache_indices(req)
-            except Exception as e:
-                logger.warning(
-                    f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"
-                )
+            if uses_secondary_staging:
+                # Staging persists evicted leases, not request-owned blocks. Do
+                # not make mandatory no-save cleanup depend on a cache lookup.
+                cache_block_ids = []
             else:
-                if self.kv_connector_manager.request_finished(
-                        req, cache_block_ids):
-                    self.async_transfer_manager.start_transfer(
-                        req, source="kv_cache_connector")
+                try:
+                    cache_block_ids = self.kv_cache_manager.get_cache_indices(
+                        req)
+                except Exception as e:
+                    logger.warning(
+                        f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"
+                    )
+                    return
+            if self.kv_connector_manager.request_finished(req,
+                                                          cache_block_ids):
+                self.async_transfer_manager.start_transfer(
+                    req, source="kv_cache_connector")
 
         if self.kv_cache_transceiver:
             for req in scheduled_requests:

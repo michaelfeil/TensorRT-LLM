@@ -216,6 +216,91 @@ def test_executor_preserves_cancel_without_connector_load(has_connector):
     assert executor._try_cancel_request(request)
 
 
+def _make_persistence_staging_manager():
+    worker = MagicMock()
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+    worker.poll_globally_completed_persistence_leases.return_value = []
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    kv_cache_manager = MagicMock()
+    manager.bind_kv_cache_manager(kv_cache_manager)
+    return manager, worker, scheduler, kv_cache_manager
+
+
+def test_persistence_staging_binds_worker_and_skips_request_finish_save():
+    manager, worker, scheduler, _ = _make_persistence_staging_manager()
+    worker.bind_persistence_lease_manager.assert_called_once_with(manager)
+
+    request = MagicMock()
+    request.request_id = 42
+    manager.scheduler_output_manager.requests[42]
+
+    assert manager.request_finished(request, [1, 2]) is False
+    scheduler.request_finished.assert_not_called()
+    scheduler.request_finished_without_save.assert_called_once_with(request)
+    worker.request_finished_without_save.assert_called_once_with(42)
+    assert 42 not in manager.scheduler_output_manager.requests
+
+
+def test_persistence_staging_finish_does_not_require_request_cache_indices():
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.uses_secondary_kv_pool_as_persistence_staging.return_value = (
+        True)
+    executor.kv_connector_manager.request_finished.return_value = False
+    executor.kv_cache_manager = MagicMock()
+    executor.async_transfer_manager = MagicMock()
+    executor.disable_overlap_scheduler = True
+
+    request = MagicMock()
+    request.request_id = 42
+    request.py_request_id = 42
+    request.is_finished = True
+    executor.active_requests = [request]
+
+    executor._send_kv_async([request])
+
+    executor.kv_cache_manager.get_cache_indices.assert_not_called()
+    executor.kv_connector_manager.request_finished.assert_called_once_with(
+        request, [])
+
+
+def test_persistence_staging_reaps_coordinated_terminal_lease_without_mpi():
+    manager, worker, _, kv_cache_manager = _make_persistence_staging_manager()
+    lease = MagicMock()
+    lease.lease_id = 7
+    manager.add_persistence_leases([lease])
+    assert manager.take_pending_persistence_leases() == [lease]
+    assert manager.take_pending_persistence_leases() == []
+
+    worker.poll_globally_completed_persistence_leases.return_value = [7]
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.connectors."
+            "kv_cache_connector.mpi_allgather") as allgather:
+        assert manager.get_finished() == []
+
+    allgather.assert_not_called()
+    kv_cache_manager.complete_persistence_leases.assert_called_once_with([7])
+
+    worker.poll_globally_completed_persistence_leases.reset_mock()
+    assert manager.get_finished() == []
+    worker.poll_globally_completed_persistence_leases.assert_not_called()
+
+
+def test_persistence_staging_rejects_unknown_coordinated_terminal_lease():
+    manager, worker, _, kv_cache_manager = _make_persistence_staging_manager()
+    lease = MagicMock()
+    lease.lease_id = 9
+    manager.add_persistence_leases([lease])
+    worker.poll_globally_completed_persistence_leases.return_value = [10]
+
+    with pytest.raises(RuntimeError, match="globally completed unknown"):
+        manager.get_finished()
+
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+
+
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
@@ -484,11 +569,44 @@ def test_sparse_metadata_updates_require_rank_local_skip():
         KvCacheConnectorManager(worker, scheduler=MagicMock())
 
 
+def test_pending_persistence_lease_submits_pre_forward_without_worker_hooks():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    worker.supports_sparse_metadata_updates.return_value = True
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    lease = MagicMock()
+    lease.lease_id = 7
+    manager.add_persistence_leases([lease])
+    worker.submit_pending_persistence_leases.side_effect = (
+        lambda stream: manager.take_pending_persistence_leases())
+
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = manager
+    executor.model_engine = MagicMock()
+    executor.execution_stream = MagicMock()
+    executor._kv_connector_worker_hooks_active = True
+    scheduled_batch = ScheduledRequests()
+
+    executor._kv_connector_start_batch(scheduled_batch)
+    executor._kv_connector_wait_for_save()
+
+    assert executor._kv_connector_worker_hooks_active is False
+    worker.submit_pending_persistence_leases.assert_called_once_with(
+        executor.execution_stream)
+    assert manager.has_pending_persistence_leases() is False
+    worker.start_load_kv.assert_not_called()
+    worker.wait_for_save.assert_not_called()
+    executor.model_engine.set_forward_pass_callable_enabled.assert_called_once_with(
+        False)
+
+
 def test_executor_skips_idle_metadata_driven_worker_hooks():
     executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = MagicMock()
     executor.model_engine = MagicMock()
     executor._kv_connector_worker_hooks_active = True
+    executor.execution_stream = MagicMock()
     scheduled_batch = ScheduledRequests()
     executor.kv_connector_manager.start_worker_batch.return_value = False
 

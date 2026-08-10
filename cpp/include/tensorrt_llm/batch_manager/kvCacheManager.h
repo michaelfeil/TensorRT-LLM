@@ -1067,6 +1067,9 @@ public:
     // Get num free blocks in the secondary (host) memory pool
     [[nodiscard]] SizeType32 getNumFreeSecondaryBlocks() const noexcept;
 
+    //! Release secondary-pool staging leases after connector persistence reaches a terminal state.
+    void completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds);
+
     //! \brief Get iteration stats (deltas since last call) for this window. Resets internal delta snapshots.
     [[nodiscard]] KvCacheIterationStats getAndResetIterationStats();
 
@@ -1419,6 +1422,13 @@ private:
     int mWorldRank;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
+    // Whether secondary blocks are pinned as connector persistence staging instead of native reusable host cache.
+    bool mUseSecondaryKvPoolAsPersistenceStaging{false};
+    // Leased secondary blocks remain claimed until the connector explicitly reports terminal completion.
+    std::unordered_map<std::uint64_t, BlockPtr> mPersistenceLeases;
+    // Leases created during allocation are published together after refreshBlocks orders D2H before the model stream.
+    std::vector<kv_connector::KvCachePersistenceLease> mUnreportedPersistenceLeases;
+    std::uint64_t mNextPersistenceLeaseId{1};
 
     // Snapshot of cumulative counters at last iteration stats read (for delta computation)
     SizeType32 mPrevAllocTotalBlocks{0};
@@ -1686,6 +1696,9 @@ public:
     {
         return sumWindows([](auto const& manager) { return manager.getNumFreeSecondaryBlocks(); });
     }
+
+    //! Release connector persistence staging leases after terminal completion.
+    void completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds);
 
     //! \brief Get per-window-size iteration stats. Resets delta snapshots for each window.
     [[nodiscard]] std::map<SizeType32, KvCacheIterationStats> getAndResetIterationStats();
@@ -2147,6 +2160,17 @@ public:
         = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
+
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniqueSecondaryPool() const
+    {
+        TLLM_THROW("getUniqueSecondaryPool is not implemented for this KV cache manager.");
+    }
+
+    virtual void completePersistenceLeases(std::vector<std::uint64_t> const& /*leaseIds*/)
+    {
+        TLLM_THROW("completePersistenceLeases is not implemented for this KV cache manager.");
+    }
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getIndexerKCachePool() const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
@@ -2646,6 +2670,7 @@ public:
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const override;
 
     runtime::ITensor::SharedPtr getUniquePrimaryPool() const override;
+    runtime::ITensor::SharedPtr getUniqueSecondaryPool() const override;
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
     runtime::ITensor::SharedPtr getIndexerKCachePool() const override;
 
@@ -2662,6 +2687,11 @@ public:
     void syncTransferManagerWithBufferManager() override
     {
         mBlockManager.syncTransferManagerWithBufferManager();
+    }
+
+    void completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds) override
+    {
+        mBlockManager.completePersistenceLeases(leaseIds);
     }
 
     //! \brief Perform per-iteration bookkeeping
