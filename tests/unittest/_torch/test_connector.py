@@ -299,13 +299,14 @@ def test_connector_manager_skips_collective_for_device_complete_match(
         req.request_id = 42
         req.is_generation_only_request = False
         req.multimodal_positions = []
-        req.get_tokens.return_value = list(range(65))
+        req.get_num_tokens.return_value = 65
 
         with patch("tensorrt_llm._torch.pyexecutor.connectors."
                    "kv_cache_connector.mpi_broadcast") as broadcast:
             assert manager.get_num_new_matched_tokens(req, 64) == 0
 
         worker.can_skip_scheduler_match.assert_called_once_with(65, 64)
+        req.get_tokens.assert_not_called()
         broadcast.assert_not_called()
         if scheduler is not None:
             scheduler.prepare_scheduler_match_skip.assert_called_once_with(

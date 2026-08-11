@@ -686,13 +686,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if request.is_generation_only_request:
             raise RuntimeError("Connector API is not supported for generation-only requests!")
 
-        request_num_tokens = len(request.get_tokens(0))
-        if not request.multimodal_positions and self.worker.can_skip_scheduler_match(
-            request_num_tokens, num_computed_tokens
-        ):
-            if self.scheduler is not None:
-                self.scheduler.prepare_scheduler_match_skip(request, num_computed_tokens)
-            return 0
+        if not request.multimodal_positions:
+            request_num_tokens = request.get_num_tokens(0)
+            if self.worker.can_skip_scheduler_match(request_num_tokens, num_computed_tokens):
+                if self.scheduler is not None:
+                    self.scheduler.prepare_scheduler_match_skip(request, num_computed_tokens)
+                return 0
 
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
