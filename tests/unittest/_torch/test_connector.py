@@ -173,6 +173,49 @@ def test_connector_manager_get_finished_skips_empty_poll():
     allgather.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "async_requests_attribute",
+    [
+        "new_async_requests",
+        "pending_async_requests",
+        "local_finished_async_requests",
+    ],
+)
+def test_connector_manager_reports_async_load_in_progress(
+        async_requests_attribute):
+    manager = KvCacheConnectorManager(MagicMock(), scheduler=MagicMock())
+    getattr(manager, async_requests_attribute).loading[7] = MagicMock()
+
+    assert manager.is_loading(7)
+    assert not manager.is_loading(8)
+
+
+def test_executor_defers_cancel_while_connector_load_is_in_progress():
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.is_loading.return_value = True
+    executor.kv_cache_transceiver = MagicMock()
+    request = MagicMock()
+    request.py_request_id = 7
+
+    assert not executor._try_cancel_request(request)
+    executor.kv_connector_manager.is_loading.assert_called_once_with(7)
+    executor.kv_cache_transceiver.cancel_request.assert_not_called()
+
+
+@pytest.mark.parametrize("has_connector", [False, True])
+def test_executor_preserves_cancel_without_connector_load(has_connector):
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = MagicMock() if has_connector else None
+    if executor.kv_connector_manager is not None:
+        executor.kv_connector_manager.is_loading.return_value = False
+    executor.kv_cache_transceiver = None
+    request = MagicMock()
+    request.py_request_id = 7
+
+    assert executor._try_cancel_request(request)
+
+
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 

@@ -6288,6 +6288,10 @@ class PyExecutor:
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
+        if (self.kv_connector_manager is not None and
+                self.kv_connector_manager.is_loading(request.py_request_id)):
+            return False
+
         if self.kv_cache_transceiver is None:
             return True
 
