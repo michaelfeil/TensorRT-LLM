@@ -39,6 +39,8 @@ struct KvCachePersistenceLease
 {
     std::uint64_t leaseId;
     executor::IdType blockHash;
+    // Logical secondary-pool index. Replicated TP connectors receive the same
+    // descriptor on every rank and map it to the owner's compact local pool.
     SizeType32 secondaryBlockIndex;
     SizeType32 priority;
 };
