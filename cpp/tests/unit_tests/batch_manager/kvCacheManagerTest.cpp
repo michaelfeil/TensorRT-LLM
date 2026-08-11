@@ -10413,6 +10413,8 @@ TEST_F(KVCacheManagerTest, NativeHostOffloadPreservesPartialBlocks)
     }
     ASSERT_NE(partialBlock, nullptr);
     ASSERT_TRUE(partialBlock->isPrimary());
+    auto const partialBlockHash = partialBlock->getHash();
+    auto const partialBlockTokens = partialBlock->getUniqueTokens();
 
     auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
     auto activeRequest = std::make_shared<LlmRequest>(
@@ -10423,7 +10425,9 @@ TEST_F(KVCacheManagerTest, NativeHostOffloadPreservesPartialBlocks)
 
     EXPECT_FALSE(partialBlock->isPrimary());
     EXPECT_FALSE(partialBlock->isFull());
-    EXPECT_FALSE(partialBlock->getUniqueTokens().empty());
+    EXPECT_EQ(partialBlock->getHash(), partialBlockHash);
+    EXPECT_EQ(partialBlock->getUniqueTokens(), partialBlockTokens);
+    EXPECT_NE(partialBlock->getLookupNode(), nullptr);
     EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 0);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
