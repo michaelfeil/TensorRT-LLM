@@ -701,6 +701,33 @@ def test_connector_manager_mtp_allocation_rewind_stays_state_only():
     manager._run_on_leader.assert_not_called()
 
 
+def test_connector_manager_rewind_hides_unreported_speculative_block():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    req, scheduled_batch = _make_generation_batch(28)
+    req.py_draft_tokens = [0, 0, 0]
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    manager._run_on_leader = MagicMock(return_value=b"metadata")
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+
+    # Sparse metadata can leave a speculative allocation unreported. A
+    # partial rewind must not reveal that physical suffix to the connector.
+    req.get_num_tokens.return_value = 29
+    req.get_tokens.return_value = list(range(29))
+    kv_cache_manager.get_cache_indices.reset_mock()
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    manager.on_rewind(req, kv_cache_manager)
+
+    kv_cache_manager.get_cache_indices.assert_called_once_with(req)
+    scheduler.on_rewind.assert_called_once_with(req, [10])
+
+
 def test_connector_manager_same_block_rewinds_stay_state_only():
     worker = MagicMock(spec=KvCacheConnectorWorker)
     worker.supports_rank_local_metadata_skip.return_value = True

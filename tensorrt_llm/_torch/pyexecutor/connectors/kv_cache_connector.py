@@ -571,8 +571,8 @@ class KvCacheConnectorSchedulerOutputManager:
         ``tokens`` would suppress those accepted tokens from the next
         ``build_scheduler_output``'s ``new_tokens`` delta.  We only trim if the
         rewind actually shortened the token list (e.g. rejected draft tokens
-        were rolled back). Returns the connector-visible block IDs only when
-        its scheduler state also requires a rewind.
+        were rolled back). Returns the connector-visible block IDs whenever
+        they differ from the physical allocation passed by the caller.
         """
         req_state = self.requests.get(req.request_id)
         if req_state is None:
@@ -586,7 +586,9 @@ class KvCacheConnectorSchedulerOutputManager:
                     "Speculative allocation growth replaced connector-visible block IDs"
                 )
             # The speculative suffix has not been sent to the connector. Keep
-            # the reported length so the next metadata update emits it.
+            # the reported length so the next metadata update emits it, and
+            # prevent the rewind callback from exposing it early.
+            scheduler_live_block_ids = list(recorded_block_ids)
         elif live_block_ids != recorded_block_ids:
             req_state.block_ids = list(live_block_ids)
             scheduler_live_block_ids = req_state.block_ids
