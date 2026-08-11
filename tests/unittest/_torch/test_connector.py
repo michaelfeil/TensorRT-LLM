@@ -277,13 +277,13 @@ def test_persistence_staging_reaps_coordinated_terminal_lease_without_mpi():
     worker.poll_globally_completed_persistence_leases.return_value = [7]
     with patch("tensorrt_llm._torch.pyexecutor.connectors."
                "kv_cache_connector.mpi_allgather") as allgather:
-        assert manager.get_finished() == []
+        manager.reap_completed_persistence_leases()
 
     allgather.assert_not_called()
     kv_cache_manager.complete_persistence_leases.assert_called_once_with([7])
 
     worker.poll_globally_completed_persistence_leases.reset_mock()
-    assert manager.get_finished() == []
+    manager.reap_completed_persistence_leases()
     worker.poll_globally_completed_persistence_leases.assert_not_called()
 
 
@@ -295,9 +295,27 @@ def test_persistence_staging_rejects_unknown_coordinated_terminal_lease():
     worker.poll_globally_completed_persistence_leases.return_value = [10]
 
     with pytest.raises(RuntimeError, match="globally completed unknown"):
-        manager.get_finished()
+        manager.reap_completed_persistence_leases()
 
     kv_cache_manager.complete_persistence_leases.assert_not_called()
+
+
+def test_prepare_and_schedule_reaps_persistence_before_fetch():
+    executor = object.__new__(PyExecutor)
+    call_order = []
+    executor._drain_deferred_error_frees = MagicMock(
+        side_effect=lambda: call_order.append("drain"))
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.reap_completed_persistence_leases.side_effect = (
+        lambda: call_order.append("reap"))
+    executor._fetch_and_activate_new_requests_after_transfer_cleanup = MagicMock(
+        side_effect=lambda: call_order.append("fetch") or [])
+    executor.is_shutdown = True
+    executor.active_requests = []
+    executor.waiting_queue = []
+
+    assert executor._prepare_and_schedule_batch() == (None, None)
+    assert call_order == ["drain", "reap", "fetch"]
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

@@ -776,7 +776,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             raise RuntimeError("Persistence lease completion requires a bound KV cache manager")
         self._kv_cache_manager.complete_persistence_leases(lease_ids)
 
-    def _reap_completed_persistence_leases(self) -> None:
+    def reap_completed_persistence_leases(self) -> None:
+        """Release terminal staging leases before the next scheduling pass."""
         if not self._outstanding_persistence_lease_ids:
             return
 
@@ -1102,8 +1103,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The requests that have newly finished saving.
         """
-        self._reap_completed_persistence_leases()
-
         # Admission/finalization decisions are broadcast, and a rank that
         # finishes early retains the request locally until every rank agrees.
         # Empty state is therefore rank-consistent and needs no collective.

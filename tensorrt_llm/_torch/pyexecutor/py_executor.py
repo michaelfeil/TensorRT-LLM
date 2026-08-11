@@ -3118,6 +3118,11 @@ class PyExecutor:
                                                      len(self.waiting_queue))
         # Must run every iteration, else deferred requests strand their KV blocks (deadlock under KV exhaustion).
         self._drain_deferred_error_frees()
+        if self.kv_connector_manager:
+            # Make terminal staging slots visible before admission and KV
+            # allocation. Reaping at iteration end strands idle completions
+            # until after the first returning batch has already allocated.
+            self.kv_connector_manager.reap_completed_persistence_leases()
         new_requests = self._fetch_and_activate_new_requests_after_transfer_cleanup(
         )
         if self.should_stop_processing:
