@@ -216,6 +216,26 @@ def test_executor_preserves_cancel_without_connector_load(has_connector):
     assert executor._try_cancel_request(request)
 
 
+def test_connector_rejects_dsa_indexer_k_cache_before_registration():
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_cache_transceiver = None
+    executor.dist = MagicMock(pp_size=1, cp_size=1)
+    executor.max_beam_width = 1
+    executor.enable_attention_dp = False
+    executor.llm_args = MagicMock()
+    executor.llm_args.kv_cache_config.host_cache_size = 0
+    executor.kv_connector_manager.uses_secondary_kv_pool_as_persistence_staging.return_value = (
+        False)
+    executor.kv_cache_manager = MagicMock()
+    executor.kv_cache_manager.impl.enable_indexer_k_cache = True
+
+    with pytest.raises(NotImplementedError, match="DSA indexer K cache"):
+        executor._maybe_init_kv_connector_manager()
+
+    executor.kv_connector_manager.worker.register_kv_caches.assert_not_called()
+
+
 def _make_persistence_staging_manager():
     worker = MagicMock()
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True

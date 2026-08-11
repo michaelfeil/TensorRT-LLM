@@ -912,6 +912,13 @@ class PyExecutor:
                 raise ValueError(
                     "KV Cache Connector requires a KV Cache Manager.")
 
+            if self.kv_cache_manager.impl.enable_indexer_k_cache:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with the DSA "
+                    "indexer K cache. Connector persistence currently "
+                    "registers only the main KV pool, so a restored prefix "
+                    "would have incomplete sparse-attention state.")
+
             if getattr(self.kv_cache_manager, 'is_vswa', False):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with variable "
