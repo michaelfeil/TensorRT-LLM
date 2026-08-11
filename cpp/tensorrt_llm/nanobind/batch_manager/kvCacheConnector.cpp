@@ -56,6 +56,7 @@ void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindi
     nb::class_<tb::kv_connector::KvCachePersistenceLease>(m, "KvCachePersistenceLease")
         .def_ro("lease_id", &tb::kv_connector::KvCachePersistenceLease::leaseId)
         .def_ro("block_hash", &tb::kv_connector::KvCachePersistenceLease::blockHash)
+        .def_ro("source_block_id", &tb::kv_connector::KvCachePersistenceLease::sourceBlockId)
         .def_ro("secondary_block_index", &tb::kv_connector::KvCachePersistenceLease::secondaryBlockIndex)
         .def_ro("priority", &tb::kv_connector::KvCachePersistenceLease::priority);
 

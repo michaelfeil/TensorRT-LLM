@@ -39,6 +39,9 @@ struct KvCachePersistenceLease
 {
     std::uint64_t leaseId;
     executor::IdType blockHash;
+    // Stable block object ID before its primary/secondary pool offsets are swapped.
+    // Connectors may use this to resolve a framework hash into their own keyspace.
+    SizeType32 sourceBlockId;
     // Logical secondary-pool index. Replicated TP connectors receive the same
     // descriptor on every rank and map it to the owner's compact local pool.
     SizeType32 secondaryBlockIndex;

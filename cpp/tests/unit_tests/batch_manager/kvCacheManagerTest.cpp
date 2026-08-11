@@ -10270,6 +10270,7 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingLeaseLife
     }
     ASSERT_NE(leasedBlock, nullptr);
     EXPECT_EQ(lease.blockHash, leasedBlock->getHash());
+    EXPECT_EQ(lease.sourceBlockId, leasedBlock->getBlockId());
     EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 0);
 
     // A full staging pool must not stall allocation or overwrite the leased slot.

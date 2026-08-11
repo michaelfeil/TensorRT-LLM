@@ -379,6 +379,22 @@ class KvCacheConnectorScheduler(ABC):
             "Secondary-pool persistence staging requires explicit no-save request cleanup"
         )
 
+    def resolve_persistence_keys(
+        self, source_block_ids: List[int], framework_block_hashes: List[int]
+    ) -> List[int]:
+        """Resolve evicted framework blocks into the connector's keyspace.
+
+        Connectors whose persistence key is the framework block hash need no
+        translation. Connectors with an independent canonical keyspace may
+        override this method, using ``source_block_ids`` to keep the mapping
+        bounded by TRT block-object lifetime.
+        """
+        if len(source_block_ids) != len(framework_block_hashes):
+            raise RuntimeError(
+                "Persistence source block IDs and framework hashes must have equal length"
+            )
+        return framework_block_hashes
+
     @abstractmethod
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """
@@ -722,6 +738,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._worker_visible_progress = {}
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
         self._pending_persistence_leases: List[KvCachePersistenceLease] = []
+        self._resolved_persistence_keys: Optional[List[int]] = None
         self._outstanding_persistence_lease_ids: Set[int] = set()
         self._kv_cache_manager: Optional["KVCacheManager"] = None
         if self._uses_secondary_persistence_staging:
@@ -733,6 +750,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def add_persistence_leases(self, leases: List[KvCachePersistenceLease]) -> None:
         """Receive one scheduler iteration's staged blocks from C++."""
+        if not leases:
+            return
+        if self._resolved_persistence_keys is not None:
+            raise RuntimeError(
+                "Cannot add persistence leases while a resolved batch is awaiting submission"
+            )
         lease_ids = [lease.lease_id for lease in leases]
         unique_lease_ids = set(lease_ids)
         if len(unique_lease_ids) != len(lease_ids):
@@ -744,12 +767,45 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             )
         self._outstanding_persistence_lease_ids.update(unique_lease_ids)
         self._pending_persistence_leases.extend(leases)
+        # refresh_blocks runs before build_scheduler_output. Force that update
+        # through the existing metadata broadcast so resolution adds no
+        # collective to ordinary decode iterations.
+        self._force_metadata_exchange = True
 
-    def take_pending_persistence_leases(self) -> List[KvCachePersistenceLease]:
-        """Take leases staged since the previous connector publication pass."""
-        leases = self._pending_persistence_leases
+    @staticmethod
+    def _persistence_lease_descriptors(
+        leases: List[KvCachePersistenceLease],
+    ) -> List[Tuple[int, int, int, int, int]]:
+        return [
+            (
+                int(lease.lease_id),
+                int(lease.source_block_id),
+                int(lease.block_hash),
+                int(lease.secondary_block_index),
+                int(lease.priority),
+            )
+            for lease in leases
+        ]
+
+    def get_resolved_pending_persistence_leases(
+        self,
+    ) -> Tuple[List[KvCachePersistenceLease], List[int]]:
+        """Peek at the resolved batch; submission commits the destructive drain."""
+        if not self._pending_persistence_leases:
+            return [], []
+        if self._resolved_persistence_keys is None:
+            raise RuntimeError("Persistence leases reached submission without metadata resolution")
+        return self._pending_persistence_leases, self._resolved_persistence_keys
+
+    def mark_persistence_leases_submitted(self, lease_ids: List[int]) -> None:
+        pending_lease_ids = [int(lease.lease_id) for lease in self._pending_persistence_leases]
+        if lease_ids != pending_lease_ids:
+            raise RuntimeError(
+                "Submitted persistence lease IDs do not match the pending batch: "
+                f"submitted={lease_ids}, pending={pending_lease_ids}"
+            )
         self._pending_persistence_leases = []
-        return leases
+        self._resolved_persistence_keys = None
 
     def has_pending_persistence_leases(self) -> bool:
         """Return whether native D2H produced leases awaiting publication."""
@@ -1024,13 +1080,64 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         metadata_exchange_skipped = self._skip_metadata_exchange
         if metadata_exchange_skipped:
+            if self._pending_persistence_leases:
+                raise RuntimeError(
+                    "Metadata exchange cannot be skipped with pending persistence leases"
+                )
             if self.scheduler is not None:
                 self.scheduler.advance_without_worker_metadata(self._scheduler_output)
             metadata = None
         else:
-            metadata = self._run_on_leader(
-                lambda: self.scheduler.build_connector_meta(self._scheduler_output)
+
+            def build_exchange():
+                try:
+                    metadata = self.scheduler.build_connector_meta(self._scheduler_output)
+                    leases = self._pending_persistence_leases
+                    if not leases:
+                        return True, metadata, None, None
+                    descriptors = self._persistence_lease_descriptors(leases)
+                    persistence_keys = self.scheduler.resolve_persistence_keys(
+                        [descriptor[1] for descriptor in descriptors],
+                        [descriptor[2] for descriptor in descriptors],
+                    )
+                    if len(persistence_keys) != len(leases):
+                        raise RuntimeError(
+                            "Connector resolved "
+                            f"{len(persistence_keys)} persistence keys for "
+                            f"{len(leases)} leases"
+                        )
+                    return True, metadata, descriptors, persistence_keys
+                # pyo3 PanicException inherits BaseException. Convert every
+                # leader failure into data so peer ranks reach the broadcast.
+                except BaseException as error:
+                    return False, type(error).__name__, str(error), None
+
+            exchange = self._run_on_leader(build_exchange)
+            exchange_ok, metadata, leader_descriptors, persistence_keys = exchange
+            if not exchange_ok:
+                raise RuntimeError(
+                    "Connector leader metadata or persistence resolution failed: "
+                    f"{metadata}: {leader_descriptors}"
+                )
+
+            local_descriptors = self._persistence_lease_descriptors(
+                self._pending_persistence_leases
             )
+            if leader_descriptors is None:
+                if local_descriptors:
+                    raise RuntimeError(
+                        "Persistence lease divergence: leader has no leases but this "
+                        f"rank has {local_descriptors}"
+                    )
+                self._resolved_persistence_keys = None
+            else:
+                rank_descriptors = mpi_allgather(local_descriptors)
+                if any(descriptors != leader_descriptors for descriptors in rank_descriptors):
+                    raise RuntimeError(
+                        "Persistence leases diverged across ranks: "
+                        f"leader={leader_descriptors}, ranks={rank_descriptors}"
+                    )
+                self._resolved_persistence_keys = [int(key) for key in persistence_keys]
 
         self._scheduler_output = None
         self._metadata_pending = False

@@ -321,8 +321,7 @@ def test_persistence_staging_reaps_coordinated_terminal_lease_without_mpi():
     lease = MagicMock()
     lease.lease_id = 7
     manager.add_persistence_leases([lease])
-    assert manager.take_pending_persistence_leases() == [lease]
-    assert manager.take_pending_persistence_leases() == []
+    assert manager.has_pending_persistence_leases()
 
     worker.poll_globally_completed_persistence_leases.return_value = [7]
     with patch("tensorrt_llm._torch.pyexecutor.connectors."
@@ -335,6 +334,90 @@ def test_persistence_staging_reaps_coordinated_terminal_lease_without_mpi():
     worker.poll_globally_completed_persistence_leases.reset_mock()
     manager.reap_completed_persistence_leases()
     worker.poll_globally_completed_persistence_leases.assert_not_called()
+
+
+def _persistence_lease(
+    lease_id=7,
+    source_block_id=17,
+    block_hash=101,
+    secondary_block_index=3,
+    priority=9,
+):
+    lease = MagicMock()
+    lease.lease_id = lease_id
+    lease.source_block_id = source_block_id
+    lease.block_hash = block_hash
+    lease.secondary_block_index = secondary_block_index
+    lease.priority = priority
+    return lease
+
+
+def test_persistence_staging_resolves_keys_in_metadata_exchange():
+    manager, _, scheduler, _ = _make_persistence_staging_manager()
+    lease = _persistence_lease()
+    manager.add_persistence_leases([lease])
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    scheduler.resolve_persistence_keys.return_value = [202]
+    scheduler.build_connector_meta.return_value = b"metadata"
+    descriptors = manager._persistence_lease_descriptors([lease])
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+        side_effect=lambda value, root: value,
+    ) as broadcast, patch(
+        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
+        return_value=[descriptors],
+    ) as allgather:
+        manager.handle_metadata()
+
+    assert manager.get_resolved_pending_persistence_leases() == ([lease], [202])
+    scheduler.build_connector_meta.assert_called_once_with("scheduler-output")
+    scheduler.resolve_persistence_keys.assert_called_once_with([17], [101])
+    broadcast.assert_called_once()
+    allgather.assert_called_once_with(descriptors)
+
+
+def test_persistence_staging_broadcasts_resolution_error_and_retains_batch():
+    manager, _, scheduler, _ = _make_persistence_staging_manager()
+    lease = _persistence_lease()
+    manager.add_persistence_leases([lease])
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    scheduler.resolve_persistence_keys.side_effect = ValueError("missing binding")
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+        side_effect=lambda value, root: value,
+    ):
+        with pytest.raises(RuntimeError, match="ValueError: missing binding"):
+            manager.handle_metadata()
+
+    assert manager.has_pending_persistence_leases()
+    assert manager._resolved_persistence_keys is None
+
+
+def test_persistence_staging_rejects_rank_divergence():
+    manager, _, scheduler, _ = _make_persistence_staging_manager()
+    lease = _persistence_lease()
+    manager.add_persistence_leases([lease])
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    scheduler.resolve_persistence_keys.return_value = [202]
+    descriptors = manager._persistence_lease_descriptors([lease])
+    divergent = [(*descriptors[0][:-1], descriptors[0][-1] + 1)]
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+        side_effect=lambda value, root: value,
+    ), patch(
+        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
+        return_value=[descriptors, divergent],
+    ):
+        with pytest.raises(RuntimeError, match="diverged across ranks"):
+            manager.handle_metadata()
+
+    assert manager.has_pending_persistence_leases()
 
 
 def test_persistence_staging_rejects_unknown_coordinated_terminal_lease():
@@ -645,8 +728,15 @@ def test_pending_persistence_lease_submits_pre_forward_without_worker_hooks():
     lease = MagicMock()
     lease.lease_id = 7
     manager.add_persistence_leases([lease])
-    worker.submit_pending_persistence_leases.side_effect = (
-        lambda stream: manager.take_pending_persistence_leases())
+    manager._resolved_persistence_keys = [101]
+
+    def submit(_stream):
+        leases, _ = manager.get_resolved_pending_persistence_leases()
+        manager.mark_persistence_leases_submitted(
+            [int(pending.lease_id) for pending in leases]
+        )
+
+    worker.submit_pending_persistence_leases.side_effect = submit
 
     executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = manager
