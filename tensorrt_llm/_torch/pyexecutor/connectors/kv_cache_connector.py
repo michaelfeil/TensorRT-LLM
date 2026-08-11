@@ -472,7 +472,10 @@ class KvCacheConnectorSchedulerOutputRequest:
         # Cumulative block hashes are immutable between full-block boundaries.
         # Probe and forward the chain only when another block can have become
         # full. Rewinds invalidate this marker in ``on_rewind``.
-        hashed_position = computed_position if is_generation else num_tokens
+        if is_generation and req.state != LlmRequestState.GENERATION_TO_COMPLETE:
+            hashed_position = computed_position
+        else:
+            hashed_position = num_tokens
         num_hashed_tokens = (hashed_position // tokens_per_block) * tokens_per_block
         hash_probe_state = (
             num_hashed_tokens if is_generation else (num_hashed_tokens, len(self.block_ids))

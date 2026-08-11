@@ -453,7 +453,7 @@ def test_sparse_metadata_updates_force_final_block_completion():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
-    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
@@ -469,6 +469,8 @@ def test_sparse_metadata_updates_force_final_block_completion():
     manager.handle_metadata()
 
     scheduler.build_connector_meta.assert_called_once()
+    output = scheduler.build_connector_meta.call_args.args[0]
+    assert output.cached_requests[0].block_hashes == [12345]
     worker.bind_connector_meta.assert_called_once_with(b"metadata")
 
 
