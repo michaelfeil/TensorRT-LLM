@@ -216,7 +216,7 @@ def test_executor_preserves_cancel_without_connector_load(has_connector):
     assert executor._try_cancel_request(request)
 
 
-def test_connector_rejects_dsa_indexer_k_cache_before_registration():
+def _make_connector_executor():
     executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = MagicMock()
     executor.kv_cache_transceiver = None
@@ -228,9 +228,39 @@ def test_connector_rejects_dsa_indexer_k_cache_before_registration():
     executor.kv_connector_manager.uses_secondary_kv_pool_as_persistence_staging.return_value = (
         False)
     executor.kv_cache_manager = MagicMock()
+    executor.kv_cache_manager.is_vswa = False
+    executor.kv_cache_manager.impl.enable_indexer_k_cache = False
+    executor.kv_cache_manager.impl.num_pools = 1
+    executor.resource_manager = MagicMock()
+    executor.resource_manager.get_resource_manager.return_value = None
+    return executor
+
+
+def test_connector_rejects_separate_draft_kv_cache_before_registration():
+    executor = _make_connector_executor()
+    executor.resource_manager.get_resource_manager.return_value = MagicMock()
+
+    with pytest.raises(NotImplementedError, match="separate draft KV cache"):
+        executor._maybe_init_kv_connector_manager()
+
+    executor.kv_connector_manager.worker.register_kv_caches.assert_not_called()
+
+
+def test_connector_rejects_dsa_indexer_k_cache_before_registration():
+    executor = _make_connector_executor()
     executor.kv_cache_manager.impl.enable_indexer_k_cache = True
 
     with pytest.raises(NotImplementedError, match="DSA indexer K cache"):
+        executor._maybe_init_kv_connector_manager()
+
+    executor.kv_connector_manager.worker.register_kv_caches.assert_not_called()
+
+
+def test_connector_rejects_multiple_kv_pools_before_registration():
+    executor = _make_connector_executor()
+    executor.kv_cache_manager.impl.num_pools = 2
+
+    with pytest.raises(NotImplementedError, match="multiple KV cache pools"):
         executor._maybe_init_kv_connector_manager()
 
     executor.kv_connector_manager.worker.register_kv_caches.assert_not_called()

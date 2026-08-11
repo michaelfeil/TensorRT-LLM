@@ -912,6 +912,15 @@ class PyExecutor:
                 raise ValueError(
                     "KV Cache Connector requires a KV Cache Manager.")
 
+            draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            if draft_kv_cache_manager is not None:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with a separate "
+                    "draft KV cache manager. The connector registers only "
+                    "the target pool and cannot namespace draft pool blocks "
+                    "or persistence leases.")
+
             if self.kv_cache_manager.impl.enable_indexer_k_cache:
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with the DSA "
@@ -934,6 +943,12 @@ class PyExecutor:
                     "rather than per-token KV blocks, so the connector's "
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
+
+            if self.kv_cache_manager.impl.num_pools != 1:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with multiple KV "
+                    "cache pools. The connector registers only pool 0, so "
+                    "restored prefixes would have incomplete cache state.")
 
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             secondary_kv_tensor = None
