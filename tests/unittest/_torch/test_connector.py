@@ -284,6 +284,19 @@ def test_persistence_staging_registers_rank_without_secondary_pool():
     )
 
 
+def test_persistence_staging_requires_block_reuse():
+    executor = _make_connector_executor()
+    executor.llm_args.kv_cache_config.host_cache_size = 1
+    executor.kv_connector_manager.uses_secondary_kv_pool_as_persistence_staging.return_value = (
+        True)
+    executor.kv_cache_manager.enable_block_reuse = False
+
+    with pytest.raises(ValueError, match="enable_block_reuse=True"):
+        executor._maybe_init_kv_connector_manager()
+
+    executor.kv_connector_manager.worker.register_kv_caches.assert_not_called()
+
+
 def _make_persistence_staging_manager():
     worker = MagicMock()
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
@@ -437,6 +450,27 @@ def test_persistence_staging_rejects_rank_divergence():
             manager.handle_metadata()
 
     assert manager.has_pending_persistence_leases()
+
+
+def test_persistence_staging_rejects_leader_empty_rank_divergence():
+    manager, _, scheduler, _ = _make_persistence_staging_manager()
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    scheduler.build_connector_meta.return_value = b"metadata"
+    divergent = manager._persistence_lease_descriptors([_persistence_lease()])
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+            side_effect=lambda value, root: value,
+    ), patch(
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
+            return_value=[[], divergent],
+    ) as allgather:
+        with pytest.raises(RuntimeError, match="leader has no leases"):
+            manager.handle_metadata()
+
+    allgather.assert_called_once_with([])
+    assert manager._resolved_persistence_keys is None
 
 
 def test_persistence_staging_rejects_unknown_coordinated_terminal_lease():

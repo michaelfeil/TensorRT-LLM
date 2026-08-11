@@ -911,6 +911,13 @@ class PyExecutor:
             if self.kv_cache_manager is None:
                 raise ValueError(
                     "KV Cache Connector requires a KV Cache Manager.")
+            if (uses_secondary_staging
+                    and not self.kv_cache_manager.enable_block_reuse):
+                raise ValueError(
+                    "A KV Cache Connector using secondary-pool persistence "
+                    "staging requires KvCacheConfig.enable_block_reuse=True. "
+                    "Evicted blocks must remain registered for the connector "
+                    "to persist their staging leases.")
 
             draft_kv_cache_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER)

@@ -1124,15 +1124,15 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             local_descriptors = self._persistence_lease_descriptors(
                 self._pending_persistence_leases
             )
+            rank_descriptors = mpi_allgather(local_descriptors)
             if leader_descriptors is None:
-                if local_descriptors:
+                if any(rank_descriptors):
                     raise RuntimeError(
-                        "Persistence lease divergence: leader has no leases but this "
-                        f"rank has {local_descriptors}"
+                        "Persistence lease divergence: leader has no leases but ranks "
+                        f"have {rank_descriptors}"
                     )
                 self._resolved_persistence_keys = None
             else:
-                rank_descriptors = mpi_allgather(local_descriptors)
                 if any(descriptors != leader_descriptors for descriptors in rank_descriptors):
                     raise RuntimeError(
                         "Persistence leases diverged across ranks: "
