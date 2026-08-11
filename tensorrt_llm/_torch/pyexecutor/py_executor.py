@@ -2361,8 +2361,7 @@ class PyExecutor:
         # scheduler-side match hook.
         connector_allows_preview = (
             self.kv_connector_manager is None
-            or self.kv_connector_manager.supports_schedulable_reuse_preview()
-        )
+            or self.kv_connector_manager.supports_schedulable_reuse_preview())
         return (self.enable_kv_cache_reuse
                 and self.kv_cache_manager is not None and hasattr(
                     self.kv_cache_manager, "estimate_reusable_prompt_len")
