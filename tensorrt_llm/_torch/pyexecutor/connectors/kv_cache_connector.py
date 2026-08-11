@@ -649,6 +649,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._metadata_pending = False
         self._skip_metadata_exchange = False
         self._worker_batch_hooks_pending = False
+        self._worker_batch_hooks_active = False
         self._force_metadata_exchange = False
         self._metadata_exchange_progress = {}
         self._worker_visible_progress = {}
@@ -757,9 +758,15 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
             if request_id in generation_request_ids:
                 # The newest sampled token is input to the next forward and
-                # therefore has no KV yet. Only accepted, already-computed
-                # positions can make a generation block transferable.
-                completed_blocks = max(num_tokens - 1, 0) // block_size
+                # therefore has no KV yet, except when the request is marked
+                # to complete on this forward. That final forward must expose
+                # a newly completed block because no later iteration will.
+                completed_position = (
+                    num_tokens
+                    if req.state == LlmRequestState.GENERATION_TO_COMPLETE
+                    else max(num_tokens - 1, 0)
+                )
+                completed_blocks = completed_position // block_size
                 # Draft lookahead reserves device capacity but cannot produce a
                 # worker transfer before those tokens are accepted into the
                 # request. Accepted full blocks are therefore the only
@@ -886,11 +893,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def start_worker_batch(self, scheduled_requests: ScheduledRequests) -> bool:
         """Run metadata-driven worker hooks for the next forward pass."""
         if self._sparse_metadata_updates_enabled and not self._worker_batch_hooks_pending:
+            self._worker_batch_hooks_active = False
             return False
 
         self.take_scheduled_requests_pending_load(scheduled_requests)
         self.worker.start_load_kv(torch.cuda.current_stream())
         self._worker_batch_hooks_pending = False
+        self._worker_batch_hooks_active = True
         return True
 
     def request_finished(self, req: LlmRequest, cache_block_ids: List[int]) -> bool:
@@ -999,9 +1008,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._skip_metadata_exchange = False
 
     def layer_pre_hook(self, module, *args):
+        if not self._worker_batch_hooks_active:
+            return
         self.worker.wait_for_layer_load(module.layer_idx, torch.cuda.current_stream())
 
     def layer_post_hook(self, module, *args):
+        if not self._worker_batch_hooks_active:
+            return
         self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())
 
     def wait_for_initialization(self):

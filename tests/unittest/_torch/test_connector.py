@@ -348,9 +348,22 @@ def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
         assert manager.start_worker_batch(scheduled_batch)
     current_stream.assert_called_once()
 
+    layer = MagicMock()
+    layer.layer_idx = 3
+    with patch.object(kv_cache_connector.torch.cuda,
+                      "current_stream") as current_stream:
+        manager.layer_pre_hook(layer)
+        manager.layer_post_hook(layer)
+    assert current_stream.call_count == 2
+    worker.wait_for_layer_load.assert_called_once_with(
+        3, current_stream.return_value)
+    worker.save_kv_layer.assert_called_once_with(3, current_stream.return_value)
+
     scheduler.build_connector_meta.reset_mock()
     worker.bind_connector_meta.reset_mock()
     worker.start_load_kv.reset_mock()
+    worker.wait_for_layer_load.reset_mock()
+    worker.save_kv_layer.reset_mock()
 
     # Same-block decode has no connector scheduler, PyO3, MPI, or worker work.
     req.get_num_tokens.return_value = 31
@@ -359,11 +372,15 @@ def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
     with patch.object(kv_cache_connector.torch.cuda,
                       "current_stream") as current_stream:
         assert not manager.start_worker_batch(scheduled_batch)
+        manager.layer_pre_hook(layer)
+        manager.layer_post_hook(layer)
     current_stream.assert_not_called()
     scheduler.build_connector_meta.assert_not_called()
     scheduler.advance_without_worker_metadata.assert_not_called()
     worker.bind_connector_meta.assert_not_called()
     worker.start_load_kv.assert_not_called()
+    worker.wait_for_layer_load.assert_not_called()
+    worker.save_kv_layer.assert_not_called()
 
     # Token 32 is sampled but not computed, so the suffix remains deferred.
     req.get_num_tokens.return_value = 32
@@ -379,6 +396,36 @@ def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
     output = scheduler.build_connector_meta.call_args.args[0]
     assert output.cached_requests[0].new_tokens == [30, 31, 32]
     assert output.cached_requests[0].new_block_ids == [11]
+    worker.bind_connector_meta.assert_called_once_with(b"metadata")
+
+
+def test_sparse_metadata_updates_force_final_block_completion():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    worker.supports_sparse_metadata_updates.return_value = True
+    scheduler = MagicMock()
+    scheduler.build_connector_meta.return_value = b"metadata"
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    req, scheduled_batch = _make_generation_batch(31)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    scheduler.build_connector_meta.reset_mock()
+    worker.bind_connector_meta.reset_mock()
+
+    # The last forward computes token position 31 and completes block 0. No
+    # token-33 iteration exists to make that boundary visible afterward.
+    req.state = LlmRequestState.GENERATION_TO_COMPLETE
+    req.get_num_tokens.return_value = 32
+    req.get_tokens.return_value = list(range(32))
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+
+    scheduler.build_connector_meta.assert_called_once()
     worker.bind_connector_meta.assert_called_once_with(b"metadata")
 
 
