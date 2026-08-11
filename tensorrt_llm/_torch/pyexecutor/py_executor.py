@@ -5483,8 +5483,8 @@ class PyExecutor:
                 cache_block_ids = []
             else:
                 try:
-                    cache_block_ids = self.kv_cache_manager.get_cache_indices(
-                        req)
+                    cache_block_ids = (
+                        self.kv_cache_manager.get_connector_cache_indices(req))
                 except Exception as e:
                     logger.warning(
                         f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"

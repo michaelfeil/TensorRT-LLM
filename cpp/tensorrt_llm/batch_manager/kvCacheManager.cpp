@@ -4760,6 +4760,34 @@ std::vector<std::vector<SizeType32>> const& KVCacheManager::getCacheBlockIds(
     return getSequence(requestId).getCacheBlockIds(windowSize);
 }
 
+std::vector<std::vector<SizeType32>> KVCacheManager::getCacheBlockPoolIndices(
+    RequestIdType requestId, SizeType32 windowSize) const
+{
+    auto const& blockIds = getSequence(requestId).getCacheBlockIds(windowSize);
+    std::vector<std::vector<SizeType32>> poolIndices;
+    poolIndices.reserve(blockIds.size());
+    for (auto const& beamBlockIds : blockIds)
+    {
+        auto& beamPoolIndices = poolIndices.emplace_back();
+        beamPoolIndices.reserve(beamBlockIds.size());
+        for (auto const blockId : beamBlockIds)
+        {
+            auto const block = mBlockManager.getBlockById(blockId, windowSize);
+            TLLM_CHECK_WITH_INFO(block != nullptr, "getCacheBlockPoolIndices: null block (blockId=%d, request %lu).",
+                blockId, static_cast<unsigned long>(requestId));
+            TLLM_CHECK_WITH_INFO(block->isPrimary(),
+                "getCacheBlockPoolIndices: connector block %d is not primary (request %lu).", blockId,
+                static_cast<unsigned long>(requestId));
+            auto const poolIndex = static_cast<SizeType32>(block->getMemoryPoolBlockIndex());
+            TLLM_CHECK_WITH_INFO(poolIndex >= 0 && poolIndex < mBlockManager.getNumPrimaryBlocks(),
+                "getCacheBlockPoolIndices: primary pool index %d is outside [0, %d) (blockId=%d, request %lu).",
+                poolIndex, mBlockManager.getNumPrimaryBlocks(), blockId, static_cast<unsigned long>(requestId));
+            beamPoolIndices.push_back(poolIndex);
+        }
+    }
+    return poolIndices;
+}
+
 std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
     LlmRequest const& llmRequest, SizeType32 windowSize)
 {

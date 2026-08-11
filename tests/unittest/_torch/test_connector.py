@@ -50,6 +50,9 @@ def test_send_kv_async_skips_stale_finished_connector_request():
     executor.kv_cache_transceiver = None
     executor.kv_cache_manager = MagicMock()
     executor.kv_cache_manager.get_cache_indices.return_value = [1, 2]
+    executor.kv_cache_manager.get_connector_cache_indices.return_value = [
+        217, 218
+    ]
     executor.kv_connector_manager = MagicMock()
     executor.kv_connector_manager.request_finished.return_value = False
     executor.async_transfer_manager = MagicMock()
@@ -62,16 +65,18 @@ def test_send_kv_async_skips_stale_finished_connector_request():
 
     executor._send_kv_async([])
 
-    executor.kv_cache_manager.get_cache_indices.assert_called_once_with(request)
+    executor.kv_cache_manager.get_connector_cache_indices.assert_called_once_with(
+        request)
     executor.kv_connector_manager.request_finished.assert_called_once_with(
-        request, [1, 2])
+        request, [217, 218])
 
     executor.active_requests = []
     executor._send_kv_async([])
 
-    executor.kv_cache_manager.get_cache_indices.assert_called_once_with(request)
+    executor.kv_cache_manager.get_connector_cache_indices.assert_called_once_with(
+        request)
     executor.kv_connector_manager.request_finished.assert_called_once_with(
-        request, [1, 2])
+        request, [217, 218])
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
@@ -82,6 +87,9 @@ def test_send_kv_async_avoids_unnecessary_active_request_scan(
     executor.kv_cache_transceiver = None
     executor.kv_cache_manager = MagicMock()
     executor.kv_cache_manager.get_cache_indices.return_value = [1, 2]
+    executor.kv_cache_manager.get_connector_cache_indices.return_value = [
+        217, 218
+    ]
     executor.kv_connector_manager = MagicMock()
     executor.kv_connector_manager.request_finished.return_value = False
     executor.async_transfer_manager = MagicMock()
@@ -95,10 +103,11 @@ def test_send_kv_async_avoids_unnecessary_active_request_scan(
     executor._send_kv_async(scheduled_requests)
 
     if disable_overlap_scheduler:
-        executor.kv_cache_manager.get_cache_indices.assert_called_once_with(
+        executor.kv_cache_manager.get_connector_cache_indices.assert_called_once_with(
             request)
     else:
-        executor.kv_cache_manager.get_cache_indices.assert_not_called()
+        executor.kv_cache_manager.get_connector_cache_indices.assert_not_called(
+        )
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
@@ -671,6 +680,7 @@ def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
@@ -723,6 +733,7 @@ def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
     # Token 33 proves that 32 KV positions exist and carries the full delta.
     req.get_num_tokens.return_value = 33
     kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
     output = scheduler.build_connector_meta.call_args.args[0]
@@ -742,6 +753,7 @@ def test_sparse_metadata_updates_force_final_block_completion():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
@@ -845,6 +857,7 @@ def test_connector_manager_skips_same_block_metadata_collective(
         kv_cache_manager = MagicMock()
         kv_cache_manager.tokens_per_block = 32
         kv_cache_manager.get_cache_indices.return_value = [10]
+        kv_cache_manager.get_connector_cache_indices.return_value = [10]
         kv_cache_manager.commit_and_get_block_hashes.return_value = []
 
         # The first observation establishes worker-visible state.
@@ -880,6 +893,7 @@ def test_connector_manager_skips_same_block_metadata_collective(
         # boundary and next-block allocation travel in one real exchange.
         req.get_num_tokens.return_value = 33
         kv_cache_manager.get_cache_indices.return_value = [10, 11]
+        kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
         real_broadcast = kv_cache_connector.mpi_broadcast
         with patch.object(kv_cache_connector,
                           "mpi_broadcast",
@@ -914,6 +928,7 @@ def test_connector_manager_mtp_lookahead_waits_for_accepted_block(
         kv_cache_manager = MagicMock()
         kv_cache_manager.tokens_per_block = 32
         kv_cache_manager.get_cache_indices.return_value = [10]
+        kv_cache_manager.get_connector_cache_indices.return_value = [10]
         kv_cache_manager.commit_and_get_block_hashes.return_value = []
 
         # Establish worker-visible progress below the lookahead boundary.
@@ -939,6 +954,7 @@ def test_connector_manager_mtp_lookahead_waits_for_accepted_block(
         # still-incomplete block transferable.
         req.get_num_tokens.return_value = 30
         kv_cache_manager.get_cache_indices.return_value = [10, 11]
+        kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
         with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
             manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
             manager.handle_metadata()
@@ -989,6 +1005,7 @@ def test_connector_manager_mtp_allocation_rewind_stays_state_only():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     manager._run_on_leader = MagicMock(return_value=b"metadata")
 
@@ -999,6 +1016,7 @@ def test_connector_manager_mtp_allocation_rewind_stays_state_only():
     # Lookahead allocates block 11 without crossing an accepted-token boundary.
     req.get_num_tokens.return_value = 30
     kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
     output = scheduler.advance_without_worker_metadata.call_args.args[0]
@@ -1010,6 +1028,7 @@ def test_connector_manager_mtp_allocation_rewind_stays_state_only():
     req.get_num_tokens.return_value = 29
     req.get_tokens.return_value = list(range(29))
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
     manager.on_rewind(req, kv_cache_manager)
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
@@ -1022,6 +1041,7 @@ def test_connector_manager_mtp_allocation_rewind_stays_state_only():
     scheduler.advance_without_worker_metadata.reset_mock()
     req.get_num_tokens.return_value = 30
     kv_cache_manager.get_cache_indices.return_value = [10, 12]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 12]
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
     output = scheduler.advance_without_worker_metadata.call_args.args[0]
@@ -1038,6 +1058,7 @@ def test_connector_manager_rewind_hides_unreported_speculative_block():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     manager._run_on_leader = MagicMock(return_value=b"metadata")
 
@@ -1049,10 +1070,13 @@ def test_connector_manager_rewind_hides_unreported_speculative_block():
     req.get_num_tokens.return_value = 29
     req.get_tokens.return_value = list(range(29))
     kv_cache_manager.get_cache_indices.reset_mock()
+    kv_cache_manager.get_connector_cache_indices.reset_mock()
     kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
     manager.on_rewind(req, kv_cache_manager)
 
     kv_cache_manager.get_cache_indices.assert_called_once_with(req)
+    kv_cache_manager.get_connector_cache_indices.assert_called_once_with(req)
     scheduler.on_rewind.assert_called_once_with(req, [10])
 
 
@@ -1066,6 +1090,7 @@ def test_connector_manager_same_block_rewinds_stay_state_only():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     manager._run_on_leader = MagicMock(return_value=b"metadata")
 
@@ -1091,6 +1116,7 @@ def test_connector_manager_boundary_rewind_forces_one_exchange():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     manager._run_on_leader = MagicMock(return_value=b"metadata")
 
@@ -1123,6 +1149,7 @@ def test_connector_manager_non_decode_work_forces_metadata_exchange(
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
 
     # A new request exchanges once, then unchanged cached decode is eligible.
     assert not manager._can_skip_metadata_exchange(scheduled_batch,
@@ -1157,6 +1184,7 @@ def test_connector_manager_finish_only_forces_when_saving_async(saving_async):
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
 
     assert not manager._can_skip_metadata_exchange(scheduled_batch,
                                                    kv_cache_manager)
@@ -1287,6 +1315,7 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
 
     kv_cache_manager = MagicMock()
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1, 2]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     kv_cache_manager.tokens_per_block = 32
 
@@ -1319,6 +1348,7 @@ def test_scheduler_output_only_reads_hashes_at_block_boundaries():
     """Unchanged cumulative block hashes are not rematerialized each step."""
     kv_cache_manager = MagicMock()
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1]
     kv_cache_manager.tokens_per_block = 4
     # The sampled token is not computed until the following scheduler step.
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
@@ -1361,14 +1391,35 @@ def test_scheduler_output_only_reads_hashes_at_block_boundaries():
     for recorded_call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
         assert recorded_call.args == (req, )
     assert kv_cache_manager.get_cache_indices.call_count == 1
+    assert kv_cache_manager.get_connector_cache_indices.call_count == 1
     assert req.get_tokens.call_count == 1
     assert req.get_token.call_args_list == [call(0, 3), call(0, 4)]
+
+
+def test_scheduler_output_uses_physical_indices_and_object_ids_for_priority():
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [6_832]
+    kv_cache_manager.get_connector_cache_indices.return_value = [217]
+    kv_cache_manager.get_priority_by_block_id.return_value = 9
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    req, scheduled_batch = _make_generation_batch(1)
+    req.kv_cache_retention_config = MagicMock()
+
+    output = KvCacheConnectorSchedulerOutputManager().build_scheduler_output(
+        scheduled_batch, AsyncRequests({}, {}), kv_cache_manager)
+
+    assert output.cached_requests[0].new_block_ids == [217]
+    assert output.cached_requests[0].block_object_ids == [6_832]
+    assert output.cached_requests[0].priorities == [9]
+    kv_cache_manager.get_priority_by_block_id.assert_called_once_with(6_832)
 
 
 def test_scheduler_output_mtp_allocation_does_not_refresh_generation_hashes():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
 
     req, scheduled_batch = _make_generation_batch(28)
@@ -1384,6 +1435,7 @@ def test_scheduler_output_mtp_allocation_does_not_refresh_generation_hashes():
     # capacity does not change the logical cumulative hash chain.
     req.get_num_tokens.return_value = 30
     kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
     allocation = manager.build_scheduler_output(scheduled_batch,
                                                 AsyncRequests({}, {}),
                                                 kv_cache_manager)
@@ -1413,6 +1465,7 @@ def test_scheduler_output_refreshes_hashes_when_context_allocation_grows():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 4
     kv_cache_manager.get_cache_indices.side_effect = [[0], [0, 1]]
+    kv_cache_manager.get_connector_cache_indices.side_effect = [[0], [0, 1]]
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[11], [11, 22]]
 
     req = MagicMock()
@@ -1440,6 +1493,48 @@ def test_scheduler_output_refreshes_hashes_when_context_allocation_grows():
     assert second.cached_requests[0].block_hashes == [11, 22]
     assert req.get_tokens.call_count == 1
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
+
+
+def test_scheduler_output_rebinds_same_length_context_reallocation():
+    """Preemption replacement refreshes identity and retention priority."""
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 4
+    kv_cache_manager.get_cache_indices.side_effect = [[6_800], [6_900]]
+    kv_cache_manager.get_connector_cache_indices.side_effect = [[10], [3]]
+    kv_cache_manager.commit_and_get_block_hashes.side_effect = [[11], [11]]
+    kv_cache_manager.get_priority_by_block_id.side_effect = [5, 7]
+
+    req = MagicMock()
+    req.request_id = 42
+    req.state = LlmRequestState.CONTEXT_INIT
+    req.get_num_tokens.return_value = 4
+    req.get_tokens.return_value = list(range(4))
+    req.context_current_position = 0
+    req.context_remaining_length = 4
+    req.context_chunk_size = 4
+    req.kv_cache_retention_config = MagicMock()
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.context_requests_last_chunk = [req]
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    first = manager.build_scheduler_output(scheduled_batch, AsyncRequests({},
+                                                                          {}),
+                                           kv_cache_manager)
+    second = manager.build_scheduler_output(scheduled_batch,
+                                            AsyncRequests({}, {}),
+                                            kv_cache_manager)
+
+    assert first.new_requests[0].new_block_ids == [10]
+    assert first.new_requests[0].block_object_ids == [6_800]
+    assert first.new_requests[0].priorities == [5]
+    assert second.cached_requests[0].new_block_ids == [3]
+    assert second.cached_requests[0].block_object_ids == [6_900]
+    assert second.cached_requests[0].block_hashes == [11]
+    assert second.cached_requests[0].priorities == [7]
+    state = manager.requests[req.request_id]
+    assert state.block_ids == [3]
+    assert state.block_object_ids == [6_900]
 
 
 def test_scheduler_output_on_rewind_trims_stale_block_ids():
@@ -1473,6 +1568,7 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     req.get_tokens.return_value = [1, 2, 3, 4, 5]
     req.get_num_tokens.return_value = 5
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1, 2]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
     manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
                                    kv_cache_manager)
@@ -1487,7 +1583,8 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     req.get_num_tokens.return_value = 6
     req.get_token.return_value = 6
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
-    manager.on_rewind(req, [0, 1], 6)
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1]
+    manager.on_rewind(req, [0, 1], [0, 1], 6)
 
     # block_ids trimmed to live indices
     assert req_state.block_ids == [0, 1], \
@@ -1500,6 +1597,7 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     # build_scheduler_output must emit new_block_ids == [3] and
     # new_tokens == [6] (the accepted token not yet reported).
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 3]
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1, 3]
     output3 = manager.build_scheduler_output(scheduled_batch,
                                              AsyncRequests({}, {}),
                                              kv_cache_manager)
@@ -1515,6 +1613,7 @@ def test_scheduler_output_on_rewind_preserves_unreported_speculative_growth():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
 
     req, scheduled_batch = _make_generation_batch(60)
@@ -1527,13 +1626,14 @@ def test_scheduler_output_on_rewind_preserves_unreported_speculative_growth():
     req.get_tokens.return_value = list(range(62))
     req.get_num_tokens.return_value = 62
 
-    scheduler_live_block_ids = manager.on_rewind(req, [0, 1, 2], 62)
+    scheduler_live_block_ids = manager.on_rewind(req, [0, 1, 2], [0, 1, 2], 62)
 
     req_state = manager.requests[req.request_id]
     assert scheduler_live_block_ids is None
     assert req_state.block_ids == [0, 1]
 
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1, 2]
     output = manager.build_scheduler_output(scheduled_batch,
                                             AsyncRequests({}, {}),
                                             kv_cache_manager)
@@ -1604,6 +1704,7 @@ def test_connector_manager_on_rewind_forwards_to_scheduler():
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1]
 
     req_state = manager.scheduler_output_manager.requests[42]
     req_state.block_ids = [0, 1, 2]
@@ -1629,6 +1730,7 @@ def test_connector_manager_on_rewind_forwards_to_scheduler():
     req.get_num_tokens.return_value = 60
     req.get_tokens.return_value = list(range(60))
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+    kv_cache_manager.get_connector_cache_indices.return_value = [0, 1, 2]
 
     manager.on_rewind(req, kv_cache_manager)
 

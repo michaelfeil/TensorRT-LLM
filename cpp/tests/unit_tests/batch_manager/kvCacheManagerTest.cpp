@@ -10247,6 +10247,14 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingLeaseLife
     auto request3 = makeActiveRequest(3, {11, 12, 13, 14});
     EXPECT_TRUE(connector->getPersistenceLeases().empty());
     auto request4 = makeActiveRequest(4, {15, 16, 17, 18});
+    auto const& request4BlockIds = mgr->getCacheBlockIds(4, windowSize).at(0);
+    auto const request4PoolIndices = mgr->getCacheBlockPoolIndices(4, windowSize).at(0);
+    ASSERT_EQ(request4BlockIds.size(), 1);
+    ASSERT_EQ(request4PoolIndices.size(), 1);
+    EXPECT_GE(request4BlockIds.front(), 3);
+    EXPECT_GE(request4PoolIndices.front(), 0);
+    EXPECT_LT(request4PoolIndices.front(), 3);
+    EXPECT_NE(request4BlockIds.front(), request4PoolIndices.front());
     // Allocation only accumulates leases. refreshBlocks first orders native D2H before the model stream, then crosses
     // into the connector once for the complete scheduler-iteration batch.
     EXPECT_TRUE(connector->getPersistenceLeases().empty());

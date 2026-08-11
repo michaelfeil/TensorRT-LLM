@@ -84,6 +84,10 @@ class RequestData:
     # remote object id) MUST mix cache_salt into their identifiers,
     # otherwise blocks from a different salt could be incorrectly reused.
     cache_salt: Optional[str] = None
+    # Stable TRT block-object IDs for the full allocation when block_hashes is
+    # present. Device transfers use new_block_ids, which are current primary
+    # memory-pool offsets and can differ after native host onboarding.
+    block_object_ids: Optional[List[int]] = None
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -486,6 +490,7 @@ class AsyncRequests:
 class KvCacheConnectorSchedulerOutputRequest:
     def __init__(self):
         self.block_ids = []
+        self.block_object_ids = []
         self.tokens = []
         self.hash_probe_state = None
 
@@ -539,11 +544,31 @@ class KvCacheConnectorSchedulerOutputRequest:
         next_position = computed_position + num_scheduled_tokens
         required_blocks = (next_position + tokens_per_block - 1) // tokens_per_block
         if not is_generation or not self.block_ids or required_blocks > len(self.block_ids):
-            block_ids = kv_cache_manager.get_cache_indices(req)
-            new_block_ids = block_ids[len(self.block_ids) :]
-            self.block_ids.extend(new_block_ids)
+            block_object_ids = kv_cache_manager.get_cache_indices(req)
+            block_ids = kv_cache_manager.get_connector_cache_indices(req)
+            if len(block_ids) != len(block_object_ids):
+                raise RuntimeError("Connector device block indices do not match TRT block objects")
+            old_block_count = len(self.block_ids)
+            allocation_prefix_unchanged = (
+                block_ids[:old_block_count] == self.block_ids
+                and block_object_ids[:old_block_count] == self.block_object_ids
+            )
+            if allocation_prefix_unchanged:
+                new_block_ids = block_ids[old_block_count:]
+                new_block_object_ids = block_object_ids[old_block_count:]
+            else:
+                # The allocation callback has already replaced the connector's
+                # device state. Send the full replacement so retention
+                # priorities are refreshed; KVBM's overlap guard prevents
+                # these IDs from being appended as additional blocks.
+                new_block_ids = block_ids
+                new_block_object_ids = block_object_ids
+                self.hash_probe_state = None
+            self.block_ids = block_ids
+            self.block_object_ids = block_object_ids
         else:
             new_block_ids = []
+            new_block_object_ids = []
 
         # Cumulative block hashes are immutable between full-block boundaries.
         # Probe and forward the chain only when another block can have become
@@ -568,15 +593,17 @@ class KvCacheConnectorSchedulerOutputRequest:
         priorities = None
         if req.kv_cache_retention_config is not None:
             priorities = [
-                kv_cache_manager.get_priority_by_block_id(block_id) for block_id in new_block_ids
+                kv_cache_manager.get_priority_by_block_id(block_id)
+                for block_id in new_block_object_ids
             ]
 
         return RequestData(
-            req.request_id,
-            new_tokens,
-            new_block_ids,
-            computed_position,
-            num_scheduled_tokens,
+            request_id=req.request_id,
+            new_tokens=new_tokens,
+            new_block_ids=new_block_ids,
+            computed_position=computed_position,
+            num_scheduled_tokens=num_scheduled_tokens,
+            block_object_ids=(list(self.block_object_ids) if block_hashes is not None else None),
             block_hashes=block_hashes,
             priorities=priorities,
             cache_salt=req.cache_salt,
@@ -630,7 +657,11 @@ class KvCacheConnectorSchedulerOutputManager:
         self.external_loads[request.request_id] = num_new_matched_tokens
 
     def on_rewind(
-        self, req: LlmRequest, live_block_ids: List[int], num_tokens: int
+        self,
+        req: LlmRequest,
+        live_block_ids: List[int],
+        live_block_object_ids: List[int],
+        num_tokens: int,
     ) -> Optional[List[int]]:
         """Re-sync connector bookkeeping after speculative-decoding rewind.
 
@@ -653,11 +684,16 @@ class KvCacheConnectorSchedulerOutputManager:
         req_state = self.requests.get(req.request_id)
         if req_state is None:
             return None
+        if len(live_block_ids) != len(live_block_object_ids):
+            raise RuntimeError("Speculative rewind device indices do not match TRT block objects")
 
         recorded_block_ids = req_state.block_ids
         scheduler_live_block_ids: Optional[List[int]] = None
         if len(live_block_ids) > len(recorded_block_ids):
-            if live_block_ids[: len(recorded_block_ids)] != recorded_block_ids:
+            if (
+                live_block_ids[: len(recorded_block_ids)] != recorded_block_ids
+                or live_block_object_ids[: len(recorded_block_ids)] != req_state.block_object_ids
+            ):
                 raise RuntimeError(
                     "Speculative allocation growth replaced connector-visible block IDs"
                 )
@@ -665,8 +701,12 @@ class KvCacheConnectorSchedulerOutputManager:
             # the reported length so the next metadata update emits it, and
             # prevent the rewind callback from exposing it early.
             scheduler_live_block_ids = list(recorded_block_ids)
-        elif live_block_ids != recorded_block_ids:
+        elif (
+            live_block_ids != recorded_block_ids
+            or live_block_object_ids != req_state.block_object_ids
+        ):
             req_state.block_ids = list(live_block_ids)
+            req_state.block_object_ids = list(live_block_object_ids)
             scheduler_live_block_ids = req_state.block_ids
 
         if num_tokens < len(req_state.tokens):
@@ -1033,7 +1073,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         num_tokens = req.get_num_tokens(0)
         # The final live token is the next-forward input and has no KV yet.
         completed_blocks = max(num_tokens - 1, 0) // block_size
-        live_block_ids = kv_cache_manager.get_cache_indices(req)
+        live_block_ids = kv_cache_manager.get_connector_cache_indices(req)
+        live_block_object_ids = kv_cache_manager.get_cache_indices(req)
         progress = (completed_blocks, completed_blocks)
         worker_visible_progress = self._worker_visible_progress.get(req.request_id)
         rewind_crossed_worker_boundary = worker_visible_progress != progress
@@ -1041,7 +1082,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._metadata_exchange_progress[req.request_id] = progress
         if self.scheduler is not None:
             scheduler_live_block_ids = self.scheduler_output_manager.on_rewind(
-                req, live_block_ids, num_tokens
+                req, live_block_ids, live_block_object_ids, num_tokens
             )
             self.scheduler.on_rewind(
                 req,

@@ -1087,7 +1087,7 @@ class KVCacheManager(BaseResourceManager):
                         self.impl.add_token(req.py_request_id)
 
                     if self.kv_connector_manager is not None:
-                        block_ids = self.get_cache_indices(req)
+                        block_ids = self.get_connector_cache_indices(req)
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
 
@@ -1651,6 +1651,27 @@ class KVCacheManager(BaseResourceManager):
 
         result = self.impl.get_cache_block_ids(request.py_request_id,
                                                window_size)
+        assert len(result) == 1
+        return result[0]
+
+    def get_connector_cache_indices(
+            self,
+            request: LlmRequest,
+            window_size: Optional[int] = None) -> List[int]:
+        """Return current primary-pool offsets for connector device I/O.
+
+        TRT block IDs remain stable when native host offload swaps a block
+        between primary and secondary pools. Device connectors index the
+        primary tensor directly and therefore require the block's current
+        memory-pool offset instead of that stable object ID.
+        """
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
+        result = self.impl.get_cache_block_pool_indices(request.py_request_id,
+                                                        window_size)
         assert len(result) == 1
         return result[0]
 

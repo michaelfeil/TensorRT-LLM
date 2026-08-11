@@ -2150,6 +2150,13 @@ public:
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
         = 0;
 
+    //! \brief Get current primary memory-pool indices [per beam] for connector device transfers.
+    [[nodiscard]] virtual std::vector<std::vector<SizeType32>> getCacheBlockPoolIndices(
+        LlmRequest::RequestIdType /*requestId*/, SizeType32 /*windowSize*/) const
+    {
+        TLLM_THROW("getCacheBlockPoolIndices is not implemented for this KV cache manager.");
+    }
+
     //! \brief Get the block ids of a batch of requests [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
@@ -2665,6 +2672,9 @@ public:
         SizeType32 sequenceLength, SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 tokensPerBlock);
 
     std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
+        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
+
+    std::vector<std::vector<SizeType32>> getCacheBlockPoolIndices(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
