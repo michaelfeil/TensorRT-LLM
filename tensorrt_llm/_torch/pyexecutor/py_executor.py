@@ -3125,6 +3125,10 @@ class PyExecutor:
             self.kv_connector_manager.reap_completed_persistence_leases()
         new_requests = self._fetch_and_activate_new_requests_after_transfer_cleanup(
         )
+        if self.kv_connector_manager:
+            # Fetch can block while idle, so leases may finish after the first
+            # reap. Poll again before the returning batch allocates KV blocks.
+            self.kv_connector_manager.reap_completed_persistence_leases()
         if self.should_stop_processing:
             return None, None
 

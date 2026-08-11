@@ -300,7 +300,7 @@ def test_persistence_staging_rejects_unknown_coordinated_terminal_lease():
     kv_cache_manager.complete_persistence_leases.assert_not_called()
 
 
-def test_prepare_and_schedule_reaps_persistence_before_fetch():
+def test_prepare_and_schedule_reaps_persistence_before_and_after_fetch():
     executor = object.__new__(PyExecutor)
     call_order = []
     executor._drain_deferred_error_frees = MagicMock(
@@ -315,7 +315,7 @@ def test_prepare_and_schedule_reaps_persistence_before_fetch():
     executor.waiting_queue = []
 
     assert executor._prepare_and_schedule_batch() == (None, None)
-    assert call_order == ["drain", "reap", "fetch"]
+    assert call_order == ["drain", "reap", "fetch", "reap"]
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
