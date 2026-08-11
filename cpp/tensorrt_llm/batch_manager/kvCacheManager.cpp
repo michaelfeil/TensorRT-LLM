@@ -1400,7 +1400,11 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         mEvictionPolicy->claimBlock(block);        // primary block → claimed from primary queue
         mEvictionPolicy->claimBlock(offloadBlock); // secondary block → claimed from secondary queue
 
-        mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
+        // Connector leases reference the secondary tensor, so file transfer modes must not bypass its D2H copy.
+        auto const effectiveTransferMode
+            = mUseSecondaryKvPoolAsPersistenceStaging ? executor::KvCacheTransferMode::DRAM : mode;
+        auto const effectiveDirectory = mUseSecondaryKvPoolAsPersistenceStaging ? std::string{} : directory;
+        mTransferManager->offload(block, offloadBlock, mPools, 0, effectiveTransferMode, effectiveDirectory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
 

@@ -10385,6 +10385,40 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingSkipsPart
     (void) mgr->removeSequence(2, activeRequest);
 }
 
+TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingForcesDramTransfer)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(
+        /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2,
+        /*blocksInSecondaryPool=*/1, /*enablePartialReuse=*/false);
+    tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
+
+    auto cachedTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5});
+    auto cachedRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/1, /*maxNewTokens=*/0, cachedTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
+    (void) mgr->removeSequence(1, cachedRequest);
+
+    auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
+    auto activeRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/2, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
+    activeRequest->setKvCacheRetentionConfig(
+        KvCacheRetentionConfig({}, KvCacheRetentionConfig::kDefaultRetentionPriority, /*decodeDurationMs=*/std::nullopt,
+            KvCacheTransferMode::POSIX_DEBUG_FALLBACK, "/path/unused-by-connector-persistence"));
+    mgr->addSequenceBatch(
+        {{{2, static_cast<SizeType32>(activeTokens->size()), /*beamWidth=*/1}}}, {std::ref(*activeRequest)});
+    mgr->refreshBlocks();
+
+    ASSERT_EQ(connector->getPersistenceLeases().size(), 1);
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 0);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
+    (void) mgr->removeSequence(2, activeRequest);
+}
+
 TEST_F(KVCacheManagerTest, NativeHostOffloadPreservesPartialBlocks)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
