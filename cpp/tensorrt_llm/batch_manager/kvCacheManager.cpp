@@ -1379,12 +1379,14 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
+    auto const hasExternalPersistenceIdentity = !mUseSecondaryKvPoolAsPersistenceStaging || block->isFull();
     // Offloading is an option only when these conditions are met:
-    // 1. Block is registered for reuse and contains state
+    // 1. Block is registered for reuse and contains state. Connector persistence also requires a full block because
+    //    external cache keys identify complete pages; native host offload can still retain partial tails.
     // 2. Eviction policy indicated block can be offloaded
     // 3. At least one free block in secondary memory
-    if (!wantPlaceholder && isRegisteredForReuse && !block->getUniqueTokens().empty() && canOffload
-        && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
+    if (!wantPlaceholder && isRegisteredForReuse && !block->getUniqueTokens().empty()
+        && hasExternalPersistenceIdentity && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
     {
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));

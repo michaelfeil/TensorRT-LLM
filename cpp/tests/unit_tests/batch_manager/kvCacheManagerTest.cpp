@@ -10175,7 +10175,7 @@ private:
 std::unique_ptr<KVCacheManager> makeConnectorTestKVCacheManager(
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> const& stream,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> connector, SizeType32 blocksInPrimaryPool = 16,
-    SizeType32 blocksInSecondaryPool = 0)
+    SizeType32 blocksInSecondaryPool = 0, bool enablePartialReuse = true)
 {
     auto constexpr numLayers = 1;
     auto constexpr numKvHeads = 1;
@@ -10198,7 +10198,7 @@ std::unique_ptr<KVCacheManager> makeConnectorTestKVCacheManager(
             /*cacheType*/ CacheType::kSELF,
             /*secondaryOffloadMinPriority*/ std::nullopt,
             /*eventManager*/ nullptr,
-            /*enablePartialReuse*/ true,
+            /*enablePartialReuse*/ enablePartialReuse,
             /*copyOnPartialReuse*/ true,
             /*enableTpMlaReplicatedHostOffload*/ false,
             /*tpGroupRanks*/ std::vector<SizeType32>{},
@@ -10309,8 +10309,8 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
     auto const stream = std::make_shared<tr::CudaStream>();
     auto connector = std::make_shared<MockKvCacheConnectorManager>(
         /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
-    auto mgr
-        = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2, /*blocksInSecondaryPool=*/1);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2,
+        /*blocksInSecondaryPool=*/1, /*enablePartialReuse=*/false);
     tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
 
     auto cachedTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5});
@@ -10328,6 +10328,49 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
     // Consume both primary blocks so eviction reaches the reusable priority-0
     // block. Connector staging must honor the native offload threshold and
     // drop it instead of creating D2H/publication work.
+    auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
+    auto activeRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/2, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{2, static_cast<SizeType32>(activeTokens->size()), /*beamWidth=*/1}}}, {std::ref(*activeRequest)});
+    mgr->refreshBlocks();
+
+    EXPECT_TRUE(connector->getPersistenceLeases().empty());
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
+    (void) mgr->removeSequence(2, activeRequest);
+}
+
+TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingSkipsPartialBlocks)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(
+        /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
+    auto mgr
+        = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2, /*blocksInSecondaryPool=*/1);
+    tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
+
+    // Four materialized prompt tokens leave three reusable states, producing a partial radix-cache tail.
+    auto cachedTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4});
+    auto cachedRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/1, /*maxNewTokens=*/0, cachedTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
+    (void) mgr->removeSequence(1, cachedRequest);
+
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    bool foundPartialBlock{false};
+    for (KVCacheBlock::IdType blockId = 0; blockId < 2; ++blockId)
+    {
+        auto const block = mgr->getBlockManager().getBlockById(blockId, windowSize);
+        foundPartialBlock |= block->getLookupNode() != nullptr && !block->isFull() && !block->getUniqueTokens().empty();
+    }
+    ASSERT_TRUE(foundPartialBlock);
+
+    // Consume both primary blocks so eviction reaches the partial tail. External connectors only identify complete
+    // pages, so the tail must be dropped instead of becoming an unresolvable persistence lease.
     auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
     auto activeRequest = std::make_shared<LlmRequest>(
         /*requestId=*/2, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
