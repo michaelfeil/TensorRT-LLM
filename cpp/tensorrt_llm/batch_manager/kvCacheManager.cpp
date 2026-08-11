@@ -4874,9 +4874,7 @@ runtime::ITensor::SharedPtr KVCacheManager::getUniqueSecondaryPool() const
 {
     TLLM_CHECK_WITH_INFO(mBlockManager.getWindowSizesMetadata().size() == 1,
         "getUniqueSecondaryPool is only supported for a single window size");
-    auto const secondaryPool = mBlockManager.getSecondaryPool(0);
-    TLLM_CHECK_WITH_INFO(secondaryPool != nullptr, "The secondary KV cache pool has not been allocated.");
-    return secondaryPool;
+    return mBlockManager.getSecondaryPool(0);
 }
 
 runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx) const

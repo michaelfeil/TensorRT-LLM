@@ -1900,8 +1900,8 @@ class KVCacheManager(BaseResourceManager):
         # the pool is a list of block, each of which stores a fixed amount of KV cache data
         return self.impl.get_unique_primary_pool()
 
-    def get_unique_secondary_pool(self) -> torch.Tensor:
-        """Return the single-window secondary KV cache pool used for staging."""
+    def get_unique_secondary_pool(self) -> Optional[torch.Tensor]:
+        """Return this rank's pool, or ``None`` when it owns no TP shard."""
         return self.impl.get_unique_secondary_pool()
 
     def complete_persistence_leases(self, lease_ids: List[int]) -> None:

@@ -2161,6 +2161,7 @@ public:
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
 
+    //! Returns null on replicated TP ranks that own no secondary blocks.
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniqueSecondaryPool() const
     {
         TLLM_THROW("getUniqueSecondaryPool is not implemented for this KV cache manager.");

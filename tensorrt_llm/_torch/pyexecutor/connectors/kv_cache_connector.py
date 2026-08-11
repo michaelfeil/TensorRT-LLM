@@ -228,7 +228,8 @@ class KvCacheConnectorWorker(ABC):
         Args:
             kv_cache_tensor: The contiguous KV cache tensor.
             secondary_kv_cache_tensor: The optional contiguous secondary pool
-                used by connectors that opt into persistence staging.
+                used by connectors that opt into persistence staging. This is
+                ``None`` on replicated TP ranks that own no secondary blocks.
         """
 
     @abstractmethod

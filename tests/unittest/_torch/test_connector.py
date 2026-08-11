@@ -266,6 +266,24 @@ def test_connector_rejects_multiple_kv_pools_before_registration():
     executor.kv_connector_manager.worker.register_kv_caches.assert_not_called()
 
 
+def test_persistence_staging_registers_rank_without_secondary_pool():
+    executor = _make_connector_executor()
+    executor.llm_args.kv_cache_config.host_cache_size = 1
+    executor.kv_connector_manager.uses_secondary_kv_pool_as_persistence_staging.return_value = (
+        True)
+    executor.kv_connector_manager.worker.requires_layerwise_transfer_hooks.return_value = (
+        False)
+    primary_pool = executor.kv_cache_manager.get_unique_primary_pool.return_value
+    executor.kv_cache_manager.get_unique_secondary_pool.return_value = None
+
+    executor._maybe_init_kv_connector_manager()
+
+    executor.kv_connector_manager.worker.register_kv_caches.assert_called_once_with(
+        primary_pool, None)
+    executor.kv_connector_manager.wait_for_initialization.assert_called_once_with(
+    )
+
+
 def _make_persistence_staging_manager():
     worker = MagicMock()
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
