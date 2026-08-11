@@ -363,11 +363,11 @@ def test_persistence_staging_resolves_keys_in_metadata_exchange():
     descriptors = manager._persistence_lease_descriptors([lease])
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
-        side_effect=lambda value, root: value,
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+            side_effect=lambda value, root: value,
     ) as broadcast, patch(
-        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
-        return_value=[descriptors],
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
+            return_value=[descriptors],
     ) as allgather:
         manager.handle_metadata()
 
@@ -384,11 +384,12 @@ def test_persistence_staging_broadcasts_resolution_error_and_retains_batch():
     manager.add_persistence_leases([lease])
     manager._scheduler_output = "scheduler-output"
     manager._metadata_pending = True
-    scheduler.resolve_persistence_keys.side_effect = ValueError("missing binding")
+    scheduler.resolve_persistence_keys.side_effect = ValueError(
+        "missing binding")
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
-        side_effect=lambda value, root: value,
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+            side_effect=lambda value, root: value,
     ):
         with pytest.raises(RuntimeError, match="ValueError: missing binding"):
             manager.handle_metadata()
@@ -408,11 +409,11 @@ def test_persistence_staging_rejects_rank_divergence():
     divergent = [(*descriptors[0][:-1], descriptors[0][-1] + 1)]
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
-        side_effect=lambda value, root: value,
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+            side_effect=lambda value, root: value,
     ), patch(
-        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
-        return_value=[descriptors, divergent],
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
+            return_value=[descriptors, divergent],
     ):
         with pytest.raises(RuntimeError, match="diverged across ranks"):
             manager.handle_metadata()
@@ -733,8 +734,7 @@ def test_pending_persistence_lease_submits_pre_forward_without_worker_hooks():
     def submit(_stream):
         leases, _ = manager.get_resolved_pending_persistence_leases()
         manager.mark_persistence_leases_submitted(
-            [int(pending.lease_id) for pending in leases]
-        )
+            [int(pending.lease_id) for pending in leases])
 
     worker.submit_pending_persistence_leases.side_effect = submit
 

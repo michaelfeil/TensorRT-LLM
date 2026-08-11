@@ -1425,10 +1425,9 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
             TLLM_CHECK_WITH_INFO(
                 inserted, "Persistence lease ID %llu already exists.", static_cast<unsigned long long>(leaseId));
             (void) leaseIt;
-            mUnreportedPersistenceLeases.emplace_back(
-                kv_connector::KvCachePersistenceLease{leaseId, static_cast<executor::IdType>(block->getHash()),
-                    static_cast<SizeType32>(block->getBlockId()),
-                    static_cast<SizeType32>(block->getMemoryPoolBlockIndex()), block->getPriority()});
+            mUnreportedPersistenceLeases.emplace_back(kv_connector::KvCachePersistenceLease{leaseId,
+                static_cast<executor::IdType>(block->getHash()), static_cast<SizeType32>(block->getBlockId()),
+                static_cast<SizeType32>(block->getMemoryPoolBlockIndex()), block->getPriority()});
         }
         else
         {
