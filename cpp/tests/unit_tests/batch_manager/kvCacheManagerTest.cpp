@@ -10347,8 +10347,8 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingSkipsPart
     auto const stream = std::make_shared<tr::CudaStream>();
     auto connector = std::make_shared<MockKvCacheConnectorManager>(
         /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
-    auto mgr
-        = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2, /*blocksInSecondaryPool=*/1);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2,
+        /*blocksInSecondaryPool=*/1, /*enablePartialReuse=*/false);
     tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
 
     // Four materialized prompt tokens leave three reusable states, producing a partial radix-cache tail.
@@ -10380,6 +10380,51 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingSkipsPart
 
     EXPECT_TRUE(connector->getPersistenceLeases().empty());
     EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
+    (void) mgr->removeSequence(2, activeRequest);
+}
+
+TEST_F(KVCacheManagerTest, NativeHostOffloadPreservesPartialBlocks)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeConnectorTestKVCacheManager(stream, /*connector=*/nullptr, /*blocksInPrimaryPool=*/2,
+        /*blocksInSecondaryPool=*/1, /*enablePartialReuse=*/false);
+    tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
+
+    auto cachedTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4});
+    auto cachedRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/1, /*maxNewTokens=*/0, cachedTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
+    (void) mgr->removeSequence(1, cachedRequest);
+
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    BlockPtr partialBlock;
+    for (KVCacheBlock::IdType blockId = 0; blockId < 2; ++blockId)
+    {
+        auto const block = mgr->getBlockManager().getBlockById(blockId, windowSize);
+        if (block->getLookupNode() != nullptr && !block->isFull() && !block->getUniqueTokens().empty())
+        {
+            partialBlock = block;
+            break;
+        }
+    }
+    ASSERT_NE(partialBlock, nullptr);
+    ASSERT_TRUE(partialBlock->isPrimary());
+
+    auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
+    auto activeRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/2, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{2, static_cast<SizeType32>(activeTokens->size()), /*beamWidth=*/1}}}, {std::ref(*activeRequest)});
+    mgr->refreshBlocks();
+
+    EXPECT_FALSE(partialBlock->isPrimary());
+    EXPECT_FALSE(partialBlock->isFull());
+    EXPECT_FALSE(partialBlock->getUniqueTokens().empty());
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 0);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
     (void) mgr->removeSequence(2, activeRequest);
