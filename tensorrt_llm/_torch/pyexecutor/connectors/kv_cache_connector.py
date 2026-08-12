@@ -1133,9 +1133,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
             def build_exchange():
                 try:
-                    metadata = self.scheduler.build_connector_meta(self._scheduler_output)
                     leases = self._pending_persistence_leases
                     if not leases:
+                        metadata = self.scheduler.build_connector_meta(self._scheduler_output)
                         return True, metadata, None, None
                     descriptors = self._persistence_lease_descriptors(leases)
                     persistence_keys = self.scheduler.resolve_persistence_keys(
@@ -1148,6 +1148,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                             f"{len(persistence_keys)} persistence keys for "
                             f"{len(leases)} leases"
                         )
+                    metadata = self.scheduler.build_connector_meta(self._scheduler_output)
                     return True, metadata, descriptors, persistence_keys
                 # pyo3 PanicException inherits BaseException. Convert every
                 # leader failure into data so peer ranks reach the broadcast.

@@ -414,8 +414,23 @@ def test_persistence_staging_resolves_keys_in_metadata_exchange():
     manager.add_persistence_leases([lease])
     manager._scheduler_output = "scheduler-output"
     manager._metadata_pending = True
-    scheduler.resolve_persistence_keys.return_value = [202]
-    scheduler.build_connector_meta.return_value = b"metadata"
+    call_order = []
+    framework_hash_by_block = {17: 101}
+
+    def resolve_persistence_keys(source_block_ids, framework_block_hashes):
+        call_order.append("resolve")
+        assert [
+            framework_hash_by_block[block_id] for block_id in source_block_ids
+        ] == framework_block_hashes
+        return [202]
+
+    def build_connector_meta(scheduler_output):
+        call_order.append("build")
+        framework_hash_by_block[17] = 303
+        return b"metadata"
+
+    scheduler.resolve_persistence_keys.side_effect = resolve_persistence_keys
+    scheduler.build_connector_meta.side_effect = build_connector_meta
     descriptors = manager._persistence_lease_descriptors([lease])
 
     with patch(
@@ -428,6 +443,7 @@ def test_persistence_staging_resolves_keys_in_metadata_exchange():
         manager.handle_metadata()
 
     assert manager.get_resolved_pending_persistence_leases() == ([lease], [202])
+    assert call_order == ["resolve", "build"]
     scheduler.build_connector_meta.assert_called_once_with("scheduler-output")
     scheduler.resolve_persistence_keys.assert_called_once_with([17], [101])
     broadcast.assert_called_once()
