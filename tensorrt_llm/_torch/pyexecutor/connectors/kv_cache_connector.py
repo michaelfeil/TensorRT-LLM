@@ -1224,9 +1224,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # new eager save, while normal finalization still preserves Store
             # operations dispatched during prefill. If none were dispatched,
             # retire the worker slot immediately through the no-save path.
-            saving_async = self._run_on_leader(
-                lambda: self.scheduler.request_finished(req, [])
-            )
+            saving_async = self._run_on_leader(lambda: self.scheduler.request_finished(req, []))
             if not saving_async:
                 self.worker.request_finished_without_save(req.request_id)
                 self.scheduler_output_manager.requests.pop(req.request_id, None)
