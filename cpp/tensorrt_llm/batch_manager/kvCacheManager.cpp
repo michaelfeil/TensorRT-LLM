@@ -1380,6 +1380,8 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     }
     ++mAllocTotalBlocks;
     auto const hasExternalPersistenceIdentity = !mUseSecondaryKvPoolAsPersistenceStaging || block->isFull();
+    auto const discardedPersistenceIdentity = mUseSecondaryKvPoolAsPersistenceStaging && isRegisteredForReuse
+        && block->isFull() && !block->getUniqueTokens().empty();
     // Offloading is an option only when these conditions are met:
     // 1. Block is registered for reuse and contains state. Connector persistence also requires a full block because
     //    external cache keys identify complete pages; native host offload can still retain partial tails.
@@ -1444,6 +1446,13 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         // The final claimBlock() below will be a no-op for the queue but still
         // applies the caller's priority/durationMs.
         block = offloadBlock;
+    }
+    else if (discardedPersistenceIdentity)
+    {
+        // No lease can be created for this residency after getFreeBlock reclaims it. Snapshot its exact identity so
+        // refreshBlocks can retire reclaimed residencies in one callback before this iteration publishes new hashes.
+        mUnreportedPersistenceRetirements.emplace_back(
+            static_cast<SizeType32>(block->getBlockId()), static_cast<executor::IdType>(block->getHash()));
     }
 
     // True priority eviction: detach ONLY this block from the lookup tree.
@@ -2360,6 +2369,11 @@ void WindowBlockManager::refreshBlocks()
 {
     mEvictionPolicy->refresh();
     mTransferManager->syncTransfers();
+    if (!mUnreportedPersistenceRetirements.empty())
+    {
+        mKvCacheConnectorManager->retirePersistenceIdentities(mUnreportedPersistenceRetirements);
+        mUnreportedPersistenceRetirements.clear();
+    }
     if (!mUnreportedPersistenceLeases.empty())
     {
         // syncTransfers has made the model stream wait for every native D2H copy issued this iteration. Publish one

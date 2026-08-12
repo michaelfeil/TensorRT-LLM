@@ -72,6 +72,12 @@ public:
     {
         TLLM_THROW("Connector enabled secondary-pool persistence staging without accepting persistence leases.");
     }
+
+    /// @brief Retire exact persistence identities before their block objects are reused.
+    /// @details Implementations that translate framework hashes into an external keyspace may override this method.
+    virtual void retirePersistenceIdentities(std::vector<std::pair<SizeType32, executor::IdType>> const& /*identities*/)
+    {
+    }
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_connector

@@ -10151,6 +10151,11 @@ public:
         mPersistenceLeases.insert(mPersistenceLeases.end(), leases.begin(), leases.end());
     }
 
+    void retirePersistenceIdentities(std::vector<std::pair<SizeType32, executor::IdType>> const& identities) override
+    {
+        mRetiredPersistenceIdentities.insert(mRetiredPersistenceIdentities.end(), identities.begin(), identities.end());
+    }
+
     [[nodiscard]] std::vector<kv_connector::KvCachePersistenceLease> const& getPersistenceLeases() const
     {
         return mPersistenceLeases;
@@ -10161,12 +10166,18 @@ public:
         return mAddPersistenceLeasesCallCount;
     }
 
+    [[nodiscard]] std::vector<std::pair<SizeType32, executor::IdType>> const& getRetiredPersistenceIdentities() const
+    {
+        return mRetiredPersistenceIdentities;
+    }
+
 private:
     SizeType32 mNumNewMatchedTokens{0};
     SizeType32 mCallCount{0};
     bool mUsesSecondaryStaging{false};
     std::vector<kv_connector::KvCachePersistenceLease> mPersistenceLeases;
     SizeType32 mAddPersistenceLeasesCallCount{0};
+    std::vector<std::pair<SizeType32, executor::IdType>> mRetiredPersistenceIdentities;
 };
 
 // Build a small KVCacheManager wired to the supplied connector. tokensPerBlock=4
@@ -10279,6 +10290,7 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingLeaseLife
     ASSERT_NE(leasedBlock, nullptr);
     EXPECT_EQ(lease.blockHash, leasedBlock->getHash());
     EXPECT_EQ(lease.sourceBlockId, leasedBlock->getBlockId());
+    EXPECT_TRUE(connector->getRetiredPersistenceIdentities().empty());
     EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 0);
 
     // A full staging pool must not stall allocation or overwrite the leased slot.
@@ -10331,6 +10343,12 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
         {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
     mgr->storeContextBlocks(*cachedRequest);
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    auto const& cachedBlockIds = mgr->getCacheBlockIds(1, windowSize).at(0);
+    ASSERT_FALSE(cachedBlockIds.empty());
+    auto const expectedRetiredBlockId = cachedBlockIds.front();
+    auto const expectedRetiredBlockHash
+        = mgr->getBlockManager().getBlockById(expectedRetiredBlockId, windowSize)->getHash();
     (void) mgr->removeSequence(1, cachedRequest);
 
     // Consume both primary blocks so eviction reaches the reusable priority-0
@@ -10344,6 +10362,10 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
     mgr->refreshBlocks();
 
     EXPECT_TRUE(connector->getPersistenceLeases().empty());
+    ASSERT_EQ(connector->getRetiredPersistenceIdentities().size(), 1);
+    EXPECT_EQ(connector->getRetiredPersistenceIdentities().front(),
+        std::make_pair(
+            static_cast<SizeType32>(expectedRetiredBlockId), static_cast<executor::IdType>(expectedRetiredBlockHash)));
     EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);

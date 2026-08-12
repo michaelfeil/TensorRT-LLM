@@ -1428,6 +1428,8 @@ private:
     std::unordered_map<std::uint64_t, BlockPtr> mPersistenceLeases;
     // Leases created during allocation are published together after refreshBlocks orders D2H before the model stream.
     std::vector<kv_connector::KvCachePersistenceLease> mUnreportedPersistenceLeases;
+    // Reclaimed residencies without leases are retired in one callback before this iteration publishes new hashes.
+    std::vector<std::pair<SizeType32, executor::IdType>> mUnreportedPersistenceRetirements;
     std::uint64_t mNextPersistenceLeaseId{1};
 
     // Snapshot of cumulative counters at last iteration stats read (for delta computation)

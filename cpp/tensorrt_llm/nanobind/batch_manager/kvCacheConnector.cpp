@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
 #include <torch/extension.h>
@@ -31,7 +32,7 @@ namespace tb = tensorrt_llm::batch_manager;
 class PyKvCacheConnectorManager : KvCacheConnectorManager
 {
 public:
-    NB_TRAMPOLINE(KvCacheConnectorManager, 3);
+    NB_TRAMPOLINE(KvCacheConnectorManager, 4);
 
     SizeType32 getNumNewMatchedTokens(tb::LlmRequest const& request, SizeType32 numComputedTokens) override
     {
@@ -46,6 +47,12 @@ public:
     void addPersistenceLeases(std::vector<KvCachePersistenceLease> const& leases) override
     {
         NB_OVERRIDE_NAME("add_persistence_leases", addPersistenceLeases, leases);
+    }
+
+    void retirePersistenceIdentities(
+        std::vector<std::pair<SizeType32, tensorrt_llm::executor::IdType>> const& identities) override
+    {
+        NB_OVERRIDE_NAME("retire_persistence_identities", retirePersistenceIdentities, identities);
     }
 };
 
@@ -67,5 +74,7 @@ void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindi
         .def("uses_secondary_kv_pool_as_persistence_staging",
             &tb::kv_connector::KvCacheConnectorManager::usesSecondaryKvPoolAsPersistenceStaging)
         .def("add_persistence_leases", &tb::kv_connector::KvCacheConnectorManager::addPersistenceLeases,
-            nb::arg("leases"));
+            nb::arg("leases"))
+        .def("retire_persistence_identities", &tb::kv_connector::KvCacheConnectorManager::retirePersistenceIdentities,
+            nb::arg("identities"));
 }

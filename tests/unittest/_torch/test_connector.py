@@ -312,6 +312,9 @@ def _make_persistence_staging_manager():
     worker.poll_globally_completed_persistence_leases.return_value = []
     scheduler = MagicMock()
     scheduler.request_finished.return_value = False
+    scheduler.resolve_persistence_keys.side_effect = (
+        lambda _source_block_ids, framework_block_hashes: framework_block_hashes
+    )
     manager = KvCacheConnectorManager(worker, scheduler=scheduler)
     kv_cache_manager = MagicMock()
     manager.bind_kv_cache_manager(kv_cache_manager)
@@ -374,8 +377,7 @@ def test_persistence_staging_finish_does_not_require_request_cache_indices():
 
 def test_persistence_staging_reaps_coordinated_terminal_lease_without_mpi():
     manager, worker, _, kv_cache_manager = _make_persistence_staging_manager()
-    lease = MagicMock()
-    lease.lease_id = 7
+    lease = _persistence_lease()
     manager.add_persistence_leases([lease])
     assert manager.has_pending_persistence_leases()
 
@@ -408,12 +410,9 @@ def _persistence_lease(
     return lease
 
 
-def test_persistence_staging_resolves_keys_in_metadata_exchange():
+def test_persistence_staging_snapshots_keys_before_metadata_build():
     manager, _, scheduler, _ = _make_persistence_staging_manager()
     lease = _persistence_lease()
-    manager.add_persistence_leases([lease])
-    manager._scheduler_output = "scheduler-output"
-    manager._metadata_pending = True
     call_order = []
     framework_hash_by_block = {17: 101}
 
@@ -431,6 +430,9 @@ def test_persistence_staging_resolves_keys_in_metadata_exchange():
 
     scheduler.resolve_persistence_keys.side_effect = resolve_persistence_keys
     scheduler.build_connector_meta.side_effect = build_connector_meta
+    manager.add_persistence_leases([lease])
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
     descriptors = manager._persistence_lease_descriptors([lease])
 
     with patch(
@@ -450,14 +452,45 @@ def test_persistence_staging_resolves_keys_in_metadata_exchange():
     allgather.assert_called_once_with(descriptors)
 
 
+def test_persistence_staging_snapshot_precedes_same_object_reuse_registration():
+    manager, _, scheduler, _ = _make_persistence_staging_manager()
+    old_lease = _persistence_lease(source_block_id=417, block_hash=101)
+    binding = {(417, 101): 201}
+
+    def resolve_persistence_keys(source_block_ids, framework_block_hashes):
+        return [
+            binding[(source_block_id, framework_hash)] for source_block_id,
+            framework_hash in zip(source_block_ids, framework_block_hashes)
+        ]
+
+    scheduler.resolve_persistence_keys.side_effect = resolve_persistence_keys
+
+    # refresh_blocks publishes the old lease before build_scheduler_output can
+    # register the replacement residency on the same stable object.
+    manager.add_persistence_leases([old_lease])
+    binding[(417, 303)] = 403
+
+    assert manager.get_resolved_pending_persistence_leases() == ([old_lease],
+                                                                 [201])
+
+
+def test_persistence_staging_forwards_exact_identity_retirement():
+    manager, _, scheduler, _ = _make_persistence_staging_manager()
+
+    manager.retire_persistence_identities([(417, 101)])
+
+    scheduler.retire_persistence_identities.assert_called_once_with([(417, 101)
+                                                                     ])
+
+
 def test_persistence_staging_broadcasts_resolution_error_and_retains_batch():
     manager, _, scheduler, _ = _make_persistence_staging_manager()
     lease = _persistence_lease()
+    scheduler.resolve_persistence_keys.side_effect = ValueError(
+        "missing binding")
     manager.add_persistence_leases([lease])
     manager._scheduler_output = "scheduler-output"
     manager._metadata_pending = True
-    scheduler.resolve_persistence_keys.side_effect = ValueError(
-        "missing binding")
 
     with patch(
             "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
@@ -473,10 +506,11 @@ def test_persistence_staging_broadcasts_resolution_error_and_retains_batch():
 def test_persistence_staging_rejects_rank_divergence():
     manager, _, scheduler, _ = _make_persistence_staging_manager()
     lease = _persistence_lease()
+    scheduler.resolve_persistence_keys.side_effect = None
+    scheduler.resolve_persistence_keys.return_value = [202]
     manager.add_persistence_leases([lease])
     manager._scheduler_output = "scheduler-output"
     manager._metadata_pending = True
-    scheduler.resolve_persistence_keys.return_value = [202]
     descriptors = manager._persistence_lease_descriptors([lease])
     divergent = [(*descriptors[0][:-1], descriptors[0][-1] + 1)]
 
@@ -516,8 +550,7 @@ def test_persistence_staging_rejects_leader_empty_rank_divergence():
 
 def test_persistence_staging_rejects_unknown_coordinated_terminal_lease():
     manager, worker, _, kv_cache_manager = _make_persistence_staging_manager()
-    lease = MagicMock()
-    lease.lease_id = 9
+    lease = _persistence_lease(lease_id=9)
     manager.add_persistence_leases([lease])
     worker.poll_globally_completed_persistence_leases.return_value = [10]
 
@@ -821,11 +854,12 @@ def test_pending_persistence_lease_submits_pre_forward_without_worker_hooks():
     worker.supports_rank_local_metadata_skip.return_value = True
     worker.supports_sparse_metadata_updates.return_value = True
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
-    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    scheduler = MagicMock()
+    scheduler.resolve_persistence_keys.return_value = [101]
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
     lease = MagicMock()
     lease.lease_id = 7
     manager.add_persistence_leases([lease])
-    manager._resolved_persistence_keys = [101]
 
     def submit(_stream):
         leases, _ = manager.get_resolved_pending_persistence_leases()
