@@ -311,13 +311,14 @@ def _make_persistence_staging_manager():
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
     worker.poll_globally_completed_persistence_leases.return_value = []
     scheduler = MagicMock()
+    scheduler.request_finished.return_value = False
     manager = KvCacheConnectorManager(worker, scheduler=scheduler)
     kv_cache_manager = MagicMock()
     manager.bind_kv_cache_manager(kv_cache_manager)
     return manager, worker, scheduler, kv_cache_manager
 
 
-def test_persistence_staging_binds_worker_and_skips_request_finish_save():
+def test_persistence_staging_finishes_without_creating_a_completion_save():
     manager, worker, scheduler, _ = _make_persistence_staging_manager()
     worker.bind_persistence_lease_manager.assert_called_once_with(manager)
 
@@ -326,10 +327,25 @@ def test_persistence_staging_binds_worker_and_skips_request_finish_save():
     manager.scheduler_output_manager.requests[42]
 
     assert manager.request_finished(request, [1, 2]) is False
-    scheduler.request_finished.assert_not_called()
-    scheduler.request_finished_without_save.assert_called_once_with(request)
+    scheduler.request_finished.assert_called_once_with(request, [])
+    scheduler.request_finished_without_save.assert_not_called()
     worker.request_finished_without_save.assert_called_once_with(42)
     assert 42 not in manager.scheduler_output_manager.requests
+
+
+def test_persistence_staging_retains_dispatched_prompt_save_until_completion():
+    manager, worker, scheduler, _ = _make_persistence_staging_manager()
+    scheduler.request_finished.return_value = True
+    request = MagicMock(request_id=42)
+    manager.scheduler_output_manager.requests[42]
+
+    assert manager.request_finished(request, [1, 2]) is True
+    scheduler.request_finished.assert_called_once_with(request, [])
+    scheduler.request_finished_without_save.assert_not_called()
+    worker.request_finished_without_save.assert_not_called()
+    assert manager.new_async_requests.saving == {42: request}
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    assert 42 in manager.scheduler_output_manager.requests
 
 
 def test_persistence_staging_finish_does_not_require_request_cache_indices():

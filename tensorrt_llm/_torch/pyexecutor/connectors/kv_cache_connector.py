@@ -1220,18 +1220,21 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._worker_visible_progress.pop(req.request_id, None)
 
         if self.uses_secondary_kv_pool_as_persistence_staging():
-            # Resident primary blocks remain in TRT's radix cache. The connector
-            # persists only blocks that TRT actually evicts into leased staging
-            # slots, so request completion must not trigger an eager D2H save.
-            self._run_on_leader(lambda: self.scheduler.request_finished_without_save(req))
-            self.worker.request_finished_without_save(req.request_id)
-            self.scheduler_output_manager.requests.pop(req.request_id, None)
-            self.scheduler_output_manager.external_loads.pop(req.request_id, None)
-            return False
-
-        saving_async = self._run_on_leader(
-            lambda: self.scheduler.request_finished(req, cache_block_ids)
-        )
+            # An empty block list prevents request completion from creating a
+            # new eager save, while normal finalization still preserves Store
+            # operations dispatched during prefill. If none were dispatched,
+            # retire the worker slot immediately through the no-save path.
+            saving_async = self._run_on_leader(
+                lambda: self.scheduler.request_finished(req, [])
+            )
+            if not saving_async:
+                self.worker.request_finished_without_save(req.request_id)
+                self.scheduler_output_manager.requests.pop(req.request_id, None)
+                self.scheduler_output_manager.external_loads.pop(req.request_id, None)
+        else:
+            saving_async = self._run_on_leader(
+                lambda: self.scheduler.request_finished(req, cache_block_ids)
+            )
 
         # This is similar to take_scheduled_requests_pending_load.
         # We need to update the request's state to indicate that it's still being used, but isn't schedulable.
