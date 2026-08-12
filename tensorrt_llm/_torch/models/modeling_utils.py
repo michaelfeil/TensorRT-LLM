@@ -908,6 +908,11 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
 
 
 def filter_weights(prefix, weights: Dict):
+    # ConsumableWeightsDict serves prefix ranges from a sorted-key index;
+    # avoids a full key scan per module (O(modules x keys) over the load).
+    prefix_items = getattr(weights, "prefix_items", None)
+    if prefix_items is not None:
+        return {k[len(prefix) + 1:]: v for k, v in prefix_items(prefix)}
     result = {}
     for k, v in weights.items():
         if k.startswith(prefix):

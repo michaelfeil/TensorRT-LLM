@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import bisect
 import threading
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterator, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from tensorrt_llm.mapping import Mapping
 
@@ -20,22 +21,56 @@ class ConsumableWeightsDict:
     Thread-safe: uses a lock to protect concurrent access. Iteration methods
     (keys, values, items, __iter__) return snapshot copies to allow safe
     concurrent iteration while other threads may modify the dictionary.
+
+    Prefix lookups (prefix_items, mark_consumed) go through a lazily built
+    sorted-key index: per-module weight filtering during load is O(log n + m)
+    instead of a full O(n) key scan, which dominates load time for large MoE
+    checkpoints (~1e5 keys x ~2e3 modules).
     """
 
     def __init__(self, weights: Dict[str, Any]):
         self._weights = weights
         self._lock = threading.Lock()
+        self._sorted_keys: Optional[List[str]] = None
+
+    def _sorted_keys_locked(self) -> List[str]:
+        if self._sorted_keys is None:
+            self._sorted_keys = sorted(self._weights)
+        return self._sorted_keys
+
+    @staticmethod
+    def _prefix_end(prefix: str) -> str:
+        # Smallest string ordered after every string with this prefix.
+        return prefix[:-1] + chr(ord(prefix[-1]) +
+                                 1) if prefix else chr(0x10FFFF)
+
+    def prefix_items(self, prefix: str) -> List[Tuple[str, Any]]:
+        """(key, value) pairs for keys starting with prefix.
+
+        Same result set as filtering items() with str.startswith, but via
+        bisect on the sorted-key index. Deleted keys may linger in the index,
+        so membership is re-checked against the live dict.
+        """
+        with self._lock:
+            sorted_keys = self._sorted_keys_locked()
+            lo = bisect.bisect_left(sorted_keys, prefix)
+            hi = bisect.bisect_left(sorted_keys, self._prefix_end(prefix), lo)
+            weights = self._weights
+            return [(k, weights[k]) for k in sorted_keys[lo:hi] if k in weights]
 
     def __getitem__(self, key: str) -> Any:
         return self._weights[key]
 
     def __setitem__(self, key: str, value: Any) -> None:
         with self._lock:
+            if self._sorted_keys is not None and key not in self._weights:
+                bisect.insort(self._sorted_keys, key)
             self._weights[key] = value
 
     def __delitem__(self, key: str) -> None:
         with self._lock:
             del self._weights[key]
+            self._sorted_keys = None
 
     def __contains__(self, key: str) -> bool:
         return key in self._weights
@@ -69,6 +104,8 @@ class ConsumableWeightsDict:
     def update(self, other: Dict[str, Any]) -> None:
         with self._lock:
             self._weights.update(other)
+            # Bulk load path; rebuild the index lazily on next prefix lookup.
+            self._sorted_keys = None
 
     def mark_consumed(self, prefix: str) -> int:
         """
@@ -83,12 +120,17 @@ class ConsumableWeightsDict:
         Thread-safe: uses a lock to prevent concurrent modification issues.
         """
         with self._lock:
-            keys_to_delete = [
-                k for k in self._weights.keys() if k.startswith(prefix + ".")
-            ]
-            for key in keys_to_delete:
-                del self._weights[key]
-            return len(keys_to_delete)
+            sorted_keys = self._sorted_keys_locked()
+            dotted = prefix + "."
+            lo = bisect.bisect_left(sorted_keys, dotted)
+            hi = bisect.bisect_left(sorted_keys, self._prefix_end(dotted), lo)
+            deleted = 0
+            for key in sorted_keys[lo:hi]:
+                if key in self._weights:
+                    del self._weights[key]
+                    deleted += 1
+            del sorted_keys[lo:hi]
+            return deleted
 
 
 class BaseWeightLoader(ABC):
