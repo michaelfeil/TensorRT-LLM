@@ -563,8 +563,11 @@ class RecvPipeline:
                 self._recv_scratch_buffer_slots.release()
 
     def _release_recv_scratch_buffers(self, views: list[_BufferView]) -> None:
-        self._core.recv_scratch_buffer_pool.release(views)
-        self._release_recv_scratch_slots_for_views(views)
+        # Permits follow the pool's decision, as on the staging side: a
+        # refused view already returned its permit the first time.
+        self._release_recv_scratch_slots_for_views(
+            self._core.recv_scratch_buffer_pool.release(views)
+        )
 
     def _should_use_recv_scratch(
         self,
@@ -904,14 +907,16 @@ class RecvPipeline:
             trace=trace,
         )
         ctx.trace.debug(
-            lambda: f"control received: "
-            f"endpoint_generation={ctx.endpoint_generation} "
-            f"dst_type={ctx.dst_type} "
-            f"descs={ctx.desc_count} data_chunks={ctx.wire_chunk_count} "
-            f"total_bytes={ctx.total_bytes} max_desc_size={ctx.max_desc_size} "
-            f"max_data_chunk_size={ctx.max_wire_chunk_size} "
-            f"max_in_flight_ops={self._core.max_in_flight_ops} "
-            f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
+            lambda: (
+                f"control received: "
+                f"endpoint_generation={ctx.endpoint_generation} "
+                f"dst_type={ctx.dst_type} "
+                f"descs={ctx.desc_count} data_chunks={ctx.wire_chunk_count} "
+                f"total_bytes={ctx.total_bytes} max_desc_size={ctx.max_desc_size} "
+                f"max_data_chunk_size={ctx.max_wire_chunk_size} "
+                f"max_in_flight_ops={self._core.max_in_flight_ops} "
+                f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
+            )
         )
         self._core._prune_quarantined_staging_buffers()
         return ctx
@@ -1399,10 +1404,12 @@ class RecvPipeline:
             await self._run_receive_copy_pipeline(ctx)
             self._scatter_request_chunks(ctx)
         ctx.trace.debug(
-            lambda: f"DATA complete: "
-            f"copy_events={len(ctx.copy_events)} "
-            f"{_format_staging_pool_state(self._core.staging_buffer_pool)} "
-            f"{_format_cuda_scratch_pool_state(self._core.recv_scratch_buffer_pool)}"
+            lambda: (
+                f"DATA complete: "
+                f"copy_events={len(ctx.copy_events)} "
+                f"{_format_staging_pool_state(self._core.staging_buffer_pool)} "
+                f"{_format_cuda_scratch_pool_state(self._core.recv_scratch_buffer_pool)}"
+            )
         )
 
     async def _finalize_success(self, ctx: _RecvTransfer) -> None:

@@ -132,8 +132,12 @@ class _AgentCore:
                 self.staging_buffer_slots.release()
 
     def _release_staging_buffers(self, views: list[_BufferView]) -> None:
-        self.staging_buffer_pool.release(views)
-        self._release_staging_slots_for_views(views)
+        # Permits follow the pool's decision: a view the pool refused was
+        # already given back once, and its permit went back with that first
+        # return. Returning a second permit would let one more transfer in
+        # than there are buffers, or trip the bounded semaphore during
+        # cleanup.
+        self._release_staging_slots_for_views(self.staging_buffer_pool.release(views))
 
     def _prune_quarantined_staging_buffers(self) -> None:
         now = time.monotonic()
@@ -153,14 +157,18 @@ class _AgentCore:
         self._prune_quarantined_staging_buffers()
         if not views:
             return
-        self.staging_buffer_pool.quarantine(views)
-        self._release_staging_slots_for_views(views)
+        # Only the views the pool accepted are ours to unwind or to hold
+        # against reuse; see _release_staging_buffers.
+        quarantined = self.staging_buffer_pool.quarantine(views)
+        if not quarantined:
+            return
+        self._release_staging_slots_for_views(quarantined)
         self._quarantined_staging_views.append(
-            _QuarantinedBufferViews(views=views, quarantined_at=time.monotonic())
+            _QuarantinedBufferViews(views=quarantined, quarantined_at=time.monotonic())
         )
         logger.warning(
             f"B10 {direction} transfer {transfer_id} quarantined staging buffers: "
-            f"count={len(views)} "
+            f"count={len(quarantined)} "
             f"active_quarantines={len(self._quarantined_staging_views)} "
             f"{_format_staging_pool_state(self.staging_buffer_pool)}"
         )

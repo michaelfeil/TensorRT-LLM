@@ -59,6 +59,20 @@ from tensorrt_llm._torch.disaggregation.b10.protocol import (
 logger = logging.getLogger(__name__)
 
 
+def _describe_am_buffer(view: Optional[memoryview]) -> str:
+    """Describe a message we could not route: its size and its leading bytes.
+
+    A header that fails to parse is nearly always a buffer something else
+    wrote into, so the raw bytes are the evidence. They say which: a previous
+    message's header means the buffer was recycled while still in use, and
+    payload-looking bytes mean it was being written by another transfer.
+    """
+    if view is None:
+        return "buffer=<unavailable>"
+    prefix = bytes(view[:_AM_HEADER_SIZE])
+    return f"buffer_len={len(view)} leading_bytes={prefix.hex()}"
+
+
 class _AmCallbackSlot:
     """Permanent UCXX callback that forwards to the active B10 agent."""
 
@@ -202,14 +216,37 @@ class B10AmDispatcher:
             pass
 
     def _dispatch(self, request: Any, ep_handle: int) -> None:
+        view = None
+        # UCXX invokes this callback from the request's completion callback
+        # whatever the outcome - its trampoline takes the ucs_status_t and
+        # discards it - so a receive that failed or was cancelled arrives here
+        # looking like any other. Its buffer holds whatever was written before
+        # the failure, which for an AM landing in a recycled staging buffer is
+        # likely the previous message's bytes: plausible enough to parse and
+        # be routed somewhere. Check the outcome first, while the header is
+        # still just bytes. The request has completed by definition of being
+        # here, so this can only reject a receive that genuinely failed.
+        try:
+            request.check_error()
+        except Exception as exc:
+            logger.warning(
+                f"B10 AM receive failed; dropped without parsing: "
+                f"{type(exc).__name__}: {exc} (ep_handle={ep_handle})"
+            )
+            return
         try:
             buf = request.recv_buffer
             if buf is None:
-                logger.error("B10 AM message with no receive buffer; dropped")
+                logger.error(
+                    f"B10 AM message with no receive buffer; dropped (ep_handle={ep_handle})"
+                )
                 return
             view = memoryview(buf).cast("B")
             if len(view) < _AM_HEADER_SIZE:
-                logger.error(f"B10 AM runt message ({len(view)} B); dropped")
+                logger.error(
+                    f"B10 AM runt message; dropped (ep_handle={ep_handle} "
+                    f"{_describe_am_buffer(view)})"
+                )
                 return
             header = _unpack_am_header(view)
             payload = view[_AM_HEADER_SIZE : _AM_HEADER_SIZE + header.payload_len]
@@ -217,17 +254,20 @@ class B10AmDispatcher:
                 logger.error(
                     f"B10 AM {header.kind_name} truncated: header says "
                     f"{header.payload_len} B, got {len(payload)} B "
-                    f"(transfer_id={header.transfer_id}); dropped"
+                    f"(transfer_id={header.transfer_id} ep_handle={ep_handle}); dropped"
                 )
                 return
         except Exception as exc:
-            logger.error(f"B10 AM header parse failed; dropped: {exc}")
+            logger.error(
+                f"B10 AM header parse failed; dropped: {exc} "
+                f"(ep_handle={ep_handle} {_describe_am_buffer(view)})"
+            )
             return
 
         if header.kind == _AM_KIND_DATA:
             sink = self._data_sinks.get((ep_handle, header.transfer_id, header.endpoint_generation))
             if sink is None:
-                self._log_stale(header)
+                self._log_stale(header, ep_handle)
                 return
             sink(header.chunk_index, payload)
         elif header.kind in (_AM_KIND_READY, _AM_KIND_RESULT):
@@ -236,7 +276,7 @@ class B10AmDispatcher:
                 None,
             )
             if future is None or future.done():
-                self._log_stale(header)
+                self._log_stale(header, ep_handle)
                 return
             future.set_result(_unpack_message(payload))
         elif header.kind == _AM_KIND_CONTROL:
@@ -247,14 +287,22 @@ class B10AmDispatcher:
         else:
             logger.error(f"B10 AM unknown kind {header.kind}; dropped")
 
-    @staticmethod
-    def _log_stale(header: _AmHeader) -> None:
+    def _log_stale(self, header: _AmHeader, ep_handle: int) -> None:
         # Stale delivery is expected after a transfer fails or times out on
-        # this side while the peer still had the message in flight.
+        # this side while the peer still had the message in flight. What is
+        # not expected is a live target for this transfer id under some other
+        # key: that says the message was mis-keyed rather than late - the
+        # header may not even belong to the message it arrived in - so name
+        # the near miss instead of leaving it to be inferred.
+        near_misses = [key for key in self._data_sinks if key[1] == header.transfer_id]
+        near_misses += [key for key in self._reply_futures if key[0] == header.transfer_id]
+        near_miss_detail = f" live_targets_for_this_transfer={near_misses}" if near_misses else ""
         logger.warning(
             f"B10 AM stale {header.kind_name} dropped: "
             f"transfer_id={header.transfer_id} "
             f"chunk_index={header.chunk_index} "
             f"endpoint_generation={header.endpoint_generation} "
-            f"payload_len={header.payload_len}"
+            f"payload_len={header.payload_len} "
+            f"ep_handle={ep_handle}"
+            f"{near_miss_detail}"
         )

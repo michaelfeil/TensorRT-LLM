@@ -194,17 +194,43 @@ class _CudaScratchBufferPool:
                 metadata=self._metadata_for_owner_locked(owner),
             )
 
-    def release(self, views: list[_BufferView]) -> None:
+    def release(self, views: list[_BufferView]) -> list[_BufferView]:
+        """Give scratch buffers back, returning the views this pool took.
+
+        See `_PinnedStagingBufferPool.release` for why the caller needs to
+        know which returns were accepted.
+        """
+        accepted: list[_BufferView] = []
         with self._lock:
             for view in views:
                 if view.pool is not self:
                     continue
+                # Returned once, like the staging pool: a repeat would hand
+                # one scratch buffer to two transfers. See
+                # _PinnedStagingBufferPool._claim_return_locked.
+                if view.returned:
+                    logger.error(
+                        "B10 recv scratch buffer released twice; refused to "
+                        "avoid handing one buffer to two transfers. This is a "
+                        "buffer-ownership bug - the earlier release stands."
+                    )
+                    continue
+                view.returned = True
+                accepted.append(view)
                 key = _device_key(view.owner.device)
-                self._checked_out[key] = max(0, self._checked_out.get(key, 0) - 1)
+                checked_out = self._checked_out.get(key, 0)
+                if checked_out <= 0:
+                    logger.error(
+                        f"B10 recv scratch buffer released with nothing checked "
+                        f"out on {key}; the pool accounting has drifted."
+                    )
+                else:
+                    self._checked_out[key] = checked_out - 1
                 if view.ready_event is None:
                     self._available.setdefault(key, []).append(view.owner)
                     continue
                 self._pending.setdefault(key, []).append((view.owner, view.ready_event))
+        return accepted
 
     def _preallocate_sync(self, device: torch.device) -> None:
         key = _device_key(device)
@@ -342,27 +368,96 @@ class _PinnedStagingBufferPool:
             self._checked_out += 1
             return _BufferView(owner[:size], owner, self)
 
-    def release(self, views: list[_BufferView]) -> None:
-        with self._lock:
-            for view in views:
-                if view.pool is not self:
-                    continue
-                self._checked_out = max(0, self._checked_out - 1)
-                if view.ready_event is not None and not view.ready_event.query():
-                    self._pending.append((view.owner, view.ready_event))
-                else:
-                    self._available.append(view.owner)
+    def release(self, views: list[_BufferView]) -> list[_BufferView]:
+        """Give buffers back, returning the views this pool actually took.
 
-    def quarantine(self, views: list[_BufferView]) -> None:
-        replaced = False
+        The caller needs that answer: a refused view is still owned by
+        whoever returned it first, so anything the caller unwinds alongside
+        the buffer - a slot permit, say - must be unwound only for the views
+        in the returned list.
+        """
+        accepted: list[_BufferView] = []
+        replace = False
         with self._lock:
             for view in views:
                 if view.pool is not self:
                     continue
-                self._checked_out = max(0, self._checked_out - 1)
-                replaced = True
-        if replaced:
+                if not self._claim_return_locked(view, "release"):
+                    continue
+                accepted.append(view)
+                try:
+                    ready = view.ready_event is None or view.ready_event.query()
+                except Exception as exc:
+                    # Whether the copy out of this buffer finished is now
+                    # unknowable, so it cannot be reused - but it must not be
+                    # dropped either, or the pool shrinks for good. Abandon
+                    # this one and refill a replacement, exactly as a
+                    # quarantine does.
+                    logger.error(
+                        f"B10 staging buffer ready-event query failed "
+                        f"({type(exc).__name__}: {exc}); abandoning the buffer "
+                        f"and refilling, since its copy-out cannot be confirmed"
+                    )
+                    replace = True
+                    continue
+                if ready:
+                    self._available.append(view.owner)
+                else:
+                    self._pending.append((view.owner, view.ready_event))
+        if replace:
             self._start_background_refill()
+        return accepted
+
+    def quarantine(self, views: list[_BufferView]) -> list[_BufferView]:
+        """Abandon buffers and refill replacements; returns views taken.
+
+        See `release` for why the caller is told which views were accepted.
+        """
+        accepted: list[_BufferView] = []
+        with self._lock:
+            for view in views:
+                if view.pool is not self:
+                    continue
+                if not self._claim_return_locked(view, "quarantine"):
+                    continue
+                accepted.append(view)
+        if accepted:
+            self._start_background_refill()
+        return accepted
+
+    def _claim_return_locked(self, view: _BufferView, action: str) -> bool:
+        """Take ownership of a view coming back, once. False means refuse it.
+
+        A view returns exactly once: it is acquired, used, then released or
+        quarantined. A second return would put one buffer into circulation
+        twice - two transfers receiving into the same memory, which surfaces
+        far from here as a corrupt AM header or a chunk that lands in the
+        wrong transfer. Refusing keeps the first outcome, which is the
+        correct one either way: a release means the buffer's copy-out already
+        finished, and a quarantine means it must never come back at all.
+
+        Loud on purpose. The counter used to be clamped with max(0, ...),
+        which made this silent and let the accounting drift until the
+        corruption surfaced somewhere unrelated.
+        """
+        if view.returned:
+            logger.error(
+                f"B10 staging buffer returned twice ({action} after it was "
+                f"already given back); refused to avoid handing one buffer to "
+                f"two transfers. This is a buffer-ownership bug - the earlier "
+                f"return stands. {_format_staging_pool_snapshot(self._snapshot_locked())}"
+            )
+            return False
+        view.returned = True
+        if self._checked_out <= 0:
+            logger.error(
+                f"B10 staging buffer {action} with nothing checked out; the "
+                f"pool accounting has drifted. "
+                f"{_format_staging_pool_snapshot(self._snapshot_locked())}"
+            )
+            return True
+        self._checked_out -= 1
+        return True
 
     def _start_background_refill(self) -> None:
         with self._lock:

@@ -20,7 +20,9 @@ deliveries are simulated with fake request objects.
 """
 
 import asyncio
+import time
 import types
+from typing import Optional
 
 import pytest
 
@@ -120,10 +122,23 @@ async def test_dispatchers_reuse_worker_callback_after_detach():
     second.detach()
 
 
-def _fake_request(message: bytes) -> types.SimpleNamespace:
+def _fake_request(message: bytes, error: Optional[Exception] = None) -> types.SimpleNamespace:
+    """Stand in for a ucxx UCXRequest as the AM receiver callback sees it.
+
+    `check_error` is part of that contract: UCXX calls the callback for failed
+    receives too, so the dispatcher asks before trusting the buffer. `error`
+    makes this a receive that failed.
+    """
     import numpy as np
 
-    return types.SimpleNamespace(recv_buffer=np.frombuffer(bytearray(message), dtype=np.uint8))
+    def check_error() -> None:
+        if error is not None:
+            raise error
+
+    return types.SimpleNamespace(
+        recv_buffer=np.frombuffer(bytearray(message), dtype=np.uint8),
+        check_error=check_error,
+    )
 
 
 @pytest.mark.asyncio
@@ -185,6 +200,34 @@ async def test_dispatcher_drops_stale_messages():
     dispatcher.register_data_sink(0, 7, 1, lambda idx, payload: pytest.fail("sink must be gone"))
     dispatcher.unregister_data_sink(0, 7, 1)
     dispatcher._dispatch(_fake_request(_pack_am_header(_AM_KIND_DATA, 7, 0, 1, 2) + b"xy"), 0)
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_drops_a_failed_receive_without_parsing_it():
+    """A receive that failed must not be routed on the strength of its bytes.
+
+    UCXX calls this callback for failed receives too - its trampoline drops
+    the ucs_status_t - so the buffer may hold only what was written before the
+    failure. AM receives land in recycled staging buffers whose previous
+    contents are earlier AM messages, so those leftovers can carry a valid
+    magic and route somewhere real. The outcome has to be checked before the
+    header is believed.
+    """
+    dispatcher = B10AmDispatcher(asyncio.get_running_loop())
+    dispatcher.set_control_handler(lambda ep_handle, hdr, payload: pytest.fail("failed receive"))
+    dispatcher.register_data_sink(0, 5, 1, lambda idx, payload: pytest.fail("failed receive"))
+    ready_future = dispatcher.register_reply_future(5, 1, _AM_KIND_READY)
+
+    # Each message is structurally perfect and addressed to a live target;
+    # only the receive itself failed.
+    for message in (
+        _pack_am_message(_AM_KIND_CONTROL, 5, 1, {"transfer_id": 5}),
+        _pack_am_header(_AM_KIND_DATA, 5, 0, 1, 2) + b"xy",
+        _pack_am_message(_AM_KIND_READY, 5, 1, {"ok": True}),
+    ):
+        dispatcher._dispatch(_fake_request(message, error=RuntimeError("Connection reset")), 0)
+
+    assert not ready_future.done()
 
 
 @pytest.mark.asyncio
@@ -278,6 +321,169 @@ def test_am_staging_allocator_returns_unclaimed_buffer_on_release():
     del array
     assert pool.snapshot()["checked_out"] == 0
     assert allocator.allocate(128) is not None
+
+
+def test_staging_pool_refuses_a_second_return():
+    """One buffer must never be in circulation twice.
+
+    A view returns exactly once. If a release is followed by another release
+    or by a quarantine - the shape a failure path takes when it re-returns a
+    view whose owner already gave it back - the extra return has to be
+    refused. Otherwise two transfers receive into the same memory and one
+    overwrites the other's AM header.
+    """
+    pool = _staging_pool(num_buffers=1, buffer_size=4096)
+    view = pool.acquire(128)
+    assert pool.snapshot()["checked_out"] == 1
+
+    pool.release([view])
+    state = pool.snapshot()
+    assert (state["available"], state["checked_out"]) == (1, 0)
+
+    # Both extra returns are refused, so the buffer is still listed once and
+    # the quarantine did not trigger a replacement for a live buffer.
+    pool.release([view])
+    pool.quarantine([view])
+    state = pool.snapshot()
+    assert (state["available"], state["checked_out"]) == (1, 0)
+
+    # And the pool still hands its one buffer to one holder at a time.
+    held = pool.acquire(128)
+    assert pool.try_acquire(128) is None
+    assert held.owner.data_ptr() == view.owner.data_ptr()
+
+
+def test_staging_pool_keeps_a_quarantined_buffer_out_of_circulation():
+    """Quarantine poisons a buffer, and a later release must not resurrect it.
+
+    Quarantining means a peer may still write into that buffer, so it is
+    abandoned and replaced rather than reused. A release arriving afterwards
+    is the same double-return in the other order, and putting the buffer back
+    would hand memory a zombie writer still owns to the next transfer.
+    """
+    pool = _staging_pool(num_buffers=1, buffer_size=4096)
+    view = pool.acquire(128)
+    poisoned_ptr = view.owner.data_ptr()
+
+    pool.quarantine([view])
+    assert pool.snapshot()["checked_out"] == 0
+
+    pool.release([view])  # refused
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        state = pool.snapshot()
+        if state["available"] >= 1 and not state["refill_in_progress"]:
+            break
+        time.sleep(0.01)
+
+    # Only the replacement is available; the poisoned buffer never comes back.
+    # The test still holds `view`, so its memory cannot have been reused for
+    # the replacement and the pointer comparison stays meaningful.
+    assert pool.snapshot()["available"] == 1
+    assert pool.acquire(128).owner.data_ptr() != poisoned_ptr
+
+
+def test_recv_scratch_pool_refuses_a_second_release():
+    """The recv scratch pool returns once too, for the same reason.
+
+    Its buffers are device memory rather than pinned host, so the failure
+    looks different - two transfers scattering into one buffer instead of two
+    receives landing in one - but a view listed twice is the same defect.
+    """
+    import torch
+
+    from tensorrt_llm._torch.disaggregation.b10.pools import _CudaScratchBufferPool
+
+    device = torch.device("cuda", 0)
+    pool = _CudaScratchBufferPool(num_buffers=1, buffer_size=4096)
+    pool.preallocate(device)
+    view = pool.acquire(128, device)
+    assert pool.snapshot()["checked_out"] == 1
+
+    pool.release([view])
+    state = pool.snapshot()
+    assert (state["available"], state["checked_out"]) == (1, 0)
+
+    # Refused, so the one buffer stays listed once.
+    pool.release([view])
+    state = pool.snapshot()
+    assert (state["available"], state["checked_out"]) == (1, 0)
+
+
+def test_double_release_returns_one_slot_permit():
+    """A refused buffer return must not return a second slot permit.
+
+    The permit is the admission control for staging, and it is released by a
+    wrapper around the pool rather than by the pool itself. If the wrapper
+    releases one per view it was handed, a refused duplicate still hands back
+    a permit - letting one more transfer in than there are buffers, or
+    tripping the bounded semaphore during cleanup. Permits have to follow the
+    pool's accept/refuse decision, so this exercises the wrapper, not the
+    pool.
+    """
+    import threading
+
+    from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
+
+    pool = _staging_pool(num_buffers=1, buffer_size=4096)
+    slots = threading.BoundedSemaphore(1)
+    core = types.SimpleNamespace(
+        staging_buffer_pool=pool,
+        staging_buffer_slots=slots,
+        _event_ready_for_slot_release=_AgentCore._event_ready_for_slot_release,
+    )
+    core._release_staging_slots_for_views = lambda views: (
+        _AgentCore._release_staging_slots_for_views(core, views)
+    )
+
+    view = pool.acquire(128)
+    slots.acquire()
+    _AgentCore._release_staging_buffers(core, [view])
+
+    # The permit came back exactly once, so the semaphore is full again.
+    with pytest.raises(ValueError):
+        slots.release()
+
+    # A duplicate return is refused by the pool, so no second permit either -
+    # this call must not raise, and must leave the buffer listed once.
+    _AgentCore._release_staging_buffers(core, [view])
+    state = pool.snapshot()
+    assert (state["available"], state["checked_out"]) == (1, 0)
+    with pytest.raises(ValueError):
+        slots.release()
+
+
+def test_release_keeps_a_buffer_whose_ready_event_query_fails():
+    """A buffer must never be lost because its event could not be queried.
+
+    The release path asks `ready_event.query()` to decide between available
+    and pending. If that raises, the buffer belongs to neither list, and
+    because the view is already marked returned a later quarantine would be
+    refused - so nothing would refill it and the pool would shrink for good.
+    Repeated failures would exhaust it.
+    """
+
+    class BrokenEvent:
+        def query(self):
+            raise RuntimeError("CUDA error: device-side assert triggered")
+
+    pool = _staging_pool(num_buffers=1, buffer_size=4096)
+    view = pool.acquire(128)
+    view.ready_event = BrokenEvent()
+    pool.release([view])
+
+    # The buffer with the unknowable copy-out is abandoned rather than reused,
+    # and a replacement is refilled, so capacity is restored.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        state = pool.snapshot()
+        if state["available"] >= 1 and not state["refill_in_progress"]:
+            break
+        time.sleep(0.01)
+    state = pool.snapshot()
+    assert (state["available"], state["checked_out"]) == (1, 0)
+    assert pool.acquire(128).owner.data_ptr() != view.owner.data_ptr()
 
 
 def test_release_staging_slots_skips_am_direct_views():

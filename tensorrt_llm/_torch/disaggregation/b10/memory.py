@@ -166,3 +166,9 @@ class _BufferView:
     pool: Optional[Any] = None
     ready_event: Optional[Any] = None
     metadata: Optional[dict[str, Any]] = None
+    # Set by the owning pool the first time this view goes back, so a second
+    # return is refused instead of putting one buffer into circulation twice.
+    # A view reaches a pool at most once by construction; a repeat means some
+    # path released it and then a failure path released or quarantined it
+    # again, which would hand the same memory to two transfers at once.
+    returned: bool = False
