@@ -2365,15 +2365,28 @@ void BlockManager::refreshBlocks()
     }
 }
 
-void WindowBlockManager::refreshBlocks()
+void BlockManager::flushPendingPersistenceRetirements()
 {
-    mEvictionPolicy->refresh();
-    mTransferManager->syncTransfers();
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.flushPendingPersistenceRetirements();
+    }
+}
+
+void WindowBlockManager::flushPendingPersistenceRetirements()
+{
     if (!mUnreportedPersistenceRetirements.empty())
     {
         mKvCacheConnectorManager->retirePersistenceIdentities(mUnreportedPersistenceRetirements);
         mUnreportedPersistenceRetirements.clear();
     }
+}
+
+void WindowBlockManager::refreshBlocks()
+{
+    mEvictionPolicy->refresh();
+    mTransferManager->syncTransfers();
+    flushPendingPersistenceRetirements();
     if (!mUnreportedPersistenceLeases.empty())
     {
         // syncTransfers has made the model stream wait for every native D2H copy issued this iteration. Publish one

@@ -1086,7 +1086,13 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
-                    if self.kv_connector_manager is not None:
+                if self.kv_connector_manager is not None:
+                    if self.kv_connector_manager.uses_secondary_kv_pool_as_persistence_staging(
+                    ):
+                        # Allocation queues retirements for reclaimed residencies.
+                        # Deliver them before the same block objects receive new keys.
+                        self.impl.flush_pending_persistence_retirements()
+                    for req in batch_llm_requests:
                         block_ids = self.get_connector_cache_indices(req)
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
@@ -1094,8 +1100,7 @@ class KVCacheManager(BaseResourceManager):
                         # refresh below. Register the new stable residency
                         # while its TRT block-object identity is still live.
                         self.kv_connector_manager.register_persistence_identities_after_alloc(
-                            req, self
-                        )
+                            req, self)
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():

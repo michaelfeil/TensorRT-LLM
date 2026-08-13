@@ -10359,7 +10359,9 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
         /*requestId=*/2, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
     mgr->addSequenceBatch(
         {{{2, static_cast<SizeType32>(activeTokens->size()), /*beamWidth=*/1}}}, {std::ref(*activeRequest)});
-    mgr->refreshBlocks();
+    // The scheduler must be able to retire the reclaimed residency before it
+    // registers the replacement key for the same stable block object.
+    mgr->flushPendingPersistenceRetirements();
 
     EXPECT_TRUE(connector->getPersistenceLeases().empty());
     ASSERT_EQ(connector->getRetiredPersistenceIdentities().size(), 1);
@@ -10367,6 +10369,9 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
         std::make_pair(
             static_cast<SizeType32>(expectedRetiredBlockId), static_cast<executor::IdType>(expectedRetiredBlockHash)));
     EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
+
+    mgr->refreshBlocks();
+    EXPECT_EQ(connector->getRetiredPersistenceIdentities().size(), 1);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
     (void) mgr->removeSequence(2, activeRequest);

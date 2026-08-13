@@ -1195,6 +1195,9 @@ public:
     //! \brief Sync internal streams used by transfer manager with buffer manager stream
     void syncTransferManagerWithBufferManager();
 
+    //! \brief Retire reclaimed connector-persistence identities before their block objects are rebound.
+    void flushPendingPersistenceRetirements();
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1864,6 +1867,9 @@ public:
     //! \brief Sync internal streams used by transfer manager with buffer manager stream
     void syncTransferManagerWithBufferManager();
 
+    //! \brief Retire reclaimed connector-persistence identities before their block objects are rebound.
+    void flushPendingPersistenceRetirements();
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -2187,6 +2193,9 @@ public:
     [[nodiscard]] virtual bool isPoolLayerFirst(SizeType32 layer_idx) const = 0;
 
     virtual void syncTransferManagerWithBufferManager() = 0;
+
+    virtual void flushPendingPersistenceRetirements() {}
+
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
     virtual void resetReuseState() = 0;
@@ -2705,6 +2714,11 @@ public:
     void completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds) override
     {
         mBlockManager.completePersistenceLeases(leaseIds);
+    }
+
+    void flushPendingPersistenceRetirements() override
+    {
+        mBlockManager.flushPendingPersistenceRetirements();
     }
 
     //! \brief Perform per-iteration bookkeeping

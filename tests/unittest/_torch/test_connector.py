@@ -347,6 +347,41 @@ def test_persistence_identity_registration_is_leader_only():
     kv_cache_manager.commit_and_get_block_hashes.assert_not_called()
 
 
+def test_persistence_staging_retires_reclaimed_identity_before_registration():
+    resource_manager = object.__new__(KVCacheManager)
+    resource_manager.impl = MagicMock()
+    resource_manager.kv_cache_type = CacheTypeCpp.SELF
+    resource_manager.is_draft = False
+    resource_manager.mapping = MagicMock(cp_config={})
+    resource_manager.mapping.has_cp_helix.return_value = False
+    resource_manager.num_extra_kv_tokens = 0
+    resource_manager._active_sequence_owners = {}
+    resource_manager.get_connector_cache_indices = MagicMock(return_value=[17])
+    resource_manager.kv_connector_manager = MagicMock()
+    connector_manager = resource_manager.kv_connector_manager
+    connector_manager.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+
+    request = MagicMock(
+        py_request_id=42,
+        py_beam_width=1,
+        prompt_len=32,
+        py_draft_tokens=[],
+        is_first_context_chunk=True,
+        is_last_context_chunk=True,
+    )
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.append_context_request(request)
+    call_order = []
+    resource_manager.impl.flush_pending_persistence_retirements.side_effect = (
+        lambda: call_order.append("retire"))
+    connector_manager.register_persistence_identities_after_alloc.side_effect = (
+        lambda *_: call_order.append("register"))
+
+    resource_manager.prepare_resources(scheduled_batch)
+
+    assert call_order == ["retire", "register"]
+
+
 def test_persistence_staging_finishes_without_creating_a_completion_save():
     manager, worker, scheduler, _ = _make_persistence_staging_manager()
     worker.bind_persistence_lease_manager.assert_called_once_with(manager)
