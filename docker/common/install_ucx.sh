@@ -6,8 +6,14 @@ set -ex
 # for both the get and put schemes, and control-lane selection that avoids a
 # device whose lane has already failed. Without it a large KV transfer has no
 # failover-capable rendezvous protocol and falls back to eager.
+#
+# This bump also picks up the fix for a segfault seen in production: the put
+# scheme released the peer's remote key before the completion that decides
+# whether to restart, so a failover restart dereferenced it. Any build at or
+# before the previous pin admits put to failover without that fix and can
+# crash the worker on a rail failure mid-write.
 UCX_VERSION="master"
-UCX_COMMIT="7840331732594e1bd58ed22f7d03a414dd6a5078"
+UCX_COMMIT="30a2390dfbca3b90d55cca6d518016ee1b384b8f"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 UCX_REPO="https://github.com/basetenlabs/ucx.git"
