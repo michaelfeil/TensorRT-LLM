@@ -403,6 +403,19 @@ class KvCacheConnectorScheduler(ABC):
     def retire_persistence_identities(self, identities: List[Tuple[int, int]]) -> None:
         """Retire exact block-object residencies that can no longer produce a lease."""
 
+    def register_persistence_identities(
+        self,
+        request: LlmRequest,
+        block_object_ids: List[int],
+        external_sequence_hashes: List[int],
+    ) -> None:
+        """Register stable persistence identities before blocks can be evicted.
+
+        Secondary-pool persistence leases are published by ``refresh_blocks``.
+        Connectors with an independent canonical keyspace must override this
+        hook so a newly allocated residency is resolvable at that boundary.
+        """
+
     @abstractmethod
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """
@@ -1345,6 +1358,22 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]):
         if self.scheduler is not None:
             self.scheduler.update_state_after_alloc(req, block_ids)
+
+    def register_persistence_identities_after_alloc(
+        self, req: LlmRequest, kv_cache_manager: "KVCacheManager"
+    ) -> None:
+        """Register a new context allocation before ``refresh_blocks``.
+
+        Only the leader owns connector scheduler state. Other TP ranks return
+        without probing hashes, so this adds no replicated work or collective.
+        """
+        if self.scheduler is None or not self._uses_secondary_persistence_staging:
+            return
+        self.scheduler.register_persistence_identities(
+            req,
+            kv_cache_manager.get_cache_indices(req),
+            kv_cache_manager.commit_and_get_block_hashes(req),
+        )
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
         self._scheduler_output = scheduler_output

@@ -321,6 +321,32 @@ def _make_persistence_staging_manager():
     return manager, worker, scheduler, kv_cache_manager
 
 
+def test_persistence_staging_registers_context_identity_before_refresh():
+    manager, _, scheduler, kv_cache_manager = _make_persistence_staging_manager()
+    request = MagicMock(request_id=42)
+    kv_cache_manager.get_cache_indices.return_value = [17, 18]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = [101, 102]
+
+    manager.register_persistence_identities_after_alloc(request, kv_cache_manager)
+
+    scheduler.register_persistence_identities.assert_called_once_with(
+        request, [17, 18], [101, 102]
+    )
+
+
+def test_persistence_identity_registration_is_leader_only():
+    worker = MagicMock()
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+    worker.poll_globally_completed_persistence_leases.return_value = []
+    manager = KvCacheConnectorManager(worker, scheduler=None)
+    kv_cache_manager = MagicMock()
+
+    manager.register_persistence_identities_after_alloc(MagicMock(), kv_cache_manager)
+
+    kv_cache_manager.get_cache_indices.assert_not_called()
+    kv_cache_manager.commit_and_get_block_hashes.assert_not_called()
+
+
 def test_persistence_staging_finishes_without_creating_a_completion_save():
     manager, worker, scheduler, _ = _make_persistence_staging_manager()
     worker.bind_persistence_lease_manager.assert_called_once_with(manager)

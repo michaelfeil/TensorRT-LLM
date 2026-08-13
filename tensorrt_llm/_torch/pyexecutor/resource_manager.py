@@ -1090,6 +1090,12 @@ class KVCacheManager(BaseResourceManager):
                         block_ids = self.get_connector_cache_indices(req)
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
+                        # Native persistence can evict these blocks in the
+                        # refresh below. Register the new stable residency
+                        # while its TRT block-object identity is still live.
+                        self.kv_connector_manager.register_persistence_identities_after_alloc(
+                            req, self
+                        )
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
