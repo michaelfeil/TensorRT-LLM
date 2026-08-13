@@ -34,8 +34,14 @@ _UCX_RECOVERY_RETRIES_ENV = "UCX_RECOVERY_RETRIES"
 _DEFAULT_UCX_RECOVERY_RETRIES = "5"
 
 
-def _apply_default_ucxx_progress_mode() -> None:
-    """Default the UCXX progress thread to busy-polling with Python futures.
+def _apply_default_ucx_env_vars() -> None:
+    """Default the UCX/UCXX environment B10 depends on, before ucxx imports.
+
+    Every value here is a floor rather than a policy: each is applied with
+    setdefault, so a deployment that sets one keeps it. They cover the
+    progress thread, Python futures, and the two fault-tolerance settings
+    whose stock values do not suit a wire protocol built entirely on active
+    messages.
 
     The v1 C++ UCX transceiver runs startProgressThread(pollingMode=true);
     ucxx's Python default is the interrupt-driven "thread" mode, which adds
@@ -329,7 +335,7 @@ def _augment_ucx_net_devices_for_sockaddr() -> None:
 def _load_ucxx_module() -> Any:
     # ucxx reads its env configuration at import time, so the defaults must
     # land before its first import; keep this as the single import site.
-    _apply_default_ucxx_progress_mode()
+    _apply_default_ucx_env_vars()
     import ucxx
 
     return ucxx

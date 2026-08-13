@@ -831,11 +831,27 @@ def test_b10_bind_notifier_tolerates_module_without_core():
     _run_bind_notifier_on_loop(types.SimpleNamespace())
 
 
-def test_b10_defaults_enable_ucxx_python_futures(monkeypatch):
-    monkeypatch.delenv("UCXPY_ENABLE_PYTHON_FUTURE", raising=False)
-    monkeypatch.delenv("UCXPY_PROGRESS_MODE", raising=False)
+def _unset_b10_ucx_env(monkeypatch):
+    """Hand monkeypatch every variable the function touches.
 
-    b10_net._apply_default_ucxx_progress_mode()
+    _apply_default_ucx_env_vars() setdefaults the whole set, so a test that
+    tracks only the subset it asserts on leaves the rest set at teardown and
+    makes later tests depend on ordering.
+    """
+    for name in (
+        "UCXPY_PROGRESS_MODE",
+        "UCXPY_ENABLE_PYTHON_FUTURE",
+        "UCXX_ERROR_HANDLING_MODE",
+        "UCX_MAX_EAGER_RAILS",
+        "UCX_RECOVERY_RETRIES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_b10_defaults_enable_ucxx_python_futures(monkeypatch):
+    _unset_b10_ucx_env(monkeypatch)
+
+    b10_net._apply_default_ucx_env_vars()
 
     assert os.environ["UCXPY_PROGRESS_MODE"] == "thread-polling"
     assert os.environ["UCXPY_ENABLE_PYTHON_FUTURE"] == "1"
@@ -848,10 +864,9 @@ def test_b10_defaults_make_the_am_plane_survive_a_lane_failure(monkeypatch):
     infinite recovery rounds can never succeed while lane rebuild is an
     upstream stub - so a failure parks the endpoint instead of resolving it.
     """
-    monkeypatch.delenv("UCX_MAX_EAGER_RAILS", raising=False)
-    monkeypatch.delenv("UCX_RECOVERY_RETRIES", raising=False)
+    _unset_b10_ucx_env(monkeypatch)
 
-    b10_net._apply_default_ucxx_progress_mode()
+    b10_net._apply_default_ucx_env_vars()
 
     assert os.environ["UCX_MAX_EAGER_RAILS"] == "2"
     assert os.environ["UCX_RECOVERY_RETRIES"] == "5"
@@ -859,11 +874,12 @@ def test_b10_defaults_make_the_am_plane_survive_a_lane_failure(monkeypatch):
 
 def test_b10_defaults_never_override_a_deployment(monkeypatch):
     """Every default here is a floor, not a policy: deployments still win."""
+    _unset_b10_ucx_env(monkeypatch)
     monkeypatch.setenv("UCX_MAX_EAGER_RAILS", "4")
     monkeypatch.setenv("UCX_RECOVERY_RETRIES", "inf")
     monkeypatch.setenv("UCXX_ERROR_HANDLING_MODE", "peer")
 
-    b10_net._apply_default_ucxx_progress_mode()
+    b10_net._apply_default_ucx_env_vars()
 
     assert os.environ["UCX_MAX_EAGER_RAILS"] == "4"
     assert os.environ["UCX_RECOVERY_RETRIES"] == "inf"
