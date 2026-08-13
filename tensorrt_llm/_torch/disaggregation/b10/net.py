@@ -28,6 +28,10 @@ _UCXX_PYTHON_FUTURE_ENV = "UCXPY_ENABLE_PYTHON_FUTURE"
 _DEFAULT_UCXX_PROGRESS_MODE = "thread-polling"
 _UCXX_ERROR_HANDLING_MODE_ENV = "UCXX_ERROR_HANDLING_MODE"
 _DEFAULT_UCXX_ERROR_HANDLING_MODE = "failover"
+_UCX_MAX_EAGER_RAILS_ENV = "UCX_MAX_EAGER_RAILS"
+_DEFAULT_UCX_MAX_EAGER_RAILS = "2"
+_UCX_RECOVERY_RETRIES_ENV = "UCX_RECOVERY_RETRIES"
+_DEFAULT_UCX_RECOVERY_RETRIES = "5"
 
 
 def _apply_default_ucxx_progress_mode() -> None:
@@ -64,10 +68,42 @@ def _apply_default_ucxx_progress_mode() -> None:
     # failing the endpoint. Measured cost vs peer mode is ~2% at the current
     # stack ceiling. Both peers must agree only in the sense that each side's
     # own endpoints are failover-capable; deployments can force the previous
-    # behavior with UCXX_ERROR_HANDLING_MODE=peer. Rail striping/fragment
-    # tuning (UCX_MAX_EAGER_RAILS, UCX_RC_MLX5_SEG_SIZE) is hardware-specific
-    # and intentionally left to deployment config.
+    # behavior with UCXX_ERROR_HANDLING_MODE=peer. Fragment tuning
+    # (UCX_RC_MLX5_SEG_SIZE) is hardware-specific and intentionally left to
+    # deployment config.
     os.environ.setdefault(_UCXX_ERROR_HANDLING_MODE_ENV, _DEFAULT_UCXX_ERROR_HANDLING_MODE)
+    # Two eager rails, because B10 puts its entire wire protocol - control,
+    # READY, DATA, RESULT - on active messages, and UCX stripes eager traffic
+    # over MAX_EAGER_RAILS lanes with a default of 1. With a single AM lane,
+    # losing that lane's NIC leaves reconfiguration nothing to move to and it
+    # bails out ("AM lane not found after reconfiguration"), so the endpoint
+    # fails rather than failing over - the exact case the failover mode above
+    # exists to survive. Two is the minimum that makes an AM-lane death
+    # recoverable. This reads like the striping knob it shares a name with,
+    # but for the AM plane it is a fault-tolerance requirement, so it belongs
+    # with the code that depends on it rather than in deployment config.
+    os.environ.setdefault(_UCX_MAX_EAGER_RAILS_ENV, _DEFAULT_UCX_MAX_EAGER_RAILS)
+    # Recovery rounds have to be finite. UCX runs one round per keepalive
+    # interval and, once they are exhausted, either declares an endpoint with
+    # no live lanes dead or gives up on the failed lanes and lets normal
+    # keepalive resume - and a recovering endpoint has its keepalive
+    # suppressed until then. The upstream default of "inf" reaches neither
+    # outcome, and cannot: rebuilding a failed lane is still an unimplemented
+    # stub upstream (ucp_ep_recovery_prepare_lanes returns 0 unconditionally),
+    # so every round is futile by construction. Left at "inf" a single lane
+    # failure parks the endpoint in a permanent recovery loop with no liveness
+    # detection.
+    #
+    # Five rounds is ~100s at the 20s default keepalive interval. The bias is
+    # deliberately toward patience: giving up costs the whole endpoint, which
+    # b10 then has to rebuild while every transfer riding it dies, whereas
+    # waiting only defers that. Individual transfers do not depend on this
+    # window - they carry their own deadline and stop on their own - so a
+    # longer one buys a NIC flap or a switch reconvergence the chance to pass
+    # without taking the endpoint with it. The cost is that peer-death
+    # detection stays suppressed for that window, which is the reason this is
+    # a bounded number at all rather than "inf".
+    os.environ.setdefault(_UCX_RECOVERY_RETRIES_ENV, _DEFAULT_UCX_RECOVERY_RETRIES)
 
 
 def _bind_ucxx_python_future_notifier(ucxx_module: Any) -> None:

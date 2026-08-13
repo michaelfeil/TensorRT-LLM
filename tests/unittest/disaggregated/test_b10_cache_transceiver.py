@@ -841,6 +841,35 @@ def test_b10_defaults_enable_ucxx_python_futures(monkeypatch):
     assert os.environ["UCXPY_ENABLE_PYTHON_FUTURE"] == "1"
 
 
+def test_b10_defaults_make_the_am_plane_survive_a_lane_failure(monkeypatch):
+    """Both UCX defaults are wrong for an AM-only wire protocol.
+
+    One eager rail means an AM-lane death has nowhere to move to, and
+    infinite recovery rounds can never succeed while lane rebuild is an
+    upstream stub - so a failure parks the endpoint instead of resolving it.
+    """
+    monkeypatch.delenv("UCX_MAX_EAGER_RAILS", raising=False)
+    monkeypatch.delenv("UCX_RECOVERY_RETRIES", raising=False)
+
+    b10_net._apply_default_ucxx_progress_mode()
+
+    assert os.environ["UCX_MAX_EAGER_RAILS"] == "2"
+    assert os.environ["UCX_RECOVERY_RETRIES"] == "5"
+
+
+def test_b10_defaults_never_override_a_deployment(monkeypatch):
+    """Every default here is a floor, not a policy: deployments still win."""
+    monkeypatch.setenv("UCX_MAX_EAGER_RAILS", "4")
+    monkeypatch.setenv("UCX_RECOVERY_RETRIES", "inf")
+    monkeypatch.setenv("UCXX_ERROR_HANDLING_MODE", "peer")
+
+    b10_net._apply_default_ucxx_progress_mode()
+
+    assert os.environ["UCX_MAX_EAGER_RAILS"] == "4"
+    assert os.environ["UCX_RECOVERY_RETRIES"] == "inf"
+    assert os.environ["UCXX_ERROR_HANDLING_MODE"] == "peer"
+
+
 def test_b10_usage_manifest_exposes_public_runtime():
     manifest = json.loads(Path("tensorrt_llm/usage/llm_args_golden_manifest.json").read_text())
     runtime_entries = [
@@ -2552,8 +2581,8 @@ def test_b10_desc_view_from_arrays_matches_normalize_fallback():
 def test_b10_submit_side_channel_and_fallback_deliver_identical_views():
     agent = _make_uninitialized_b10_agent()
     captured = []
-    agent._send._submit_transfer_request = (
-        lambda request, src_descs, dst_descs: captured.append((src_descs, dst_descs)) or "status"
+    agent._send._submit_transfer_request = lambda request, src_descs, dst_descs: (
+        captured.append((src_descs, dst_descs)) or "status"
     )
 
     src_ptrs = np.array([4096, 8192, 12288], dtype=np.int64)
