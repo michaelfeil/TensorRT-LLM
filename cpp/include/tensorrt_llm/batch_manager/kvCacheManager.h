@@ -507,6 +507,15 @@ public:
 
     size_t getHash() const;
 
+    //! \brief Record the exact framework hash exposed to connector persistence for this physical residency.
+    void setPersistenceIdentityHash(executor::IdType hash);
+
+    //! \brief Consume the connector-persistence identity before this physical block is reclaimed.
+    [[nodiscard]] std::optional<executor::IdType> takePersistenceIdentityHash();
+
+    //! \brief Clear connector-persistence identity state after terminal lease cleanup.
+    void clearPersistenceIdentityHash();
+
     std::vector<MmKey> getExtraKeys() const;
 
 private:
@@ -557,6 +566,8 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
+    // Exact framework hash most recently exposed to connector persistence for this physical residency.
+    std::optional<executor::IdType> mPersistenceIdentityHash;
 };
 
 class GenerationRequest

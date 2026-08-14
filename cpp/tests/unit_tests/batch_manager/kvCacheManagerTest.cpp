@@ -10235,6 +10235,7 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingLeaseLife
             requestId, /*maxNewTokens=*/0, inputTokens, samplingConfig, /*isStreaming=*/false);
         mgr->addSequenceBatch(
             {{{requestId, static_cast<SizeType32>(inputTokens->size()), /*beamWidth=*/1}}}, {std::ref(*request)});
+        EXPECT_EQ(mgr->commitAndGetBlockHashesForRequest(*request, windowSize).size(), 1);
         tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
         mgr->storeContextBlocks(*request);
         (void) mgr->removeSequence(requestId, request);
@@ -10341,15 +10342,20 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
         KvCacheRetentionConfig::kDefaultRetentionPriority));
     mgr->addSequenceBatch(
         {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
+    auto const exposedHashes = mgr->commitAndGetBlockHashesForRequest(*cachedRequest, theOnlyWindowSize(*mgr));
+    ASSERT_EQ(exposedHashes.size(), 1);
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
     mgr->storeContextBlocks(*cachedRequest);
     auto const windowSize = theOnlyWindowSize(*mgr);
     auto const& cachedBlockIds = mgr->getCacheBlockIds(1, windowSize).at(0);
     ASSERT_FALSE(cachedBlockIds.empty());
     auto const expectedRetiredBlockId = cachedBlockIds.front();
-    auto const expectedRetiredBlockHash
-        = mgr->getBlockManager().getBlockById(expectedRetiredBlockId, windowSize)->getHash();
+    auto const expectedRetiredBlockHash = exposedHashes.front();
     (void) mgr->removeSequence(1, cachedRequest);
+    // The connector identity is the hash exposed above, not later mutable block metadata.
+    mgr->getBlockManager()
+        .getBlockById(expectedRetiredBlockId, windowSize)
+        ->setHash(static_cast<std::size_t>(expectedRetiredBlockHash) ^ 1);
 
     // Consume both primary blocks so eviction reaches the reusable priority-0
     // block. Connector staging must honor the native offload threshold and
@@ -10372,6 +10378,101 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingPreserves
 
     mgr->refreshBlocks();
     EXPECT_EQ(connector->getRetiredPersistenceIdentities().size(), 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
+    (void) mgr->removeSequence(2, activeRequest);
+}
+
+TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingRetiresDuplicateResidency)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(
+        /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/4,
+        /*blocksInSecondaryPool=*/1, /*enablePartialReuse=*/false);
+    tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
+
+    // Allocate the same prefix concurrently so both requests materialize it in distinct physical blocks.
+    // The first completion owns the trie slot; the second residency is released without a lookup-tree node.
+    auto const tokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5});
+    auto request1 = std::make_shared<LlmRequest>(
+        /*requestId=*/1, /*maxNewTokens=*/0, tokens, samplingConfig, /*isStreaming=*/false);
+    auto request2 = std::make_shared<LlmRequest>(
+        /*requestId=*/2, /*maxNewTokens=*/0, tokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch({{{1, static_cast<SizeType32>(tokens->size()), /*beamWidth=*/1},
+                              {2, static_cast<SizeType32>(tokens->size()), /*beamWidth=*/1}}},
+        {std::ref(*request1), std::ref(*request2)});
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    auto const request1Hashes = mgr->commitAndGetBlockHashesForRequest(*request1, windowSize);
+    auto const request2Hashes = mgr->commitAndGetBlockHashesForRequest(*request2, windowSize);
+    ASSERT_EQ(request1Hashes.size(), 1);
+    ASSERT_EQ(request2Hashes.size(), 1);
+    EXPECT_EQ(request1Hashes, request2Hashes);
+    auto const duplicateBlockId = mgr->getCacheBlockIds(2, windowSize).at(0).front();
+    auto const duplicateBlockHash = request2Hashes.front();
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request1);
+    (void) mgr->removeSequence(1, request1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request2);
+    (void) mgr->removeSequence(2, request2);
+    EXPECT_EQ(mgr->getBlockManager().getBlockById(duplicateBlockId, windowSize)->getLookupNode(), nullptr);
+
+    // Reclaim both primary blocks. The trie-owned residency may be leased, but the duplicate cannot be; it must be
+    // explicitly retired before its physical block object receives a different persistence identity.
+    auto activeTokens
+        = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26});
+    auto activeRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/3, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{3, static_cast<SizeType32>(activeTokens->size()), /*beamWidth=*/1}}}, {std::ref(*activeRequest)});
+    auto const& activeBlockIds = mgr->getCacheBlockIds(3, windowSize).at(0);
+    ASSERT_EQ(activeBlockIds.size(), 4);
+    EXPECT_NE(std::find(activeBlockIds.begin(), activeBlockIds.end(), duplicateBlockId), activeBlockIds.end());
+    mgr->flushPendingPersistenceRetirements();
+
+    auto const& retirements = connector->getRetiredPersistenceIdentities();
+    EXPECT_NE(std::find(retirements.begin(), retirements.end(),
+                  std::make_pair(
+                      static_cast<SizeType32>(duplicateBlockId), static_cast<executor::IdType>(duplicateBlockHash))),
+        retirements.end());
+
+    mgr->refreshBlocks();
+    ASSERT_EQ(connector->getPersistenceLeases().size(), 1);
+    mgr->completePersistenceLeases({connector->getPersistenceLeases().front().leaseId});
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
+    (void) mgr->removeSequence(3, activeRequest);
+}
+
+TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingSkipsUnexposedFullResidency)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(
+        /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2,
+        /*blocksInSecondaryPool=*/1, /*enablePartialReuse=*/false);
+    tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
+
+    auto cachedTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5});
+    auto cachedRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/1, /*maxNewTokens=*/0, cachedTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
+    (void) mgr->removeSequence(1, cachedRequest);
+
+    // A cancellation can release a just-filled block before its hash reaches connector metadata. Fullness alone does
+    // not prove that an external persistence identity exists, so reclaiming it must not produce an unknown callback.
+    auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
+    auto activeRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/2, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{2, static_cast<SizeType32>(activeTokens->size()), /*beamWidth=*/1}}}, {std::ref(*activeRequest)});
+    mgr->refreshBlocks();
+
+    EXPECT_TRUE(connector->getPersistenceLeases().empty());
+    EXPECT_TRUE(connector->getRetiredPersistenceIdentities().empty());
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
     (void) mgr->removeSequence(2, activeRequest);
@@ -10420,6 +10521,47 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingSkipsPart
     (void) mgr->removeSequence(2, activeRequest);
 }
 
+TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingRetiresExposedPartialResidency)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(
+        /*numNewMatchedTokens=*/0, /*usesSecondaryStaging=*/true);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector, /*blocksInPrimaryPool=*/2,
+        /*blocksInSecondaryPool=*/1, /*enablePartialReuse=*/false);
+    tr::SamplingConfig const samplingConfig{/*beamWidth=*/1};
+
+    // Allocation exposes a full four-token identity before prefill. Request completion then proves that only three KV
+    // states were materialized, turning the cached tail partial without erasing the connector's existing binding.
+    auto cachedTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4});
+    auto cachedRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/1, /*maxNewTokens=*/0, cachedTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    auto const exposedHashes = mgr->commitAndGetBlockHashesForRequest(*cachedRequest, windowSize);
+    ASSERT_EQ(exposedHashes.size(), 1);
+    auto const cachedBlockId = mgr->getCacheBlockIds(1, windowSize).at(0).front();
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
+    (void) mgr->removeSequence(1, cachedRequest);
+    ASSERT_FALSE(mgr->getBlockManager().getBlockById(cachedBlockId, windowSize)->isFull());
+
+    auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
+    auto activeRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/2, /*maxNewTokens=*/0, activeTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch(
+        {{{2, static_cast<SizeType32>(activeTokens->size()), /*beamWidth=*/1}}}, {std::ref(*activeRequest)});
+    mgr->refreshBlocks();
+
+    EXPECT_TRUE(connector->getPersistenceLeases().empty());
+    ASSERT_EQ(connector->getRetiredPersistenceIdentities().size(), 1);
+    EXPECT_EQ(connector->getRetiredPersistenceIdentities().front(),
+        std::make_pair(static_cast<SizeType32>(cachedBlockId), exposedHashes.front()));
+    EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);
+    (void) mgr->removeSequence(2, activeRequest);
+}
+
 TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingForcesDramTransfer)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -10434,8 +10576,16 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingForcesDra
         /*requestId=*/1, /*maxNewTokens=*/0, cachedTokens, samplingConfig, /*isStreaming=*/false);
     mgr->addSequenceBatch(
         {{{1, static_cast<SizeType32>(cachedTokens->size()), /*beamWidth=*/1}}}, {std::ref(*cachedRequest)});
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    auto const exposedHashes = mgr->commitAndGetBlockHashesForRequest(*cachedRequest, windowSize);
+    ASSERT_EQ(exposedHashes.size(), 1);
+    auto const cachedBlockId = mgr->getCacheBlockIds(1, windowSize).at(0).front();
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*cachedRequest);
     (void) mgr->removeSequence(1, cachedRequest);
+    // Persistence descriptors must preserve the identity the connector saw, even if mutable block metadata drifts.
+    mgr->getBlockManager()
+        .getBlockById(cachedBlockId, windowSize)
+        ->setHash(static_cast<std::size_t>(exposedHashes.front()) ^ 1);
 
     auto activeTokens = std::make_shared<VecTokens>(VecTokens{11, 12, 13, 14, 15, 16, 17, 18});
     auto activeRequest = std::make_shared<LlmRequest>(
@@ -10448,6 +10598,8 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingForcesDra
     mgr->refreshBlocks();
 
     ASSERT_EQ(connector->getPersistenceLeases().size(), 1);
+    EXPECT_EQ(connector->getPersistenceLeases().front().sourceBlockId, cachedBlockId);
+    EXPECT_EQ(connector->getPersistenceLeases().front().blockHash, exposedHashes.front());
     EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 0);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*activeRequest);

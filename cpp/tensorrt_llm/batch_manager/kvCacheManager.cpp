@@ -394,6 +394,21 @@ size_t KVCacheBlock::getHash() const
     return mHash;
 }
 
+void KVCacheBlock::setPersistenceIdentityHash(executor::IdType hash)
+{
+    mPersistenceIdentityHash = hash;
+}
+
+std::optional<executor::IdType> KVCacheBlock::takePersistenceIdentityHash()
+{
+    return std::exchange(mPersistenceIdentityHash, std::nullopt);
+}
+
+void KVCacheBlock::clearPersistenceIdentityHash()
+{
+    mPersistenceIdentityHash.reset();
+}
+
 VecUniqueTokens const& KVCacheBlock::getUniqueTokens() const
 {
     return mBlockKey.uniqueTokens;
@@ -1369,6 +1384,7 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
 {
     // eviction policy get free primary block
     auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel, wantPlaceholder);
+    auto const persistenceIdentityHash = block->takePersistenceIdentityHash();
     bool isRegisteredForReuse{false};
     {
         std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
@@ -1379,9 +1395,10 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
-    auto const hasExternalPersistenceIdentity = !mUseSecondaryKvPoolAsPersistenceStaging || block->isFull();
-    auto const discardedPersistenceIdentity = mUseSecondaryKvPoolAsPersistenceStaging && isRegisteredForReuse
-        && block->isFull() && !block->getUniqueTokens().empty();
+    auto const hasExternalPersistenceIdentity = !mUseSecondaryKvPoolAsPersistenceStaging
+        || (persistenceIdentityHash.has_value() && block->isFull() && !block->getUniqueTokens().empty());
+    auto const discardedPersistenceIdentity
+        = mUseSecondaryKvPoolAsPersistenceStaging && persistenceIdentityHash.has_value();
     // Offloading is an option only when these conditions are met:
     // 1. Block is registered for reuse and contains state. Connector persistence also requires a full block because
     //    external cache keys identify complete pages; native host offload can still retain partial tails.
@@ -1434,7 +1451,7 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
                 inserted, "Persistence lease ID %llu already exists.", static_cast<unsigned long long>(leaseId));
             (void) leaseIt;
             mUnreportedPersistenceLeases.emplace_back(kv_connector::KvCachePersistenceLease{leaseId,
-                static_cast<executor::IdType>(block->getHash()), static_cast<SizeType32>(block->getBlockId()),
+                *persistenceIdentityHash, static_cast<SizeType32>(block->getBlockId()),
                 static_cast<SizeType32>(block->getMemoryPoolBlockIndex()), block->getPriority()});
         }
         else
@@ -1449,10 +1466,11 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     }
     else if (discardedPersistenceIdentity)
     {
-        // No lease can be created for this residency after getFreeBlock reclaims it. Snapshot its exact identity so
-        // refreshBlocks can retire reclaimed residencies in one callback before this iteration publishes new hashes.
+        // No lease can be created for this residency after getFreeBlock reclaims it. This also covers duplicate
+        // physical blocks that storeBlocks did not attach to an already-populated trie slot. Retire the exact hash
+        // exposed to the connector before this iteration publishes a new identity for the same physical block.
         mUnreportedPersistenceRetirements.emplace_back(
-            static_cast<SizeType32>(block->getBlockId()), static_cast<executor::IdType>(block->getHash()));
+            static_cast<SizeType32>(block->getBlockId()), *persistenceIdentityHash);
     }
 
     // True priority eviction: detach ONLY this block from the lookup tree.
@@ -1501,6 +1519,7 @@ void WindowBlockManager::completePersistenceLeases(std::vector<std::uint64_t> co
         block->setBlockKey(BlockKey{}, false);
         block->setPrevBlockInSeq(nullptr);
         block->setHash(0);
+        block->clearPersistenceIdentityHash();
         block->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
         block->setDurationMs(std::nullopt);
         block->setExpirationTime(std::nullopt);
@@ -4883,7 +4902,9 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
             // predecessor (if any) has already been committed and exposes a stable hash.
             block->setHash();
         }
-        hashes.push_back(static_cast<executor::IdType>(block->getHash()));
+        auto const hash = static_cast<executor::IdType>(block->getHash());
+        hashes.push_back(hash);
+        block->setPersistenceIdentityHash(hash);
     }
     return hashes;
 }

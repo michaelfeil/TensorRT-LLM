@@ -990,7 +990,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if load_kv_async:
             self.new_async_requests.loading[request.request_id] = request
 
-        if self.scheduler is not None:
+        if self.scheduler is not None or self._uses_secondary_persistence_staging:
             self.scheduler_output_manager.record_new_matched_tokens(request, num_tokens)
 
         request.py_num_connector_matched_tokens = num_tokens
@@ -1029,10 +1029,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             return
 
         self._metadata_pending = True
-        if self.scheduler is not None:
-            self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
+        if self.scheduler is not None or self._uses_secondary_persistence_staging:
+            scheduler_output = self.scheduler_output_manager.build_scheduler_output(
                 scheduled_batch, self.new_async_requests, kv_cache_manager
             )
+            if self.scheduler is not None:
+                self._scheduler_output = scheduler_output
 
     def _can_skip_metadata_exchange(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
@@ -1128,10 +1130,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         rewind_crossed_worker_boundary = worker_visible_progress != progress
         self._force_metadata_exchange |= rewind_crossed_worker_boundary
         self._metadata_exchange_progress[req.request_id] = progress
-        if self.scheduler is not None:
+        scheduler_live_block_ids = None
+        if self.scheduler is not None or self._uses_secondary_persistence_staging:
             scheduler_live_block_ids = self.scheduler_output_manager.on_rewind(
                 req, live_block_ids, live_block_object_ids, num_tokens
             )
+        if self.scheduler is not None:
             self.scheduler.on_rewind(
                 req,
                 live_block_ids if scheduler_live_block_ids is None else scheduler_live_block_ids,
@@ -1364,16 +1368,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     ) -> None:
         """Register a new context allocation before ``refresh_blocks``.
 
-        Only the leader owns connector scheduler state. Other TP ranks return
-        without probing hashes, so this adds no replicated work or collective.
+        Every TP rank records the same physical-block identity locally so
+        future persistence leases remain rank-consistent. Only the leader
+        forwards the identity mapping into connector scheduler state.
         """
-        if self.scheduler is None or not self._uses_secondary_persistence_staging:
+        if not self._uses_secondary_persistence_staging:
             return
-        self.scheduler.register_persistence_identities(
-            req,
-            kv_cache_manager.get_cache_indices(req),
-            kv_cache_manager.commit_and_get_block_hashes(req),
-        )
+        block_object_ids = kv_cache_manager.get_cache_indices(req)
+        block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+        if self.scheduler is not None:
+            self.scheduler.register_persistence_identities(
+                req,
+                block_object_ids,
+                block_hashes,
+            )
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
         self._scheduler_output = scheduler_output

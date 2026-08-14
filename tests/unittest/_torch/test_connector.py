@@ -334,17 +334,21 @@ def test_persistence_staging_registers_context_identity_before_refresh():
     )
 
 
-def test_persistence_identity_registration_is_leader_only():
+def test_persistence_identity_registration_marks_nonleader_blocks():
     worker = MagicMock()
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
     worker.poll_globally_completed_persistence_leases.return_value = []
-    manager = KvCacheConnectorManager(worker, scheduler=None)
+    with patch.object(kv_cache_connector, "mpi_rank", return_value=1):
+        manager = KvCacheConnectorManager(worker, scheduler=None)
     kv_cache_manager = MagicMock()
+    request = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [17, 18]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = [101, 102]
 
-    manager.register_persistence_identities_after_alloc(MagicMock(), kv_cache_manager)
+    manager.register_persistence_identities_after_alloc(request, kv_cache_manager)
 
-    kv_cache_manager.get_cache_indices.assert_not_called()
-    kv_cache_manager.commit_and_get_block_hashes.assert_not_called()
+    kv_cache_manager.get_cache_indices.assert_called_once_with(request)
+    kv_cache_manager.commit_and_get_block_hashes.assert_called_once_with(request)
 
 
 def test_persistence_staging_retires_reclaimed_identity_before_registration():
@@ -793,6 +797,81 @@ def _make_generation_batch(num_tokens: int):
     scheduled_batch = ScheduledRequests()
     scheduled_batch.generation_requests = [req]
     return req, scheduled_batch
+
+
+def test_persistence_staging_nonleader_marks_exact_decode_boundaries():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+    with patch.object(kv_cache_connector, "mpi_rank", return_value=1):
+        manager = KvCacheConnectorManager(worker, scheduler=None)
+    req, scheduled_batch = _make_generation_batch(31)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.side_effect = [[10], [10, 11]]
+    kv_cache_manager.get_connector_cache_indices.side_effect = [[10], [10, 11]]
+    kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 1
+
+    # Token 32 is sampled but not computed, so peers must not expose the block before the leader does.
+    req.get_num_tokens.return_value = 32
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 1
+
+    # Token 33 proves the full block exists. The peer records the same local identity while retaining no leader output.
+    req.get_num_tokens.return_value = 33
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
+    assert manager._scheduler_output is None
+
+
+def test_persistence_staging_nonleader_rewind_trims_local_state():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+    with patch.object(kv_cache_connector, "mpi_rank", return_value=1):
+        manager = KvCacheConnectorManager(worker, scheduler=None)
+    req, scheduled_batch = _make_generation_batch(33)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = [12345]
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    request_state = manager.scheduler_output_manager.requests[req.request_id]
+    assert request_state.block_ids == [10, 11]
+    assert len(request_state.tokens) == 33
+
+    req.get_num_tokens.return_value = 31
+    req.get_tokens.return_value = list(range(31))
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+    manager.on_rewind(req, kv_cache_manager)
+
+    assert request_state.block_ids == [10]
+    assert request_state.block_object_ids == [10]
+    assert request_state.tokens == list(range(31))
+
+
+def test_persistence_staging_nonleader_records_external_loads():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+    worker.can_skip_scheduler_match.return_value = False
+    with patch.object(kv_cache_connector, "mpi_rank", return_value=1):
+        manager = KvCacheConnectorManager(worker, scheduler=None)
+    req = MagicMock()
+    req.request_id = 42
+    req.is_generation_only_request = False
+    req.multimodal_positions = []
+    req.get_num_tokens.return_value = 128
+
+    with patch.object(
+        kv_cache_connector, "mpi_broadcast", return_value=(64, False)
+    ):
+        assert manager.get_num_new_matched_tokens(req, 0) == 64
+
+    assert manager.scheduler_output_manager.external_loads == {42: 64}
 
 
 def test_sparse_metadata_updates_defer_state_and_worker_hooks_until_boundary():
