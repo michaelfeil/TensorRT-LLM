@@ -653,7 +653,8 @@ def test_persistence_staging_rejects_rank_divergence():
 
 
 def test_persistence_staging_releases_rank_tail_when_leader_is_empty():
-    manager, _, scheduler, _ = _make_persistence_staging_manager()
+    manager, worker, scheduler, kv_cache_manager = (
+        _make_persistence_staging_manager())
     manager._scheduler_output = "scheduler-output"
     manager._metadata_pending = True
     scheduler.build_connector_meta.return_value = b"metadata"
@@ -670,10 +671,19 @@ def test_persistence_staging_releases_rank_tail_when_leader_is_empty():
 
     allgather.assert_called_once_with([])
     assert manager._resolved_persistence_keys is None
+    assert manager._persistence_tail_discard_pending
+    manager._synchronize_persistence_discard = MagicMock()
+
+    manager.submit_pending_persistence_leases(MagicMock())
+
+    manager._synchronize_persistence_discard.assert_called_once()
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+    worker.submit_pending_persistence_leases.assert_not_called()
+    assert not manager._persistence_tail_discard_pending
 
 
 def test_persistence_staging_converges_to_common_logical_prefix():
-    manager, _, scheduler, kv_cache_manager = (
+    manager, worker, scheduler, kv_cache_manager = (
         _make_persistence_staging_manager())
     leases = [
         _persistence_lease(lease_id=7, source_block_id=17, block_hash=101),
@@ -704,9 +714,21 @@ def test_persistence_staging_converges_to_common_logical_prefix():
 
     assert manager.get_resolved_pending_persistence_leases() == ([leases[0]],
                                                                   [201])
-    kv_cache_manager.complete_persistence_leases.assert_called_once_with([8])
+    assert manager._pending_persistence_tail_to_discard == [leases[1]]
+    assert manager._persistence_tail_discard_pending
+    assert manager._outstanding_persistence_lease_ids == {7, 8}
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
     scheduler.retire_persistence_identities.assert_called_once_with([(18, 102)])
+    manager._synchronize_persistence_discard = MagicMock()
+    worker.submit_pending_persistence_leases.side_effect = (
+        lambda _: manager.mark_persistence_leases_submitted([7]))
+
+    manager.submit_pending_persistence_leases(MagicMock())
+
+    manager._synchronize_persistence_discard.assert_called_once()
+    kv_cache_manager.complete_persistence_leases.assert_called_once_with([8])
     assert manager._outstanding_persistence_lease_ids == {7}
+    assert not manager._persistence_tail_discard_pending
 
 
 def test_persistence_staging_accepts_rank_local_lease_ids():

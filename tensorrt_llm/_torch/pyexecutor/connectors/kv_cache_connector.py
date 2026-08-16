@@ -878,6 +878,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._generation_progress_fast_path_armed = False
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
         self._pending_persistence_leases: List[KvCachePersistenceLease] = []
+        self._pending_persistence_tail_to_discard: List[
+            KvCachePersistenceLease
+        ] = []
+        self._persistence_tail_discard_pending = False
         self._resolved_persistence_keys: Optional[List[int]] = None
         self._persistence_resolution_error: Optional[Tuple[str, str]] = None
         self._outstanding_persistence_lease_ids: Set[int] = set()
@@ -893,7 +897,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         """Receive one scheduler iteration's staged blocks from C++."""
         if not leases:
             return
-        if self._pending_persistence_leases:
+        if self._pending_persistence_leases or self._persistence_tail_discard_pending:
             raise RuntimeError("Cannot add persistence leases while a batch is awaiting submission")
         lease_ids = [lease.lease_id for lease in leases]
         unique_lease_ids = set(lease_ids)
@@ -983,12 +987,48 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         """Return whether native D2H produced leases awaiting publication."""
         return bool(self._pending_persistence_leases)
 
+    def _synchronize_persistence_discard(self, stream: torch.cuda.Stream) -> None:
+        """Prove every rank's native D2H is safe before releasing staged blocks."""
+        try:
+            d2h_complete = torch.cuda.Event()
+            d2h_complete.record(stream)
+            d2h_complete.synchronize()
+            local_d2h_ready = (True, None)
+        except BaseException as error:
+            local_d2h_ready = (False, f"{type(error).__name__}: {error}")
+        rank_d2h_readiness = mpi_allgather(local_d2h_ready)
+        if not all(ready for ready, _ in rank_d2h_readiness):
+            raise RuntimeError(
+                "Cannot discard persistence leases before every rank's D2H copy is safe: "
+                f"{rank_d2h_readiness}"
+            )
+
+    def _discard_persistence_lease_tail(self) -> None:
+        if not self._persistence_tail_discard_pending:
+            raise RuntimeError("No persistence lease tail is pending discard")
+        tail_ids = [
+            int(lease.lease_id)
+            for lease in self._pending_persistence_tail_to_discard
+        ]
+        unknown_tail_ids = set(tail_ids) - self._outstanding_persistence_lease_ids
+        if unknown_tail_ids:
+            raise RuntimeError(
+                f"Cannot discard unknown persistence lease IDs: {sorted(unknown_tail_ids)}"
+            )
+        if tail_ids:
+            self.complete_persistence_leases(tail_ids)
+            self._outstanding_persistence_lease_ids.difference_update(tail_ids)
+        self._pending_persistence_tail_to_discard = []
+        self._persistence_tail_discard_pending = False
+
     def submit_pending_persistence_leases(self, stream: torch.cuda.Stream) -> None:
         """Submit the full D2H-ready batch before forward without CPU waiting."""
-        if (
-            not self._uses_secondary_persistence_staging
-            or not self.has_pending_persistence_leases()
-        ):
+        if not self._uses_secondary_persistence_staging:
+            return
+        if self._persistence_tail_discard_pending:
+            self._synchronize_persistence_discard(stream)
+            self._discard_persistence_lease_tail()
+        if not self.has_pending_persistence_leases():
             return
         self.worker.submit_pending_persistence_leases(stream)
         if self.has_pending_persistence_leases():
@@ -1049,20 +1089,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             )
 
         local_tail = self._pending_persistence_leases[common_count:]
-        if local_tail:
-            local_tail_ids = [int(lease.lease_id) for lease in local_tail]
-            if self.scheduler is not None:
-                self.scheduler.retire_persistence_identities(
-                    [
-                        (int(lease.source_block_id), int(lease.block_hash))
-                        for lease in local_tail
-                    ]
-                )
-            self.complete_persistence_leases(local_tail_ids)
-            self._outstanding_persistence_lease_ids.difference_update(local_tail_ids)
-            self._pending_persistence_leases = self._pending_persistence_leases[
-                :common_count
-            ]
+        if self.scheduler is not None and local_tail:
+            self.scheduler.retire_persistence_identities(
+                [
+                    (int(lease.source_block_id), int(lease.block_hash))
+                    for lease in local_tail
+                ]
+            )
+        self._pending_persistence_tail_to_discard = list(local_tail)
+        self._persistence_tail_discard_pending = any(
+            len(descriptors) != common_count for descriptors in rank_descriptors
+        )
+        self._pending_persistence_leases = self._pending_persistence_leases[
+            :common_count
+        ]
 
         self._resolved_persistence_keys = [
             int(key) for key in persistence_keys[:common_count]
