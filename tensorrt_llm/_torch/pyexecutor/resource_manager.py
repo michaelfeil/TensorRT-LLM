@@ -1392,13 +1392,14 @@ class KVCacheManager(BaseResourceManager):
                     connector_rewind_required = True
                 if should_notify_connector:
                     computed_tokens = max(request.get_num_tokens(0) - 1, 0)
-                    generated_tokens = (
-                        1 + request.py_num_accepted_draft_tokens)
+                    generated_tokens = (1 +
+                                        request.py_num_accepted_draft_tokens)
                     previous_computed_tokens = max(
                         computed_tokens - generated_tokens, 0)
-                    crossed_block_boundary = (
-                        computed_tokens // self.tokens_per_block !=
-                        previous_computed_tokens // self.tokens_per_block)
+                    crossed_block_boundary = (computed_tokens //
+                                              self.tokens_per_block
+                                              != previous_computed_tokens //
+                                              self.tokens_per_block)
                     if connector_rewind_required or crossed_block_boundary:
                         self.kv_connector_manager.record_generation_progress(
                             request, self, connector_rewind_required,
@@ -1747,6 +1748,27 @@ class KVCacheManager(BaseResourceManager):
         return list(
             self.impl.commit_and_get_block_hashes_for_request(
                 request, window_size))
+
+    def supports_incremental_persistence_identities(self) -> bool:
+        """Return whether the loaded C++ cache manager exposes ranged hashes."""
+        return hasattr(self.impl,
+                       "commit_and_get_block_hashes_for_request_range")
+
+    def commit_and_get_block_hashes_range(
+            self,
+            request: LlmRequest,
+            first_block_index: int,
+            window_size: Optional[int] = None) -> List[int]:
+        """Commit completed blocks and return hashes from a block index."""
+        if first_block_index < 0:
+            raise ValueError("first_block_index must be non-negative")
+        if window_size is None:
+            if self.is_vswa:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+        return list(
+            self.impl.commit_and_get_block_hashes_for_request_range(
+                request, window_size, first_block_index))
 
     def get_all_cache_indices(self, request: LlmRequest) -> List[int]:
         block_ids: List[int] = []

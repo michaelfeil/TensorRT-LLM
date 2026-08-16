@@ -4620,6 +4620,10 @@ TEST_F(KVCacheManagerTest, CommitAndGetBlockHashesForRequest)
     auto expected = expectedChain(*llmRequest);
     ASSERT_EQ(expected.size(), 2u);
     EXPECT_EQ(hashes, expected);
+    EXPECT_EQ(kvCacheManager.commitAndGetBlockHashesForRequestRange(*llmRequest, maxAttentionWindow, 1),
+        (std::vector<tle::IdType>{expected.back()}));
+    EXPECT_THROW(
+        kvCacheManager.commitAndGetBlockHashesForRequestRange(*llmRequest, maxAttentionWindow, 3), tc::TllmException);
     // The first block's hash is unchanged from the context-only call (front-running only appends).
     EXPECT_EQ(hashes.front(), contextHashes.front());
 

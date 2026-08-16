@@ -4863,6 +4863,12 @@ std::vector<std::vector<SizeType32>> KVCacheManager::getCacheBlockPoolIndices(
 std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
     LlmRequest const& llmRequest, SizeType32 windowSize)
 {
+    return commitAndGetBlockHashesForRequestRange(llmRequest, windowSize, /*firstBlockIndex=*/0);
+}
+
+std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequestRange(
+    LlmRequest const& llmRequest, SizeType32 windowSize, SizeType32 firstBlockIndex)
+{
     constexpr SizeType32 beamIdx = 0;
     TLLM_CHECK_WITH_INFO(
         llmRequest.getTokens().size() == 1, "commitAndGetBlockHashesForRequest only supports beam width 1.");
@@ -4898,6 +4904,9 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
     // The allocator may have allocated a (partial) trailing block; clip to whichever count is
     // smaller so we never index past either side.
     auto const limit = std::min(numFullTokenBlocks, numAllocatedBlocks);
+    TLLM_CHECK_WITH_INFO(firstBlockIndex >= 0 && firstBlockIndex <= limit,
+        "commitAndGetBlockHashesForRequest first block index %d is outside [0, %d] (request %lu).", firstBlockIndex,
+        limit, static_cast<unsigned long>(llmRequest.mRequestId));
     if (limit == 0)
     {
         return {};
@@ -4908,8 +4917,8 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
     auto const cacheSalt = llmRequest.getCacheSalt();
 
     std::vector<executor::IdType> hashes;
-    hashes.reserve(static_cast<size_t>(limit));
-    for (SizeType32 b = 0; b < limit; ++b)
+    hashes.reserve(static_cast<size_t>(limit - firstBlockIndex));
+    for (SizeType32 b = firstBlockIndex; b < limit; ++b)
     {
         auto block = mBlockManager.getBlockById(blockIds[b], windowSize);
         TLLM_CHECK_WITH_INFO(block != nullptr,

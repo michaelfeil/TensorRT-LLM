@@ -327,16 +327,17 @@ def _make_persistence_staging_manager():
 
 
 def test_persistence_staging_registers_context_identity_before_refresh():
-    manager, _, scheduler, kv_cache_manager = _make_persistence_staging_manager()
+    manager, _, scheduler, kv_cache_manager = _make_persistence_staging_manager(
+    )
     request = MagicMock(request_id=42)
     kv_cache_manager.get_cache_indices.return_value = [17, 18]
     kv_cache_manager.commit_and_get_block_hashes.return_value = [101, 102]
 
-    manager.register_persistence_identities_after_alloc(request, kv_cache_manager)
+    manager.register_persistence_identities_after_alloc(request,
+                                                        kv_cache_manager)
 
     scheduler.register_persistence_identities.assert_called_once_with(
-        request, [17, 18], [101, 102]
-    )
+        request, [17, 18], [101, 102])
 
 
 def test_persistence_identity_registration_marks_nonleader_blocks():
@@ -350,10 +351,12 @@ def test_persistence_identity_registration_marks_nonleader_blocks():
     kv_cache_manager.get_cache_indices.return_value = [17, 18]
     kv_cache_manager.commit_and_get_block_hashes.return_value = [101, 102]
 
-    manager.register_persistence_identities_after_alloc(request, kv_cache_manager)
+    manager.register_persistence_identities_after_alloc(request,
+                                                        kv_cache_manager)
 
     kv_cache_manager.get_cache_indices.assert_called_once_with(request)
-    kv_cache_manager.commit_and_get_block_hashes.assert_called_once_with(request)
+    kv_cache_manager.commit_and_get_block_hashes.assert_called_once_with(
+        request)
 
 
 def test_persistence_staging_retires_reclaimed_identity_before_registration():
@@ -534,9 +537,9 @@ def test_state_only_connector_update_skips_worker_bind_and_hooks():
     manager._metadata_pending = True
 
     with patch.object(
-        kv_cache_connector,
-        "mpi_broadcast",
-        side_effect=lambda value, root: value,
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
     ):
         manager.handle_metadata()
 
@@ -560,13 +563,13 @@ def test_state_only_connector_update_broadcasts_persistence_keys():
     descriptors = manager._persistence_lease_descriptors([lease])
 
     with patch.object(
-        kv_cache_connector,
-        "mpi_broadcast",
-        side_effect=lambda value, root: value,
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
     ), patch.object(
-        kv_cache_connector,
-        "mpi_allgather",
-        return_value=[descriptors],
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[descriptors],
     ):
         manager.handle_metadata()
 
@@ -1130,9 +1133,9 @@ def test_persistence_staging_nonleader_records_external_loads():
     req.multimodal_positions = []
     req.get_num_tokens.return_value = 128
 
-    with patch.object(
-        kv_cache_connector, "mpi_broadcast", return_value=(64, False)
-    ):
+    with patch.object(kv_cache_connector,
+                      "mpi_broadcast",
+                      return_value=(64, False)):
         assert manager.get_num_new_matched_tokens(req, 0) == 64
 
     assert manager.scheduler_output_manager.external_loads == {42: 64}
@@ -1536,9 +1539,8 @@ def test_connector_manager_mtp_allocation_rewind_stays_state_only():
     kv_cache_manager.get_cache_indices.return_value = [10]
     kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
-    manager._run_on_leader = MagicMock(
-        return_value=(True, b"metadata", None, None)
-    )
+    manager._run_on_leader = MagicMock(return_value=(True, b"metadata", None,
+                                                     None))
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
@@ -2109,13 +2111,60 @@ def test_scheduler_output_refreshes_hashes_when_context_allocation_grows():
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
 
 
+def test_scheduler_output_sends_incremental_persistence_identity_tail():
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 4
+    kv_cache_manager.get_cache_indices.side_effect = [[6_800], [6_800, 6_801]]
+    kv_cache_manager.get_connector_cache_indices.side_effect = [[10], [10, 11]]
+    kv_cache_manager.commit_and_get_block_hashes_range.side_effect = [[101],
+                                                                      [202]]
+
+    req = MagicMock()
+    req.request_id = 42
+    req.state = LlmRequestState.CONTEXT_INIT
+    req.get_num_tokens.return_value = 8
+    req.get_tokens.return_value = list(range(8))
+    req.context_current_position = 0
+    req.context_remaining_length = 8
+    req.context_chunk_size = 4
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.context_requests_last_chunk = [req]
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    first = manager.build_scheduler_output(
+        scheduled_batch,
+        AsyncRequests({}, {}),
+        kv_cache_manager,
+        incremental_persistence_identities=True,
+    )
+    second = manager.build_scheduler_output(
+        scheduled_batch,
+        AsyncRequests({}, {}),
+        kv_cache_manager,
+        incremental_persistence_identities=True,
+    )
+
+    assert first.new_requests[0].block_hash_start == 0
+    assert first.new_requests[0].block_hashes == [101]
+    assert first.new_requests[0].block_object_ids == [6_800]
+    assert second.cached_requests[0].block_hash_start == 1
+    assert second.cached_requests[0].block_hashes == [202]
+    assert second.cached_requests[0].block_object_ids == [6_801]
+    assert kv_cache_manager.commit_and_get_block_hashes_range.call_args_list == [
+        call(req, 0),
+        call(req, 1),
+    ]
+
+
 def test_scheduler_output_rebinds_same_length_context_reallocation():
     """Preemption replacement refreshes identity and retention priority."""
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 4
     kv_cache_manager.get_cache_indices.side_effect = [[6_800], [6_900]]
     kv_cache_manager.get_connector_cache_indices.side_effect = [[10], [3]]
-    kv_cache_manager.commit_and_get_block_hashes.side_effect = [[11], [11]]
+    kv_cache_manager.commit_and_get_block_hashes_range.side_effect = [[11],
+                                                                      [11]]
     kv_cache_manager.get_priority_by_block_id.side_effect = [5, 7]
 
     req = MagicMock()
@@ -2132,12 +2181,17 @@ def test_scheduler_output_rebinds_same_length_context_reallocation():
     scheduled_batch.context_requests_last_chunk = [req]
     manager = KvCacheConnectorSchedulerOutputManager()
 
-    first = manager.build_scheduler_output(scheduled_batch, AsyncRequests({},
-                                                                          {}),
-                                           kv_cache_manager)
-    second = manager.build_scheduler_output(scheduled_batch,
-                                            AsyncRequests({}, {}),
-                                            kv_cache_manager)
+    first = manager.build_scheduler_output(
+        scheduled_batch,
+        AsyncRequests({}, {}),
+        kv_cache_manager,
+        incremental_persistence_identities=True,
+    )
+    second = manager.build_scheduler_output(
+        scheduled_batch,
+        AsyncRequests({}, {}),
+        kv_cache_manager,
+        incremental_persistence_identities=True)
 
     assert first.new_requests[0].new_block_ids == [10]
     assert first.new_requests[0].block_object_ids == [6_800]
@@ -2145,7 +2199,12 @@ def test_scheduler_output_rebinds_same_length_context_reallocation():
     assert second.cached_requests[0].new_block_ids == [3]
     assert second.cached_requests[0].block_object_ids == [6_900]
     assert second.cached_requests[0].block_hashes == [11]
+    assert second.cached_requests[0].block_hash_start == 0
     assert second.cached_requests[0].priorities == [7]
+    assert kv_cache_manager.commit_and_get_block_hashes_range.call_args_list == [
+        call(req, 0),
+        call(req, 0),
+    ]
     state = manager.requests[req.request_id]
     assert state.block_ids == [3]
     assert state.block_object_ids == [6_900]
@@ -2183,9 +2242,14 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     req.get_num_tokens.return_value = 5
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
     kv_cache_manager.get_connector_cache_indices.return_value = [0, 1, 2]
-    kv_cache_manager.commit_and_get_block_hashes.return_value = []
-    manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
-                                   kv_cache_manager)
+    kv_cache_manager.commit_and_get_block_hashes_range.side_effect = [[11, 22],
+                                                                      [11, 22]]
+    manager.build_scheduler_output(
+        scheduled_batch,
+        AsyncRequests({}, {}),
+        kv_cache_manager,
+        incremental_persistence_identities=True,
+    )
     req_state = manager.requests[42]
     assert req_state.block_ids == [0, 1, 2]
     assert req_state.tokens == [1, 2, 3, 4, 5]
@@ -2212,15 +2276,20 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     # new_tokens == [6] (the accepted token not yet reported).
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 3]
     kv_cache_manager.get_connector_cache_indices.return_value = [0, 1, 3]
-    output3 = manager.build_scheduler_output(scheduled_batch,
-                                             AsyncRequests({}, {}),
-                                             kv_cache_manager)
+    output3 = manager.build_scheduler_output(
+        scheduled_batch,
+        AsyncRequests({}, {}),
+        kv_cache_manager,
+        incremental_persistence_identities=True)
     cached = output3.cached_requests[0]
     assert cached.new_block_ids == [3], \
         f"Expected new_block_ids == [3], got {cached.new_block_ids}"
     assert cached.new_tokens == [6], \
         f"Expected accepted token 6 in new_tokens, got {cached.new_tokens}"
-    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
+    assert kv_cache_manager.commit_and_get_block_hashes_range.call_args_list == [
+        call(req, 0),
+        call(req, 0),
+    ]
 
 
 def test_scheduler_output_on_rewind_preserves_unreported_speculative_growth():

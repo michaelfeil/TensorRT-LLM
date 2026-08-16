@@ -2336,6 +2336,21 @@ public:
     {
         TLLM_THROW("commitAndGetBlockHashesForRequest is not implemented for this KV cache manager.");
     }
+
+    //! Commit completed blocks and return hashes beginning at `firstBlockIndex`.
+    //!
+    //! The default preserves compatibility for cache-manager implementations that expose only
+    //! `commitAndGetBlockHashesForRequest`; implementations may override this to avoid materializing the prefix.
+    [[nodiscard]] virtual std::vector<executor::IdType> commitAndGetBlockHashesForRequestRange(
+        LlmRequest const& llmRequest, SizeType32 windowSize, SizeType32 firstBlockIndex)
+    {
+        auto hashes = commitAndGetBlockHashesForRequest(llmRequest, windowSize);
+        TLLM_CHECK_WITH_INFO(firstBlockIndex >= 0 && static_cast<size_t>(firstBlockIndex) <= hashes.size(),
+            "commitAndGetBlockHashesForRequestRange first block index %d exceeds hash count %zu.", firstBlockIndex,
+            hashes.size());
+        hashes.erase(hashes.begin(), hashes.begin() + firstBlockIndex);
+        return hashes;
+    }
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -2680,6 +2695,9 @@ public:
 
     [[nodiscard]] std::vector<executor::IdType> commitAndGetBlockHashesForRequest(
         LlmRequest const& llmRequest, SizeType32 windowSize) override;
+
+    [[nodiscard]] std::vector<executor::IdType> commitAndGetBlockHashesForRequestRange(
+        LlmRequest const& llmRequest, SizeType32 windowSize, SizeType32 firstBlockIndex) override;
 
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 

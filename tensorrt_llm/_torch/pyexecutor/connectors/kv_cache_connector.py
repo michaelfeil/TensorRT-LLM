@@ -69,11 +69,9 @@ class RequestData:
     computed_position: int
     # The number of scheduled tokens for the upcoming forward pass.
     num_scheduled_tokens: int
-    # The cumulative chain of block hashes for full blocks of beam 0 when that
-    # chain changed in this scheduler step. ``None`` means the connector should
-    # retain the chain from the prior update. Each entry is the hash that KV
-    # cache events report for the corresponding block; the chain is read
-    # directly from the KV cache manager rather than recomputed Python-side.
+    # Block hashes for full blocks of beam 0 when that chain changed in this
+    # scheduler step. Incremental connectors receive the suffix beginning at
+    # ``block_hash_start``; other connectors retain the cumulative chain.
     block_hashes: Optional[List[int]] = None
     # The retention priorities for each new block (same length as new_block_ids).
     # Used for priority-based offload filtering. None means use default priority.
@@ -84,10 +82,12 @@ class RequestData:
     # remote object id) MUST mix cache_salt into their identifiers,
     # otherwise blocks from a different salt could be incorrectly reused.
     cache_salt: Optional[str] = None
-    # Stable TRT block-object IDs for the full allocation when block_hashes is
-    # present. Device transfers use new_block_ids, which are current primary
-    # memory-pool offsets and can differ after native host onboarding.
+    # Stable TRT block-object IDs aligned one-to-one with ``block_hashes``.
+    # Device transfers use new_block_ids, which are current primary memory-pool
+    # offsets and can differ after native host onboarding.
     block_object_ids: Optional[List[int]] = None
+    # Completed block index corresponding to the first incremental block hash.
+    block_hash_start: int = 0
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -169,6 +169,10 @@ class KvCacheConnectorWorker(ABC):
         has applied all leader-owned state for the update and proved that no
         new worker slot or transfer operation is pending.
         """
+        return False
+
+    def supports_incremental_persistence_identities(self) -> bool:
+        """Return whether completed block identities may be sent as tail deltas."""
         return False
 
     def supports_schedulable_reuse_preview(self) -> bool:
@@ -542,8 +546,14 @@ class KvCacheConnectorSchedulerOutputRequest:
         self.block_object_ids = []
         self.tokens = []
         self.hash_probe_state = None
+        self.block_hash_count = 0
 
-    def update_and_build_data(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
+    def update_and_build_data(
+        self,
+        req: LlmRequest,
+        kv_cache_manager: "KVCacheManager",
+        incremental_persistence_identities: bool = False,
+    ):
         num_tokens = req.get_num_tokens(0)
         if req.state in (
             LlmRequestState.CONTEXT_INIT,
@@ -613,6 +623,7 @@ class KvCacheConnectorSchedulerOutputRequest:
                 new_block_ids = block_ids
                 new_block_object_ids = block_object_ids
                 self.hash_probe_state = None
+                self.block_hash_count = 0
             self.block_ids = block_ids
             self.block_object_ids = block_object_ids
         else:
@@ -630,8 +641,16 @@ class KvCacheConnectorSchedulerOutputRequest:
         hash_probe_state = (
             num_hashed_tokens if is_generation else (num_hashed_tokens, len(self.block_ids))
         )
+        block_hash_start = 0
         if hash_probe_state != self.hash_probe_state:
-            block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+            if incremental_persistence_identities:
+                block_hash_start = self.block_hash_count
+                block_hashes = kv_cache_manager.commit_and_get_block_hashes_range(
+                    req, block_hash_start
+                )
+            else:
+                block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+            self.block_hash_count = block_hash_start + len(block_hashes)
             self.hash_probe_state = hash_probe_state
         else:
             block_hashes = None
@@ -652,8 +671,15 @@ class KvCacheConnectorSchedulerOutputRequest:
             new_block_ids=new_block_ids,
             computed_position=computed_position,
             num_scheduled_tokens=num_scheduled_tokens,
-            block_object_ids=(list(self.block_object_ids) if block_hashes is not None else None),
+            block_object_ids=(
+                list(self.block_object_ids[block_hash_start : self.block_hash_count])
+                if block_hashes is not None and incremental_persistence_identities
+                else list(self.block_object_ids)
+                if block_hashes is not None
+                else None
+            ),
             block_hashes=block_hashes,
+            block_hash_start=block_hash_start,
             priorities=priorities,
             cache_salt=req.cache_salt,
         )
@@ -670,6 +696,7 @@ class KvCacheConnectorSchedulerOutputManager:
         new_async_requests: AsyncRequests,
         kv_cache_manager: "KVCacheManager",
         request_ids: Optional[Set[int]] = None,
+        incremental_persistence_identities: bool = False,
     ):
         scheduler_output = SchedulerOutput()
 
@@ -682,7 +709,7 @@ class KvCacheConnectorSchedulerOutputManager:
             is_new = req.request_id not in self.requests
 
             request_data = self.requests[req.request_id].update_and_build_data(
-                req, kv_cache_manager
+                req, kv_cache_manager, incremental_persistence_identities
             )
 
             # Don't include the connector matched tokens in the initial scheduler output.
@@ -698,7 +725,7 @@ class KvCacheConnectorSchedulerOutputManager:
             if request_ids is not None and req.request_id not in request_ids:
                 continue
             request_data = self.requests[req.request_id].update_and_build_data(
-                req, kv_cache_manager
+                req, kv_cache_manager, incremental_persistence_identities
             )
 
             scheduler_output.cached_requests.append(request_data)
@@ -775,6 +802,7 @@ class KvCacheConnectorSchedulerOutputManager:
                 scheduler_live_block_ids = list(req_state.block_ids)
         if scheduler_live_block_ids is not None:
             req_state.hash_probe_state = None
+            req_state.block_hash_count = 0
         return scheduler_live_block_ids
 
 
@@ -814,6 +842,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
         self._state_only_updates_enabled = (
             self.worker.supports_state_only_connector_updates() is True
+        )
+        self._incremental_persistence_identities_enabled = (
+            self.worker.supports_incremental_persistence_identities() is True
         )
         if self._sparse_metadata_updates_enabled and not self._rank_local_metadata_skip_enabled:
             raise ValueError("Sparse connector metadata updates require rank-local metadata skip")
@@ -1097,6 +1128,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 self.new_async_requests,
                 kv_cache_manager,
                 self._metadata_request_ids,
+                self._incremental_persistence_identities_enabled
+                and kv_cache_manager.supports_incremental_persistence_identities() is True,
             )
             if self.scheduler is not None:
                 self._scheduler_output = scheduler_output
