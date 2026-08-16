@@ -1135,7 +1135,12 @@ class KVCacheManager(BaseResourceManager):
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
-                scheduled_batch, self)
+                scheduled_batch,
+                self,
+                generation_progress_events_enabled=(
+                    not self.mapping.enable_attention_dp
+                    and self.mapping.world_size == self.mapping.tp_size),
+            )
 
     def _collect_context_sequences(self, scheduled_batch: ScheduledRequests,
                                    is_cross: bool, is_star_cp: bool):
@@ -1369,10 +1374,10 @@ class KVCacheManager(BaseResourceManager):
                     continue
                 should_notify_connector = (self.kv_connector_manager is not None
                                            and not self.is_draft)
+                connector_rewind_required = False
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)
-                    if should_notify_connector:
-                        self.kv_connector_manager.on_rewind(request, self)
+                    connector_rewind_required = True
                 # Symmetric companion to prepare_resources's reserve_slack
                 # add_token loop: when _kv_reserve_draft_tokens (e.g. dynamic
                 # tree's K*max_draft_len) exceeds the runtime draft length,
@@ -1384,8 +1389,20 @@ class KVCacheManager(BaseResourceManager):
                 extra_rewind = self._kv_reserve_draft_tokens - runtime_draft_len
                 if extra_rewind > 0:
                     self.rewind_kv_cache(request, extra_rewind)
-                    if should_notify_connector:
-                        self.kv_connector_manager.on_rewind(request, self)
+                    connector_rewind_required = True
+                if should_notify_connector:
+                    computed_tokens = max(request.get_num_tokens(0) - 1, 0)
+                    generated_tokens = (
+                        1 + request.py_num_accepted_draft_tokens)
+                    previous_computed_tokens = max(
+                        computed_tokens - generated_tokens, 0)
+                    crossed_block_boundary = (
+                        computed_tokens // self.tokens_per_block !=
+                        previous_computed_tokens // self.tokens_per_block)
+                    if connector_rewind_required or crossed_block_boundary:
+                        self.kv_connector_manager.record_generation_progress(
+                            request, self, connector_rewind_required,
+                            computed_tokens)
 
         # For context requests, store completed context blocks for KV cache reuse.
         # We wait until context_remaining_length == 0 (all chunks processed) before
@@ -2799,6 +2816,10 @@ class ResourceManager:
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
+        for request in scheduled_batch.context_requests:
+            if getattr(request, "prepopulated_prompt_len_limit",
+                       None) is not None:
+                request.clear_prepopulated_prompt_len_limit()
 
     @nvtx_range("update_resources")
     def update_resources(

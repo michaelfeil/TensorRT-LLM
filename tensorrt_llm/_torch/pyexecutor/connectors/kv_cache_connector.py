@@ -840,6 +840,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._worker_visible_progress = {}
         self._metadata_request_ids: Optional[Set[int]] = None
         self._rank_local_state_only_pending = False
+        self._generation_computed_tokens: Dict[int, int] = {}
+        self._metadata_exchange_dirty_request_ids: Set[int] = set()
+        self._metadata_exchange_included_dirty_request_ids: Set[int] = set()
+        self._generation_progress_events_enabled = False
+        self._generation_progress_fast_path_armed = False
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
         self._pending_persistence_leases: List[KvCachePersistenceLease] = []
         self._resolved_persistence_keys: Optional[List[int]] = None
@@ -1063,10 +1068,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
 
     def build_scheduler_output(
-        self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
+        self,
+        scheduled_batch: ScheduledRequests,
+        kv_cache_manager: "KVCacheManager",
+        generation_progress_events_enabled: bool = False,
     ):
+        self._metadata_exchange_included_dirty_request_ids.clear()
         self._skip_metadata_exchange = self._can_skip_metadata_exchange(
-            scheduled_batch, kv_cache_manager
+            scheduled_batch,
+            kv_cache_manager,
+            generation_progress_events_enabled,
         )
         if (
             self._skip_metadata_exchange
@@ -1089,15 +1100,67 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             )
             if self.scheduler is not None:
                 self._scheduler_output = scheduler_output
+            self._metadata_exchange_included_dirty_request_ids.update(
+                req.request_id
+                for req in scheduled_batch.generation_requests
+                if req.request_id in self._metadata_exchange_dirty_request_ids
+                and (
+                    self._metadata_request_ids is None
+                    or req.request_id in self._metadata_request_ids
+                )
+            )
 
     def _can_skip_metadata_exchange(
-        self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
+        self,
+        scheduled_batch: ScheduledRequests,
+        kv_cache_manager: "KVCacheManager",
+        generation_progress_events_enabled: bool = False,
     ) -> bool:
         """Return a conservative decision that is identical on replicated ranks."""
         self._metadata_request_ids = None
         self._rank_local_state_only_pending = False
+        self._generation_progress_events_enabled = False
         if not self._rank_local_metadata_skip_enabled:
             return False
+
+        self._generation_progress_events_enabled = bool(
+            generation_progress_events_enabled
+            and self._sparse_metadata_updates_enabled
+            and self._uses_secondary_persistence_staging
+        )
+        has_non_generation_work = bool(
+            scheduled_batch.encoder_requests
+            or scheduled_batch.context_requests
+            or scheduled_batch.paused_requests
+        )
+        has_generation_work = bool(scheduled_batch.generation_requests)
+        can_use_generation_progress = (
+            self._generation_progress_events_enabled
+            and has_generation_work
+            and not has_non_generation_work
+            and self._generation_progress_fast_path_armed
+        )
+        if can_use_generation_progress:
+            has_async_work = not (
+                self.new_async_requests.is_empty
+                and self.pending_async_requests.is_empty
+                and self.local_finished_async_requests.is_empty
+            )
+            if not self._force_metadata_exchange and not has_async_work:
+                if not self._metadata_exchange_dirty_request_ids:
+                    return True
+                self._metadata_request_ids = {
+                    req.request_id
+                    for req in scheduled_batch.generation_requests
+                    if req.request_id in self._metadata_exchange_dirty_request_ids
+                }
+                if not self._metadata_request_ids:
+                    # Boundary progress for a temporarily unscheduled request
+                    # remains dirty until that request is scheduled again.
+                    return True
+                self._rank_local_state_only_pending = self._state_only_updates_enabled
+                if self._rank_local_state_only_pending:
+                    return True
 
         block_size = kv_cache_manager.tokens_per_block
         progress_changed = False
@@ -1126,6 +1189,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 # request. Accepted full blocks are therefore the only
                 # worker-visible generation boundary.
                 transfer_boundary = completed_blocks
+                self._generation_computed_tokens[request_id] = completed_position
             else:
                 completed_blocks = num_tokens // block_size
                 next_position = req.context_current_position + min(
@@ -1143,22 +1207,19 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             self._metadata_exchange_progress[request_id] = progress
 
         for request_id in list(self._metadata_exchange_progress):
-            if request_id not in active_request_ids:
+            if (
+                request_id not in active_request_ids
+                and request_id not in self._metadata_exchange_dirty_request_ids
+            ):
                 del self._metadata_exchange_progress[request_id]
 
-        has_non_generation_work = bool(
-            scheduled_batch.encoder_requests
-            or scheduled_batch.context_requests
-            or scheduled_batch.paused_requests
-        )
         has_async_work = not (
             self.new_async_requests.is_empty
             and self.pending_async_requests.is_empty
             and self.local_finished_async_requests.is_empty
         )
         has_unseen_worker_request = any(
-            request_id not in self._worker_visible_progress
-            for request_id in active_request_ids
+            request_id not in self._worker_visible_progress for request_id in active_request_ids
         )
         pure_generation_update = (
             not self._force_metadata_exchange
@@ -1166,11 +1227,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             and not has_async_work
             and not has_unseen_worker_request
         )
-        if (
-            self._uses_secondary_persistence_staging
-            and pure_generation_update
-            and progress_changed
-        ):
+        if self._uses_secondary_persistence_staging and pure_generation_update and progress_changed:
             # Eviction staging creates no request-scoped decode Stores. Every
             # rank can therefore consume the same sparse cursor while only the
             # leader advances hashes and block identities. New/context work,
@@ -1188,7 +1245,47 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 self._worker_visible_progress[req.request_id] = self._metadata_exchange_progress[
                     req.request_id
                 ]
+        self._generation_progress_fast_path_armed = (
+            self._generation_progress_events_enabled
+            and has_generation_work
+            and not has_non_generation_work
+        )
         return can_skip
+
+    def record_generation_progress(
+        self,
+        req: LlmRequest,
+        kv_cache_manager: "KVCacheManager",
+        rewind_required: bool,
+        computed_tokens: int,
+    ) -> None:
+        """Record a generation boundary found in an already-visited request loop."""
+        if not self._generation_progress_events_enabled:
+            if rewind_required:
+                self._on_rewind(req, kv_cache_manager, computed_tokens + 1)
+            return
+
+        request_id = req.request_id
+        if request_id not in self._generation_computed_tokens:
+            self._generation_progress_fast_path_armed = False
+            self._force_metadata_exchange = True
+            if rewind_required:
+                self._on_rewind(req, kv_cache_manager, computed_tokens + 1)
+            return
+
+        self._generation_computed_tokens[request_id] = computed_tokens
+        completed_blocks = computed_tokens // kv_cache_manager.tokens_per_block
+        progress = (completed_blocks, completed_blocks)
+        if self._metadata_exchange_progress.get(request_id) != progress:
+            self._metadata_exchange_dirty_request_ids.add(request_id)
+        self._metadata_exchange_progress[request_id] = progress
+
+        if rewind_required:
+            self._on_rewind(req, kv_cache_manager, computed_tokens + 1)
+
+    def on_generation_will_complete(self) -> None:
+        """Force one exact scan so the final forward can publish its KV block."""
+        self._generation_progress_fast_path_armed = False
 
     def on_rewind(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
         """Notify the connector that a request's KV cache was rewound.
@@ -1197,8 +1294,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         notifies the external scheduler (e.g. KVBM leader) so it can trim
         its own per-request slot state.
         """
-        block_size = kv_cache_manager.tokens_per_block
         num_tokens = req.get_num_tokens(0)
+        self._on_rewind(req, kv_cache_manager, num_tokens)
+
+    def _on_rewind(
+        self,
+        req: LlmRequest,
+        kv_cache_manager: "KVCacheManager",
+        num_tokens: int,
+    ) -> None:
+        block_size = kv_cache_manager.tokens_per_block
         # The final live token is the next-forward input and has no KV yet.
         completed_blocks = max(num_tokens - 1, 0) // block_size
         live_block_ids = kv_cache_manager.get_connector_cache_indices(req)
@@ -1208,6 +1313,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         rewind_crossed_worker_boundary = worker_visible_progress != progress
         self._force_metadata_exchange |= rewind_crossed_worker_boundary
         self._metadata_exchange_progress[req.request_id] = progress
+        self._generation_computed_tokens[req.request_id] = max(num_tokens - 1, 0)
         scheduler_live_block_ids = None
         if self.scheduler is not None or self._uses_secondary_persistence_staging:
             scheduler_live_block_ids = self.scheduler_output_manager.on_rewind(
@@ -1265,9 +1371,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             def build_exchange():
                 def build_update() -> ConnectorUpdate:
                     if self._state_only_updates_enabled:
-                        return self.scheduler.build_connector_update(
-                            self._scheduler_output
-                        )
+                        return self.scheduler.build_connector_update(self._scheduler_output)
                     return ConnectorWorkerMetadata(
                         self.scheduler.build_connector_meta(self._scheduler_output)
                     )
@@ -1332,11 +1436,15 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     f"{type(update).__name__}"
                 )
 
+        processed_request_ids = set(self._metadata_exchange_included_dirty_request_ids)
         self._scheduler_output = None
         self._metadata_pending = False
         self._skip_metadata_exchange = False
         self._metadata_request_ids = None
+        self._metadata_exchange_included_dirty_request_ids.clear()
         self._rank_local_state_only_pending = False
+
+        self._metadata_exchange_dirty_request_ids.difference_update(processed_request_ids)
 
         if worker_metadata_available:
             self.worker.bind_connector_meta(metadata)
@@ -1367,11 +1475,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             free_resources on the request.
         """
 
-        if req.request_id in self.finished_async_loading_requests:
-            del self.finished_async_loading_requests[req.request_id]
-        self._metadata_exchange_progress.pop(req.request_id, None)
-        self._worker_visible_progress.pop(req.request_id, None)
-
         if self.uses_secondary_kv_pool_as_persistence_staging():
             # An empty block list prevents request completion from creating a
             # new eager save, while normal finalization still preserves Store
@@ -1386,6 +1489,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             saving_async = self._run_on_leader(
                 lambda: self.scheduler.request_finished(req, cache_block_ids)
             )
+
+        if req.request_id in self.finished_async_loading_requests:
+            del self.finished_async_loading_requests[req.request_id]
+        self._metadata_exchange_progress.pop(req.request_id, None)
+        self._worker_visible_progress.pop(req.request_id, None)
+        self._generation_computed_tokens.pop(req.request_id, None)
+        self._metadata_exchange_dirty_request_ids.discard(req.request_id)
 
         # This is similar to take_scheduled_requests_pending_load.
         # We need to update the request's state to indicate that it's still being used, but isn't schedulable.
@@ -1470,6 +1580,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return list(all_finished.saving.values())
 
     def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]):
+        self._generation_progress_fast_path_armed = False
         if self.scheduler is not None:
             self.scheduler.update_state_after_alloc(req, block_ids)
 

@@ -6083,6 +6083,8 @@ class PyExecutor:
             ):
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
+                if self.kv_connector_manager is not None:
+                    self.kv_connector_manager.on_generation_will_complete()
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request

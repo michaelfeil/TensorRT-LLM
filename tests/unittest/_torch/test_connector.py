@@ -856,6 +856,189 @@ def _make_generation_batch(num_tokens: int):
     return req, scheduled_batch
 
 
+def _make_generation_progress_manager():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    worker.supports_sparse_metadata_updates.return_value = True
+    worker.supports_state_only_connector_updates.return_value = True
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+    scheduler = MagicMock()
+    scheduler.build_connector_update.return_value = ConnectorStateOnly()
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    return manager, scheduler
+
+
+def _arm_generation_progress_fast_path(
+    manager: KvCacheConnectorManager,
+    scheduled_batch: ScheduledRequests,
+    kv_cache_manager: KVCacheManager,
+) -> None:
+    manager.build_scheduler_output(
+        scheduled_batch,
+        kv_cache_manager,
+        generation_progress_events_enabled=True,
+    )
+    manager.handle_metadata()
+
+
+def test_generation_progress_same_block_avoids_request_scan():
+    manager, scheduler = _make_generation_progress_manager()
+    req, scheduled_batch = _make_generation_batch(30)
+    req.py_num_accepted_draft_tokens = 0
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    scheduler.reset_mock()
+
+    manager.record_generation_progress(req, kv_cache_manager, False, 30)
+    req.get_num_tokens.side_effect = AssertionError(
+        "steady generation must not read the bound token vector")
+    manager.build_scheduler_output(
+        scheduled_batch,
+        kv_cache_manager,
+        generation_progress_events_enabled=True,
+    )
+    manager.handle_metadata()
+
+    scheduler.build_connector_update.assert_not_called()
+    scheduler.advance_without_worker_metadata.assert_not_called()
+    assert manager._metadata_exchange_dirty_request_ids == set()
+
+
+@pytest.mark.parametrize(("num_tokens", "num_accepted_draft_tokens"), [(32, 0),
+                                                                       (30, 3)])
+def test_generation_progress_boundary_including_mtp_advances_dirty_request(
+        num_tokens: int, num_accepted_draft_tokens: int):
+    manager, scheduler = _make_generation_progress_manager()
+    req, scheduled_batch = _make_generation_batch(num_tokens)
+    req.py_num_accepted_draft_tokens = num_accepted_draft_tokens
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = [12345]
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    scheduler.reset_mock()
+
+    computed_tokens = num_tokens - 1 + 1 + num_accepted_draft_tokens
+    manager.record_generation_progress(req, kv_cache_manager, False,
+                                       computed_tokens)
+    manager.build_scheduler_output(
+        scheduled_batch,
+        kv_cache_manager,
+        generation_progress_events_enabled=True,
+    )
+    manager.handle_metadata()
+
+    scheduler.advance_without_worker_metadata.assert_called_once()
+    output = scheduler.advance_without_worker_metadata.call_args.args[0]
+    assert [request.request_id for request in output.cached_requests] == [42]
+    assert manager._metadata_exchange_dirty_request_ids == set()
+
+
+def test_generation_progress_dirty_unscheduled_request_is_retained():
+    manager, _ = _make_generation_progress_manager()
+    req, scheduled_batch = _make_generation_batch(32)
+    req.py_num_accepted_draft_tokens = 0
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = [12345]
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    manager.record_generation_progress(req, kv_cache_manager, False, 32)
+
+    other_req, other_batch = _make_generation_batch(30)
+    other_req.request_id = 43
+    manager.build_scheduler_output(
+        other_batch,
+        kv_cache_manager,
+        generation_progress_events_enabled=True,
+    )
+    manager.handle_metadata()
+    assert manager._metadata_exchange_dirty_request_ids == {42}
+
+    manager.build_scheduler_output(
+        scheduled_batch,
+        kv_cache_manager,
+        generation_progress_events_enabled=True,
+    )
+    manager.handle_metadata()
+    assert manager._metadata_exchange_dirty_request_ids == set()
+
+
+def test_generation_progress_final_forward_forces_exact_boundary_scan():
+    manager, scheduler = _make_generation_progress_manager()
+    req, scheduled_batch = _make_generation_batch(31)
+    req.py_num_accepted_draft_tokens = 0
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = [12345]
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    scheduler.reset_mock()
+
+    manager.record_generation_progress(req, kv_cache_manager, False, 31)
+    req.get_num_tokens.return_value = 32
+    req.state = LlmRequestState.GENERATION_TO_COMPLETE
+    manager.on_generation_will_complete()
+    manager.build_scheduler_output(
+        scheduled_batch,
+        kv_cache_manager,
+        generation_progress_events_enabled=True,
+    )
+    manager.handle_metadata()
+
+    scheduler.advance_without_worker_metadata.assert_called_once()
+    assert manager._metadata_exchange_progress[req.request_id] == (1, 1)
+
+
+def test_generation_progress_cleanup_follows_finish_callback():
+    manager, scheduler = _make_generation_progress_manager()
+    req, scheduled_batch = _make_generation_batch(32)
+    req.py_num_accepted_draft_tokens = 0
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = [12345]
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    manager.record_generation_progress(req, kv_cache_manager, False, 32)
+    manager._run_on_leader = MagicMock(side_effect=lambda function: function())
+
+    def finish_request(request, cache_block_ids):
+        assert request is req
+        assert cache_block_ids == []
+        assert manager._metadata_exchange_dirty_request_ids == {req.request_id}
+        return False
+
+    scheduler.request_finished.side_effect = finish_request
+
+    assert not manager.request_finished(req, [10])
+    assert req.request_id not in manager._metadata_exchange_progress
+    assert req.request_id not in manager._worker_visible_progress
+    assert req.request_id not in manager._generation_computed_tokens
+    assert manager._metadata_exchange_dirty_request_ids == set()
+
+
+def test_generation_will_complete_disarms_progress_fast_path():
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = MagicMock()
+    req = MagicMock(state=LlmRequestState.GENERATION_IN_PROGRESS)
+    req.will_complete_next_iteration.return_value = True
+
+    executor._update_generation_requests_that_will_complete_next_iteration(
+        [req])
+
+    assert req.state == LlmRequestState.GENERATION_TO_COMPLETE
+    executor.kv_connector_manager.on_generation_will_complete.assert_called_once_with(
+    )
+
+
 def test_filtered_scheduler_output_preserves_omitted_external_loads():
     manager = KvCacheConnectorSchedulerOutputManager()
     first_req, scheduled_batch = _make_generation_batch(30)
@@ -2076,7 +2259,9 @@ def _make_kv_cache_manager_for_update_resources(is_draft: bool):
     manager.kv_cache_type = CacheTypeCpp.SELF
     manager.is_draft = is_draft
     manager.kv_connector_manager = MagicMock()
+    manager.tokens_per_block = 32
     manager._kv_reserve_draft_tokens = 0
+    manager._use_ragged_dynamic_draft_lengths = False
     manager.rewind_kv_cache = MagicMock()
     return manager
 
@@ -2086,6 +2271,7 @@ def _make_generation_request_for_rewind(rewind_len: int):
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.py_rewind_len = rewind_len
     req.py_num_accepted_draft_tokens = 0
+    req.get_num_tokens.return_value = 33
     return req
 
 
@@ -2102,7 +2288,60 @@ def test_update_resources_notifies_connector_only_from_target_kv_manager():
         manager.update_resources(scheduled_batch)
 
     manager.rewind_kv_cache.assert_called_once_with(req, 1)
-    manager.kv_connector_manager.on_rewind.assert_called_once_with(req, manager)
+    manager.kv_connector_manager.record_generation_progress.assert_called_once_with(
+        req, manager, True, 32)
+
+
+def test_update_resources_reports_generation_progress_without_rewind():
+    req = _make_generation_request_for_rewind(rewind_len=0)
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = _make_kv_cache_manager_for_update_resources(is_draft=False)
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2._update_kv_cache_draft_token_location"
+    ):
+        manager.update_resources(scheduled_batch)
+
+    manager.rewind_kv_cache.assert_not_called()
+    manager.kv_connector_manager.record_generation_progress.assert_called_once_with(
+        req, manager, False, 32)
+
+
+def test_update_resources_skips_generation_progress_inside_block():
+    req = _make_generation_request_for_rewind(rewind_len=0)
+    req.get_num_tokens.return_value = 32
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = _make_kv_cache_manager_for_update_resources(is_draft=False)
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2._update_kv_cache_draft_token_location"
+    ):
+        manager.update_resources(scheduled_batch)
+
+    manager.rewind_kv_cache.assert_not_called()
+    manager.kv_connector_manager.record_generation_progress.assert_not_called()
+
+
+def test_update_resources_reports_mtp_block_boundary():
+    req = _make_generation_request_for_rewind(rewind_len=0)
+    req.py_num_accepted_draft_tokens = 3
+    req.get_num_tokens.return_value = 34
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = _make_kv_cache_manager_for_update_resources(is_draft=False)
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2._update_kv_cache_draft_token_location"
+    ):
+        manager.update_resources(scheduled_batch)
+
+    manager.kv_connector_manager.record_generation_progress.assert_called_once_with(
+        req, manager, False, 33)
 
 
 def test_update_resources_draft_kv_manager_does_not_notify_connector():
@@ -2117,7 +2356,7 @@ def test_update_resources_draft_kv_manager_does_not_notify_connector():
 
     assert manager.rewind_kv_cache.call_count == 2
     manager.rewind_kv_cache.assert_any_call(req, 1)
-    manager.kv_connector_manager.on_rewind.assert_not_called()
+    manager.kv_connector_manager.record_generation_progress.assert_not_called()
 
 
 def test_connector_manager_on_rewind_forwards_to_scheduler():
