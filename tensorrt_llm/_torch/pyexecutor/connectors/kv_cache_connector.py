@@ -1004,6 +1004,71 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             raise RuntimeError("Persistence lease completion requires a bound KV cache manager")
         self._kv_cache_manager.complete_persistence_leases(lease_ids)
 
+    def _converge_persistence_lease_prefix(
+        self,
+        rank_descriptors: List[List[Tuple[int, int, int, int, int]]],
+        leader_descriptors: List[Tuple[int, int, int, int, int]],
+        persistence_keys: List[int],
+    ) -> Tuple[List[Tuple[int, int, int, int, int]], List[int]]:
+        """Keep the logical eviction prefix staged by every replicated TP rank.
+
+        Secondary-pool completions become visible to each executor rank at a
+        slightly different wall-clock instant. A rank can therefore have a
+        shorter staging tail for one allocation even though all ranks evicted
+        the same logical block order. Publishing only the common prefix is
+        safe; a rank-local tail has not been submitted to the connector yet and
+        can be released just like an unsuccessful native offload.
+
+        Lease IDs are deliberately excluded from the logical comparison. They
+        are rank-local handles and can differ after one rank rolled back a
+        longer tail in an earlier batch.
+        """
+        if not rank_descriptors:
+            raise RuntimeError("Persistence lease convergence requires at least one rank")
+
+        common_count = min(len(descriptors) for descriptors in rank_descriptors)
+        leader_prefix = leader_descriptors[:common_count]
+        leader_logical_prefix = [descriptor[1:] for descriptor in leader_prefix]
+        for rank, descriptors in enumerate(rank_descriptors):
+            logical_prefix = [descriptor[1:] for descriptor in descriptors[:common_count]]
+            if logical_prefix == leader_logical_prefix:
+                continue
+            first_mismatch = next(
+                index
+                for index, (leader_descriptor, rank_descriptor) in enumerate(
+                    zip(leader_logical_prefix, logical_prefix, strict=True)
+                )
+                if leader_descriptor != rank_descriptor
+            )
+            raise RuntimeError(
+                "Logical persistence lease prefixes diverged across ranks: "
+                f"rank={rank}, lengths={[len(value) for value in rank_descriptors]}, "
+                f"first_mismatch={first_mismatch}, "
+                f"leader={leader_logical_prefix[first_mismatch]}, "
+                f"rank_value={logical_prefix[first_mismatch]}"
+            )
+
+        local_tail = self._pending_persistence_leases[common_count:]
+        if local_tail:
+            local_tail_ids = [int(lease.lease_id) for lease in local_tail]
+            if self.scheduler is not None:
+                self.scheduler.retire_persistence_identities(
+                    [
+                        (int(lease.source_block_id), int(lease.block_hash))
+                        for lease in local_tail
+                    ]
+                )
+            self.complete_persistence_leases(local_tail_ids)
+            self._outstanding_persistence_lease_ids.difference_update(local_tail_ids)
+            self._pending_persistence_leases = self._pending_persistence_leases[
+                :common_count
+            ]
+
+        self._resolved_persistence_keys = [
+            int(key) for key in persistence_keys[:common_count]
+        ]
+        return leader_prefix, self._resolved_persistence_keys
+
     def reap_completed_persistence_leases(self) -> None:
         """Release terminal staging leases before the next scheduling pass."""
         if not self._outstanding_persistence_lease_ids:
@@ -1444,18 +1509,22 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             rank_descriptors = mpi_allgather(local_descriptors)
             if leader_descriptors is None:
                 if any(rank_descriptors):
-                    raise RuntimeError(
-                        "Persistence lease divergence: leader has no leases but ranks "
-                        f"have {rank_descriptors}"
+                    leader_descriptors, persistence_keys = (
+                        self._converge_persistence_lease_prefix(
+                            rank_descriptors,
+                            [],
+                            [],
+                        )
                     )
                 self._resolved_persistence_keys = None
             else:
-                if any(descriptors != leader_descriptors for descriptors in rank_descriptors):
-                    raise RuntimeError(
-                        "Persistence leases diverged across ranks: "
-                        f"leader={leader_descriptors}, ranks={rank_descriptors}"
+                leader_descriptors, persistence_keys = (
+                    self._converge_persistence_lease_prefix(
+                        rank_descriptors,
+                        leader_descriptors,
+                        persistence_keys,
                     )
-                self._resolved_persistence_keys = [int(key) for key in persistence_keys]
+                )
 
             if isinstance(update, ConnectorWorkerMetadata):
                 metadata = update.metadata
