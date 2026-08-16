@@ -839,6 +839,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._metadata_exchange_progress = {}
         self._worker_visible_progress = {}
         self._metadata_request_ids: Optional[Set[int]] = None
+        self._rank_local_state_only_pending = False
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
         self._pending_persistence_leases: List[KvCachePersistenceLease] = []
         self._resolved_persistence_keys: Optional[List[int]] = None
@@ -1067,7 +1068,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._skip_metadata_exchange = self._can_skip_metadata_exchange(
             scheduled_batch, kv_cache_manager
         )
-        if self._skip_metadata_exchange and self._sparse_metadata_updates_enabled:
+        if (
+            self._skip_metadata_exchange
+            and self._sparse_metadata_updates_enabled
+            and not self._rank_local_state_only_pending
+        ):
             # Leave SchedulerOutputManager's token/block cursor untouched so
             # the next visible boundary carries the complete accumulated delta.
             self._scheduler_output = None
@@ -1090,6 +1095,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     ) -> bool:
         """Return a conservative decision that is identical on replicated ranks."""
         self._metadata_request_ids = None
+        self._rank_local_state_only_pending = False
         if not self._rank_local_metadata_skip_enabled:
             return False
 
@@ -1150,21 +1156,32 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             and self.pending_async_requests.is_empty
             and self.local_finished_async_requests.is_empty
         )
+        has_unseen_worker_request = any(
+            request_id not in self._worker_visible_progress
+            for request_id in active_request_ids
+        )
         pure_generation_update = (
             not self._force_metadata_exchange
             and not has_non_generation_work
             and not has_async_work
+            and not has_unseen_worker_request
         )
         if (
             self._uses_secondary_persistence_staging
             and pure_generation_update
             and progress_changed
         ):
-            # Eviction staging creates no request-scoped decode Stores. Keep
-            # the full worker exchange, but update only requests whose complete
-            # block identity changed; omitted cursors retain their delta.
+            # Eviction staging creates no request-scoped decode Stores. Every
+            # rank can therefore consume the same sparse cursor while only the
+            # leader advances hashes and block identities. New/context work,
+            # persistence leases, and async work all make
+            # ``pure_generation_update`` false and retain the full exchange;
+            # any leader-queued repair remains pending until that event.
             self._metadata_request_ids = changed_request_ids
-        can_skip = pure_generation_update and not progress_changed
+            self._rank_local_state_only_pending = self._state_only_updates_enabled
+        can_skip = pure_generation_update and (
+            not progress_changed or self._rank_local_state_only_pending
+        )
         if not can_skip:
             self._force_metadata_exchange = False
             for req in scheduled_batch.all_requests():
@@ -1319,6 +1336,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._metadata_pending = False
         self._skip_metadata_exchange = False
         self._metadata_request_ids = None
+        self._rank_local_state_only_pending = False
 
         if worker_metadata_available:
             self.worker.bind_connector_meta(metadata)

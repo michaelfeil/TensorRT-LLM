@@ -24,8 +24,9 @@ import pytest
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests, ConnectorStateOnly, KvCacheConnectorManager,
-    KvCacheConnectorSchedulerOutputManager, KvCacheConnectorWorker)
+    AsyncRequests, ConnectorStateOnly, ConnectorWorkerMetadata,
+    KvCacheConnectorManager, KvCacheConnectorSchedulerOutputManager,
+    KvCacheConnectorWorker)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
@@ -1062,9 +1063,12 @@ def test_persistence_staging_metadata_updates_only_changed_requests():
     worker = MagicMock(spec=KvCacheConnectorWorker)
     worker.supports_rank_local_metadata_skip.return_value = True
     worker.supports_sparse_metadata_updates.return_value = True
+    worker.supports_state_only_connector_updates.return_value = True
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
     scheduler = MagicMock()
     scheduler.build_connector_meta.return_value = b"metadata"
+    scheduler.build_connector_update.return_value = ConnectorWorkerMetadata(
+        b"metadata")
     manager = KvCacheConnectorManager(worker, scheduler=scheduler)
     first_req, scheduled_batch = _make_generation_batch(30)
     second_req, _ = _make_generation_batch(30)
@@ -1086,26 +1090,32 @@ def test_persistence_staging_metadata_updates_only_changed_requests():
 
     first_req.get_num_tokens.return_value = 33
     second_req.get_num_tokens.return_value = 31
-    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
-    manager.handle_metadata()
+    with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+        manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+        manager.handle_metadata()
 
-    output = scheduler.build_connector_meta.call_args.args[0]
+    broadcast.assert_not_called()
+    scheduler.build_connector_meta.assert_not_called()
+    scheduler.advance_without_worker_metadata.assert_called_once()
+    output = scheduler.advance_without_worker_metadata.call_args.args[0]
     assert [req.request_id for req in output.cached_requests] == [42]
     assert output.cached_requests[0].new_tokens == [30, 31, 32]
-    scheduler.advance_without_worker_metadata.assert_not_called()
-    worker.bind_connector_meta.assert_called_once_with(b"metadata")
+    worker.bind_connector_meta.assert_not_called()
 
     scheduler.reset_mock()
     worker.reset_mock()
     second_req.get_num_tokens.return_value = 33
-    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
-    manager.handle_metadata()
+    with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+        manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+        manager.handle_metadata()
 
-    output = scheduler.build_connector_meta.call_args.args[0]
+    broadcast.assert_not_called()
+    scheduler.build_connector_meta.assert_not_called()
+    scheduler.advance_without_worker_metadata.assert_called_once()
+    output = scheduler.advance_without_worker_metadata.call_args.args[0]
     assert [req.request_id for req in output.cached_requests] == [43]
     assert output.cached_requests[0].new_tokens == [30, 31, 32]
-    scheduler.advance_without_worker_metadata.assert_not_called()
-    worker.bind_connector_meta.assert_called_once_with(b"metadata")
+    worker.bind_connector_meta.assert_not_called()
 
 
 def test_sparse_metadata_updates_require_rank_local_skip():
