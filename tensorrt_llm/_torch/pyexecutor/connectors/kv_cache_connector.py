@@ -101,6 +101,21 @@ class SchedulerOutput:
     cached_requests: List[RequestData] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ConnectorStateOnly:
+    """The scheduler advanced without producing worker-visible work."""
+
+
+@dataclass(frozen=True)
+class ConnectorWorkerMetadata:
+    """Metadata that workers must bind before the next forward pass."""
+
+    metadata: object
+
+
+ConnectorUpdate = ConnectorStateOnly | ConnectorWorkerMetadata
+
+
 class KvCacheConnectorWorker(ABC):
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -144,6 +159,15 @@ class KvCacheConnectorWorker(ABC):
         The paired scheduler must consume the complete token and block delta
         at the next worker-visible boundary. Worker batch, forward, and save
         hooks must only be needed after a real metadata bind.
+        """
+        return False
+
+    def supports_state_only_connector_updates(self) -> bool:
+        """Return whether the scheduler can atomically suppress worker metadata.
+
+        The paired scheduler must return ``ConnectorStateOnly`` only after it
+        has applied all leader-owned state for the update and proved that no
+        new worker slot or transfer operation is pending.
         """
         return False
 
@@ -316,6 +340,15 @@ class KvCacheConnectorScheduler(ABC):
         Returns:
             The metadata for the workers.
         """
+
+    def build_connector_update(self, scheduler_output: SchedulerOutput) -> ConnectorUpdate:
+        """Advance scheduler state and describe any worker-visible work.
+
+        Existing connectors produce worker metadata on every visible scheduler
+        update. Connectors may override this method to return
+        ``ConnectorStateOnly`` after atomically applying leader-only state.
+        """
+        return ConnectorWorkerMetadata(self.build_connector_meta(scheduler_output))
 
     @abstractmethod
     def get_num_new_matched_tokens(
@@ -636,10 +669,13 @@ class KvCacheConnectorSchedulerOutputManager:
         scheduled_batch: ScheduledRequests,
         new_async_requests: AsyncRequests,
         kv_cache_manager: "KVCacheManager",
+        request_ids: Optional[Set[int]] = None,
     ):
         scheduler_output = SchedulerOutput()
 
         for req in scheduled_batch.context_requests:
+            if request_ids is not None and req.request_id not in request_ids:
+                continue
             if req.request_id in new_async_requests.loading_ids:
                 continue
 
@@ -659,13 +695,19 @@ class KvCacheConnectorSchedulerOutputManager:
                 scheduler_output.cached_requests.append(request_data)
 
         for req in scheduled_batch.generation_requests:
+            if request_ids is not None and req.request_id not in request_ids:
+                continue
             request_data = self.requests[req.request_id].update_and_build_data(
                 req, kv_cache_manager
             )
 
             scheduler_output.cached_requests.append(request_data)
 
-        self.external_loads = dict()
+        if request_ids is None:
+            self.external_loads = dict()
+        else:
+            for request_id in request_ids:
+                self.external_loads.pop(request_id, None)
 
         return scheduler_output
 
@@ -770,6 +812,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._sparse_metadata_updates_enabled = (
             self.worker.supports_sparse_metadata_updates() is True
         )
+        self._state_only_updates_enabled = (
+            self.worker.supports_state_only_connector_updates() is True
+        )
         if self._sparse_metadata_updates_enabled and not self._rank_local_metadata_skip_enabled:
             raise ValueError("Sparse connector metadata updates require rank-local metadata skip")
 
@@ -793,6 +838,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._force_metadata_exchange = False
         self._metadata_exchange_progress = {}
         self._worker_visible_progress = {}
+        self._metadata_request_ids: Optional[Set[int]] = None
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
         self._pending_persistence_leases: List[KvCachePersistenceLease] = []
         self._resolved_persistence_keys: Optional[List[int]] = None
@@ -1031,7 +1077,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._metadata_pending = True
         if self.scheduler is not None or self._uses_secondary_persistence_staging:
             scheduler_output = self.scheduler_output_manager.build_scheduler_output(
-                scheduled_batch, self.new_async_requests, kv_cache_manager
+                scheduled_batch,
+                self.new_async_requests,
+                kv_cache_manager,
+                self._metadata_request_ids,
             )
             if self.scheduler is not None:
                 self._scheduler_output = scheduler_output
@@ -1040,11 +1089,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ) -> bool:
         """Return a conservative decision that is identical on replicated ranks."""
+        self._metadata_request_ids = None
         if not self._rank_local_metadata_skip_enabled:
             return False
 
         block_size = kv_cache_manager.tokens_per_block
         progress_changed = False
+        changed_request_ids = set()
         active_request_ids = set()
         generation_request_ids = {req.request_id for req in scheduled_batch.generation_requests}
 
@@ -1082,6 +1133,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             progress = (completed_blocks, transfer_boundary)
             if self._metadata_exchange_progress.get(request_id) != progress:
                 progress_changed = True
+                changed_request_ids.add(request_id)
             self._metadata_exchange_progress[request_id] = progress
 
         for request_id in list(self._metadata_exchange_progress):
@@ -1098,12 +1150,21 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             and self.pending_async_requests.is_empty
             and self.local_finished_async_requests.is_empty
         )
-        can_skip = (
+        pure_generation_update = (
             not self._force_metadata_exchange
             and not has_non_generation_work
             and not has_async_work
-            and not progress_changed
         )
+        if (
+            self._uses_secondary_persistence_staging
+            and pure_generation_update
+            and progress_changed
+        ):
+            # Eviction staging creates no request-scoped decode Stores. Keep
+            # the full worker exchange, but update only requests whose complete
+            # block identity changed; omitted cursors retain their delta.
+            self._metadata_request_ids = changed_request_ids
+        can_skip = pure_generation_update and not progress_changed
         if not can_skip:
             self._force_metadata_exchange = False
             for req in scheduled_batch.all_requests():
@@ -1173,6 +1234,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             return
 
         metadata_exchange_skipped = self._skip_metadata_exchange
+        worker_metadata_available = False
         if metadata_exchange_skipped:
             if self._pending_persistence_leases:
                 raise RuntimeError(
@@ -1184,11 +1246,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         else:
 
             def build_exchange():
+                def build_update() -> ConnectorUpdate:
+                    if self._state_only_updates_enabled:
+                        return self.scheduler.build_connector_update(
+                            self._scheduler_output
+                        )
+                    return ConnectorWorkerMetadata(
+                        self.scheduler.build_connector_meta(self._scheduler_output)
+                    )
+
                 try:
                     leases = self._pending_persistence_leases
                     if not leases:
-                        metadata = self.scheduler.build_connector_meta(self._scheduler_output)
-                        return True, metadata, None, None
+                        update = build_update()
+                        return True, update, None, None
                     descriptors = self._persistence_lease_descriptors(leases)
                     if self._persistence_resolution_error is not None:
                         error_type, error_message = self._persistence_resolution_error
@@ -1198,19 +1269,19 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                         raise RuntimeError(
                             "Leader did not snapshot persistence keys when leases were created"
                         )
-                    metadata = self.scheduler.build_connector_meta(self._scheduler_output)
-                    return True, metadata, descriptors, persistence_keys
+                    update = build_update()
+                    return True, update, descriptors, persistence_keys
                 # pyo3 PanicException inherits BaseException. Convert every
                 # leader failure into data so peer ranks reach the broadcast.
                 except BaseException as error:
                     return False, type(error).__name__, str(error), None
 
             exchange = self._run_on_leader(build_exchange)
-            exchange_ok, metadata, leader_descriptors, persistence_keys = exchange
+            exchange_ok, update, leader_descriptors, persistence_keys = exchange
             if not exchange_ok:
                 raise RuntimeError(
                     "Connector leader metadata or persistence resolution failed: "
-                    f"{metadata}: {leader_descriptors}"
+                    f"{update}: {leader_descriptors}"
                 )
 
             local_descriptors = self._persistence_lease_descriptors(
@@ -1232,11 +1303,24 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     )
                 self._resolved_persistence_keys = [int(key) for key in persistence_keys]
 
+            if isinstance(update, ConnectorWorkerMetadata):
+                metadata = update.metadata
+                worker_metadata_available = True
+            elif isinstance(update, ConnectorStateOnly):
+                metadata = None
+                worker_metadata_available = False
+            else:
+                raise RuntimeError(
+                    "Connector scheduler returned an unsupported update type: "
+                    f"{type(update).__name__}"
+                )
+
         self._scheduler_output = None
         self._metadata_pending = False
         self._skip_metadata_exchange = False
+        self._metadata_request_ids = None
 
-        if not metadata_exchange_skipped:
+        if worker_metadata_available:
             self.worker.bind_connector_meta(metadata)
             self._worker_batch_hooks_pending = True
 
@@ -1349,6 +1433,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         all_finished = self.local_finished_async_requests.extract_by_id(
             intersect_finished_saving, intersect_finished_loading
         )
+
+        # Scheduler-output cursors retain the complete prompt token list. They
+        # are no longer needed once every rank has completed an asynchronous
+        # save, so release them with the request instead of retaining every
+        # finished prompt for the lifetime of the engine.
+        for request_id in all_finished.saving:
+            self.scheduler_output_manager.requests.pop(request_id, None)
+            self.scheduler_output_manager.external_loads.pop(request_id, None)
 
         # For requests that have finished loading, move them back to the context state.
         for id, req in all_finished.loading.items():

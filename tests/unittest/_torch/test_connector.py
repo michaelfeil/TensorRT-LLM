@@ -24,7 +24,7 @@ import pytest
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests, KvCacheConnectorManager,
+    AsyncRequests, ConnectorStateOnly, KvCacheConnectorManager,
     KvCacheConnectorSchedulerOutputManager, KvCacheConnectorWorker)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -130,6 +130,7 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
         req = MagicMock()
 
         req.request_id = 42
+        manager.scheduler_output_manager.requests[42]
 
         manager.request_finished(req, [])
 
@@ -162,6 +163,7 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
             worker.get_finished.return_value = ([42], [])
 
         assert manager.get_finished() == [req]
+        assert 42 not in manager.scheduler_output_manager.requests
 
         worker.get_finished.reset_mock()
         assert manager.get_finished() == []
@@ -517,6 +519,58 @@ def test_persistence_staging_snapshots_keys_before_metadata_build():
     allgather.assert_called_once_with(descriptors)
 
 
+def test_state_only_connector_update_skips_worker_bind_and_hooks():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    worker.supports_sparse_metadata_updates.return_value = True
+    worker.supports_state_only_connector_updates.return_value = True
+    scheduler = MagicMock()
+    scheduler.build_connector_update.return_value = ConnectorStateOnly()
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+
+    with patch.object(
+        kv_cache_connector,
+        "mpi_broadcast",
+        side_effect=lambda value, root: value,
+    ):
+        manager.handle_metadata()
+
+    scheduler.build_connector_update.assert_called_once_with("scheduler-output")
+    scheduler.build_connector_meta.assert_not_called()
+    worker.bind_connector_meta.assert_not_called()
+    assert not manager.start_worker_batch(MagicMock())
+
+
+def test_state_only_connector_update_broadcasts_persistence_keys():
+    manager, worker, scheduler, _ = _make_persistence_staging_manager()
+    worker.supports_rank_local_metadata_skip.return_value = True
+    worker.supports_sparse_metadata_updates.return_value = True
+    worker.supports_state_only_connector_updates.return_value = True
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    lease = _persistence_lease()
+    manager.add_persistence_leases([lease])
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    scheduler.build_connector_update.return_value = ConnectorStateOnly()
+    descriptors = manager._persistence_lease_descriptors([lease])
+
+    with patch.object(
+        kv_cache_connector,
+        "mpi_broadcast",
+        side_effect=lambda value, root: value,
+    ), patch.object(
+        kv_cache_connector,
+        "mpi_allgather",
+        return_value=[descriptors],
+    ):
+        manager.handle_metadata()
+
+    assert manager.get_resolved_pending_persistence_leases() == ([lease], [101])
+    worker.bind_connector_meta.assert_not_called()
+
+
 def test_persistence_staging_snapshot_precedes_same_object_reuse_registration():
     manager, _, scheduler, _ = _make_persistence_staging_manager()
     old_lease = _persistence_lease(source_block_id=417, block_hash=101)
@@ -799,6 +853,30 @@ def _make_generation_batch(num_tokens: int):
     return req, scheduled_batch
 
 
+def test_filtered_scheduler_output_preserves_omitted_external_loads():
+    manager = KvCacheConnectorSchedulerOutputManager()
+    first_req, scheduled_batch = _make_generation_batch(30)
+    second_req, _ = _make_generation_batch(30)
+    second_req.request_id = 43
+    scheduled_batch.generation_requests.append(second_req)
+    manager.external_loads = {42: 64, 43: 64}
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+
+    output = manager.build_scheduler_output(
+        scheduled_batch,
+        AsyncRequests({}, {}),
+        kv_cache_manager,
+        request_ids={first_req.request_id},
+    )
+
+    assert [req.request_id for req in output.cached_requests] == [42]
+    assert manager.external_loads == {43: 64}
+
+
 def test_persistence_staging_nonleader_marks_exact_decode_boundaries():
     worker = MagicMock(spec=KvCacheConnectorWorker)
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
@@ -977,6 +1055,56 @@ def test_sparse_metadata_updates_force_final_block_completion():
     scheduler.build_connector_meta.assert_called_once()
     output = scheduler.build_connector_meta.call_args.args[0]
     assert output.cached_requests[0].block_hashes == [12345]
+    worker.bind_connector_meta.assert_called_once_with(b"metadata")
+
+
+def test_persistence_staging_metadata_updates_only_changed_requests():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    worker.supports_sparse_metadata_updates.return_value = True
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = True
+    scheduler = MagicMock()
+    scheduler.build_connector_meta.return_value = b"metadata"
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    first_req, scheduled_batch = _make_generation_batch(30)
+    second_req, _ = _make_generation_batch(30)
+    second_req.request_id = 43
+    scheduled_batch.generation_requests.append(second_req)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = [12345]
+
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+    initial_output = scheduler.build_connector_meta.call_args.args[0]
+    assert [req.request_id
+            for req in initial_output.cached_requests] == [42, 43]
+    scheduler.reset_mock()
+    worker.reset_mock()
+
+    first_req.get_num_tokens.return_value = 33
+    second_req.get_num_tokens.return_value = 31
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+
+    output = scheduler.build_connector_meta.call_args.args[0]
+    assert [req.request_id for req in output.cached_requests] == [42]
+    assert output.cached_requests[0].new_tokens == [30, 31, 32]
+    scheduler.advance_without_worker_metadata.assert_not_called()
+    worker.bind_connector_meta.assert_called_once_with(b"metadata")
+
+    scheduler.reset_mock()
+    worker.reset_mock()
+    second_req.get_num_tokens.return_value = 33
+    manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
+    manager.handle_metadata()
+
+    output = scheduler.build_connector_meta.call_args.args[0]
+    assert [req.request_id for req in output.cached_requests] == [43]
+    assert output.cached_requests[0].new_tokens == [30, 31, 32]
+    scheduler.advance_without_worker_metadata.assert_not_called()
     worker.bind_connector_meta.assert_called_once_with(b"metadata")
 
 
@@ -1213,7 +1341,9 @@ def test_connector_manager_mtp_allocation_rewind_stays_state_only():
     kv_cache_manager.get_cache_indices.return_value = [10]
     kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
-    manager._run_on_leader = MagicMock(return_value=b"metadata")
+    manager._run_on_leader = MagicMock(
+        return_value=(True, b"metadata", None, None)
+    )
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
