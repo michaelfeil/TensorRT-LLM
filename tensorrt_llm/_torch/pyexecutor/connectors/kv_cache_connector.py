@@ -48,6 +48,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (
 )
 from tensorrt_llm.bindings.internal.batch_manager import KvCachePersistenceLease, LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.logger import logger
 
 from ..llm_request import get_draft_token_length
 from ..scheduler import ScheduledRequests
@@ -848,6 +849,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
         if self._sparse_metadata_updates_enabled and not self._rank_local_metadata_skip_enabled:
             raise ValueError("Sparse connector metadata updates require rank-local metadata skip")
+        self._drop_pending_persistence_reason: Optional[str] = None
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -982,6 +984,31 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._pending_persistence_leases = []
         self._resolved_persistence_keys = None
         self._persistence_resolution_error = None
+        self._drop_pending_persistence_reason = None
+
+    def discard_pending_persistence_leases(self, lease_ids: List[int]) -> None:
+        """Release an unpublishable batch after its native D2H copy is safe."""
+        if self._drop_pending_persistence_reason is None:
+            raise RuntimeError("Cannot discard a publishable persistence lease batch")
+        pending_lease_ids = [int(lease.lease_id) for lease in self._pending_persistence_leases]
+        if lease_ids != pending_lease_ids:
+            raise RuntimeError(
+                "Discarded persistence lease IDs do not match the pending batch: "
+                f"discarded={lease_ids}, pending={pending_lease_ids}"
+            )
+        unknown_lease_ids = set(lease_ids) - self._outstanding_persistence_lease_ids
+        if unknown_lease_ids:
+            raise RuntimeError(
+                "Cannot discard unknown persistence lease IDs: "
+                f"{sorted(unknown_lease_ids)}"
+            )
+        if lease_ids:
+            self.complete_persistence_leases(lease_ids)
+            self._outstanding_persistence_lease_ids.difference_update(lease_ids)
+        self._pending_persistence_leases = []
+        self._resolved_persistence_keys = None
+        self._persistence_resolution_error = None
+        self._drop_pending_persistence_reason = None
 
     def has_pending_persistence_leases(self) -> bool:
         """Return whether native D2H produced leases awaiting publication."""
@@ -1024,6 +1051,19 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def submit_pending_persistence_leases(self, stream: torch.cuda.Stream) -> None:
         """Submit the full D2H-ready batch before forward without CPU waiting."""
         if not self._uses_secondary_persistence_staging:
+            return
+        # These flags are collective state. Check them before the rank-local
+        # pending batch so an empty rank cannot skip a barrier entered by peers.
+        if self._drop_pending_persistence_reason is not None:
+            self._synchronize_persistence_discard(stream)
+            lease_ids = [int(lease.lease_id) for lease in self._pending_persistence_leases]
+            logger.error(
+                "Discarding connector persistence leases with unresolved exact identities: "
+                "count=%s cause=%s",
+                len(lease_ids),
+                self._drop_pending_persistence_reason,
+            )
+            self.discard_pending_persistence_leases(lease_ids)
             return
         if self._persistence_tail_discard_pending:
             self._synchronize_persistence_discard(stream)
@@ -1441,6 +1481,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         kv_cache_manager: "KVCacheManager",
         num_tokens: int,
     ) -> None:
+        # Native rewind already treats an overlap batch for a released TRT
+        # sequence as a no-op. Mirror that lifecycle boundary before querying
+        # the sequence for connector indices.
+        if not kv_cache_manager.has_active_sequence(req.py_request_id):
+            return
+
         block_size = kv_cache_manager.tokens_per_block
         # The final live token is the next-forward input and has no KV yet.
         completed_blocks = max(num_tokens - 1, 0) // block_size
@@ -1518,25 +1564,41 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     leases = self._pending_persistence_leases
                     if not leases:
                         update = build_update()
-                        return True, update, None, None
+                        return True, update, None, None, None
                     descriptors = self._persistence_lease_descriptors(leases)
                     if self._persistence_resolution_error is not None:
                         error_type, error_message = self._persistence_resolution_error
-                        return False, error_type, error_message, None
+                        discardable_identity_errors = (
+                            "persistence hash mismatch",
+                            "no canonical G2PB persistence key is attached to TRT block",
+                        )
+                        if any(
+                            marker in error_message
+                            for marker in discardable_identity_errors
+                        ):
+                            update = build_update()
+                            return True, update, descriptors, None, error_message
+                        return False, error_type, error_message, None, None
                     persistence_keys = self._resolved_persistence_keys
                     if persistence_keys is None:
                         raise RuntimeError(
                             "Leader did not snapshot persistence keys when leases were created"
                         )
                     update = build_update()
-                    return True, update, descriptors, persistence_keys
+                    return True, update, descriptors, persistence_keys, None
                 # pyo3 PanicException inherits BaseException. Convert every
                 # leader failure into data so peer ranks reach the broadcast.
                 except BaseException as error:
-                    return False, type(error).__name__, str(error), None
+                    return False, type(error).__name__, str(error), None, None
 
             exchange = self._run_on_leader(build_exchange)
-            exchange_ok, update, leader_descriptors, persistence_keys = exchange
+            (
+                exchange_ok,
+                update,
+                leader_descriptors,
+                persistence_keys,
+                drop_persistence_reason,
+            ) = exchange
             if not exchange_ok:
                 raise RuntimeError(
                     "Connector leader metadata or persistence resolution failed: "
@@ -1557,6 +1619,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                         )
                     )
                 self._resolved_persistence_keys = None
+            elif persistence_keys is None:
+                # Identity resolution failed on the leader, so nothing in this
+                # batch is publishable. Every rank drops its complete local
+                # batch after the shared D2H safety barrier.
+                if drop_persistence_reason is None:
+                    raise RuntimeError("Unpublishable persistence batch has no failure reason")
+                self._resolved_persistence_keys = None
+                self._drop_pending_persistence_reason = drop_persistence_reason
             else:
                 leader_descriptors, persistence_keys = (
                     self._converge_persistence_lease_prefix(

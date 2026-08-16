@@ -719,16 +719,137 @@ def test_persistence_staging_converges_to_common_logical_prefix():
     assert manager._outstanding_persistence_lease_ids == {7, 8}
     kv_cache_manager.complete_persistence_leases.assert_not_called()
     scheduler.retire_persistence_identities.assert_called_once_with([(18, 102)])
-    manager._synchronize_persistence_discard = MagicMock()
+    stream = MagicMock()
+    d2h_complete = MagicMock()
+    call_order = []
+    d2h_complete.record.side_effect = lambda _stream: call_order.append("record")
+    d2h_complete.synchronize.side_effect = lambda: call_order.append("synchronize")
+    kv_cache_manager.complete_persistence_leases.side_effect = (
+        lambda _lease_ids: call_order.append("release-tail")
+    )
     worker.submit_pending_persistence_leases.side_effect = (
-        lambda _: manager.mark_persistence_leases_submitted([7]))
+        lambda _: (
+            call_order.append("submit-prefix"),
+            manager.mark_persistence_leases_submitted([7]),
+        )
+    )
+
+    with patch.object(
+        kv_cache_connector.torch.cuda,
+        "Event",
+        return_value=d2h_complete,
+    ), patch.object(
+        kv_cache_connector,
+        "mpi_allgather",
+        side_effect=lambda value: (call_order.append("all-rank-ready"), [value, value])[1],
+    ):
+        manager.submit_pending_persistence_leases(stream)
+
+    d2h_complete.record.assert_called_once_with(stream)
+    d2h_complete.synchronize.assert_called_once_with()
+    assert call_order == [
+        "record",
+        "synchronize",
+        "all-rank-ready",
+        "release-tail",
+        "submit-prefix",
+    ]
+    kv_cache_manager.complete_persistence_leases.assert_called_once_with([8])
+    assert manager._outstanding_persistence_lease_ids == {7}
+    assert not manager._persistence_tail_discard_pending
+
+
+def test_persistence_staging_failed_d2h_readiness_keeps_tail_staged():
+    manager, worker, scheduler, kv_cache_manager = (
+        _make_persistence_staging_manager())
+    leases = [
+        _persistence_lease(lease_id=7, source_block_id=17, block_hash=101),
+        _persistence_lease(
+            lease_id=8,
+            source_block_id=18,
+            block_hash=102,
+            secondary_block_index=4,
+        ),
+    ]
+    scheduler.resolve_persistence_keys.side_effect = None
+    scheduler.resolve_persistence_keys.return_value = [201, 202]
+    manager.add_persistence_leases(leases)
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    descriptors = manager._persistence_lease_descriptors(leases)
+
+    with patch.object(
+        kv_cache_connector,
+        "mpi_broadcast",
+        side_effect=lambda value, root: value,
+    ), patch.object(
+        kv_cache_connector,
+        "mpi_allgather",
+        return_value=[descriptors, descriptors[:1]],
+    ):
+        manager.handle_metadata()
+
+    with patch.object(kv_cache_connector.torch.cuda, "Event"), patch.object(
+        kv_cache_connector,
+        "mpi_allgather",
+        return_value=[(True, None), (False, "rank 1 D2H failed")],
+    ):
+        with pytest.raises(RuntimeError, match="before every rank's D2H copy is safe"):
+            manager.submit_pending_persistence_leases(MagicMock())
+
+    assert manager._pending_persistence_leases == [leases[0]]
+    assert manager._pending_persistence_tail_to_discard == [leases[1]]
+    assert manager._persistence_tail_discard_pending
+    assert manager._outstanding_persistence_lease_ids == {7, 8}
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+    worker.submit_pending_persistence_leases.assert_not_called()
+
+
+def test_persistence_staging_empty_rank_joins_unpublishable_batch_barrier():
+    manager, worker, _, kv_cache_manager = _make_persistence_staging_manager()
+    manager._drop_pending_persistence_reason = "missing exact identity"
+    manager._synchronize_persistence_discard = MagicMock()
 
     manager.submit_pending_persistence_leases(MagicMock())
 
     manager._synchronize_persistence_discard.assert_called_once()
-    kv_cache_manager.complete_persistence_leases.assert_called_once_with([8])
-    assert manager._outstanding_persistence_lease_ids == {7}
-    assert not manager._persistence_tail_discard_pending
+    assert manager._drop_pending_persistence_reason is None
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+    worker.submit_pending_persistence_leases.assert_not_called()
+
+
+def test_persistence_staging_drops_unpublishable_batch_after_d2h_barrier():
+    manager, worker, scheduler, kv_cache_manager = (
+        _make_persistence_staging_manager())
+    lease = _persistence_lease()
+    scheduler.resolve_persistence_keys.side_effect = RuntimeError(
+        "no canonical G2PB persistence key is attached to TRT block"
+    )
+    manager.add_persistence_leases([lease])
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    descriptors = manager._persistence_lease_descriptors([lease])
+
+    with patch.object(
+        kv_cache_connector,
+        "mpi_broadcast",
+        side_effect=lambda value, root: value,
+    ), patch.object(
+        kv_cache_connector,
+        "mpi_allgather",
+        return_value=[descriptors, []],
+    ):
+        manager.handle_metadata()
+
+    assert manager._drop_pending_persistence_reason is not None
+    manager._synchronize_persistence_discard = MagicMock()
+    manager.submit_pending_persistence_leases(MagicMock())
+
+    manager._synchronize_persistence_discard.assert_called_once()
+    kv_cache_manager.complete_persistence_leases.assert_called_once_with([7])
+    worker.submit_pending_persistence_leases.assert_not_called()
+    assert not manager.has_pending_persistence_leases()
+    assert manager._drop_pending_persistence_reason is None
 
 
 def test_persistence_staging_accepts_rank_local_lease_ids():
@@ -2522,11 +2643,13 @@ def test_connector_manager_on_rewind_forwards_to_scheduler():
 
     req = MagicMock()
     req.request_id = 42
+    req.py_request_id = 42
     req.get_num_tokens.return_value = 3
     req.get_tokens.return_value = [1, 2, 3]
 
     kv_cache_manager = MagicMock()
     kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.has_active_sequence.return_value = True
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
     kv_cache_manager.get_connector_cache_indices.return_value = [0, 1]
 
@@ -2559,6 +2682,30 @@ def test_connector_manager_on_rewind_forwards_to_scheduler():
     manager.on_rewind(req, kv_cache_manager)
 
     scheduler.on_rewind.assert_called_once_with(req, [0, 1])
+
+
+def test_connector_manager_on_rewind_ignores_finalized_request():
+    """A stale overlap batch must not query an already-freed TRT sequence."""
+    worker = MagicMock()
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+    req = MagicMock()
+    req.request_id = 42
+    req.py_request_id = 42
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.has_active_sequence.return_value = False
+    kv_cache_manager.get_connector_cache_indices.side_effect = IndexError(
+        "unordered_map::at")
+    kv_cache_manager.get_cache_indices.side_effect = IndexError(
+        "unordered_map::at")
+
+    manager.on_rewind(req, kv_cache_manager)
+
+    kv_cache_manager.has_active_sequence.assert_called_once_with(42)
+    kv_cache_manager.get_connector_cache_indices.assert_not_called()
+    kv_cache_manager.get_cache_indices.assert_not_called()
+    scheduler.on_rewind.assert_not_called()
 
 
 def test_connector_manager_shutdown_is_ordered_and_idempotent():

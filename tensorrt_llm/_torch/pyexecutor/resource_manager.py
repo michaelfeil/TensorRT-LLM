@@ -1056,6 +1056,9 @@ class KVCacheManager(BaseResourceManager):
         self._active_sequence_owners[request.py_request_id] = (
             id(request), getattr(request, "is_dummy_request", False))
 
+    def has_active_sequence(self, request_id: int) -> bool:
+        return request_id in self._active_sequence_owners
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
         # dedicated path so the self-attention flow below stays unconditional.
