@@ -6759,6 +6759,51 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     EXPECT_EQ(remainingAfterContextAlloc, maxNewTokens / tokensPerBlock);
 }
 
+TEST(KVCacheManagerReuseAccountingTest, PrefixReuseLimitCapsEstimateAndAuthoritativeClaim)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr promptLength = 64;
+    auto constexpr maxNewTokens = 32;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxAttentionWindow = 512;
+
+    auto kvCacheManager = createKvCacheManager(
+        KvCacheManagerInstantiationParameters{
+            /* numLayers */ 1,
+            /* numHeads */ 1,
+            /* sizePerHead */ 1,
+            /* tokensPerBlock */ tokensPerBlock,
+            /* blocksPerWindow */ blocksAndWindow(/* numPrimaryBlocks */ 256, /* windowSize */ maxAttentionWindow),
+            /* sinkTokenLength */ 0,
+            /* maxAttentionWindow */ maxAttentionWindow,
+            /* maxBeamWidth */ maxBeamWidth,
+            /* maxNumTokens */ 1024,
+            /* kvCacheBlockReuse */ true,
+        },
+        stream);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+    auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+    auto const tokens = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(promptLength), 7);
+
+    auto source = LlmRequest{0, maxNewTokens, tokens, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+    kvCacheManager->addSequenceBatch({{{source.mRequestId, source.getPromptLen(), maxBeamWidth}}}, {std::ref(source)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(source);
+    kvCacheManager->storeContextBlocks(source);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(source);
+    kvCacheManager->removeSequence(source.mRequestId, source);
+
+    auto request = LlmRequest{1, maxNewTokens, tokens, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+    request.setPrepopulatedPromptLenLimit(tokensPerBlock);
+
+    kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, onlyWindowSize);
+    EXPECT_EQ(request.getEstimatedReusableTokens(), tokensPerBlock);
+
+    kvCacheManager->addSequenceBatch(
+        {{{request.mRequestId, request.getPromptLen(), maxBeamWidth}}}, {std::ref(request)});
+    EXPECT_EQ(request.getPrepopulatedPromptLen(), tokensPerBlock);
+}
+
 // Validates the two independent budgets getNeededBlocksOneStep drives for a first-chunk context request.
 // The block/capacity budget (numRequiredBlocks) credits only allocated reuse, since a free-but-cached
 // block still costs a free-pool block when reused. The compute/token budget (estimatedReusableTokens)

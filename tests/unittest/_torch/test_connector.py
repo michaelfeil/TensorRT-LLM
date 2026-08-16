@@ -27,7 +27,9 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, ConnectorStateOnly, ConnectorWorkerMetadata,
     KvCacheConnectorManager, KvCacheConnectorSchedulerOutputManager,
     KvCacheConnectorWorker)
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState,
+                                                        SamplingConfig)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
                                                              KVCacheManager)
@@ -1600,6 +1602,89 @@ def test_schedulable_reuse_preview_respects_connector_opt_in(
     executor.kv_connector_manager = connector_manager
 
     assert executor._should_apply_schedulable_reuse_preview() is expected
+
+
+def test_connector_reuse_preview_uses_tp_minimum_as_native_claim_limit():
+    executor = object.__new__(PyExecutor)
+    executor.dist = MagicMock(tp_size=4, pp_size=1, cp_size=1)
+    executor.enable_attention_dp = False
+    executor.inflight_req_ids = set()
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.supports_schedulable_reuse_preview.return_value = True
+    executor.kv_cache_manager = MagicMock()
+    executor.kv_cache_manager._active_sequence_owners = {}
+    executor.kv_cache_manager.estimate_reusable_prompt_len_with_summary.side_effect = (
+        lambda request: ({
+            11: 96,
+            12: 64
+        }[request.request_id], MagicMock()))
+
+    requests = []
+    for request_id in (12, 11):
+        request = MagicMock(
+            request_id=request_id,
+            is_context_init_state=True,
+            is_first_context_chunk=True,
+            prepopulated_prompt_len_limit=None,
+        )
+        request.clear_prepopulated_prompt_len_limit.side_effect = lambda request=request: setattr(
+            request, "prepopulated_prompt_len_limit", None)
+        requests.append(request)
+
+    executor.dist.tp_allgather.return_value = [
+        (((11, 96), (12, 64)), None),
+        (((11, 32), (12, 64)), None),
+        (((11, 64), (12, 96)), None),
+        (((11, 96), (12, 64)), None),
+    ]
+
+    executor._synchronize_tp_reuse_limits(requests)
+
+    requests_by_id = {request.request_id: request for request in requests}
+    assert requests_by_id[11].prepopulated_prompt_len_limit == 32
+    assert requests_by_id[12].prepopulated_prompt_len_limit == 64
+    assert requests_by_id[11].py_schedulable_reuse_summary is None
+    assert requests_by_id[12].py_schedulable_reuse_summary is None
+    executor.dist.tp_allgather.assert_called_once_with((
+        ((11, 96), (12, 64)),
+        None,
+    ))
+
+
+def test_connector_reuse_preview_avoids_tp_collective_without_context():
+    executor = object.__new__(PyExecutor)
+    executor.dist = MagicMock(tp_size=4, pp_size=1, cp_size=1)
+    executor.enable_attention_dp = False
+    executor.inflight_req_ids = set()
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.supports_schedulable_reuse_preview.return_value = True
+    executor.kv_cache_manager = MagicMock()
+    executor.kv_cache_manager._active_sequence_owners = {}
+    generation_request = MagicMock(
+        request_id=11,
+        is_context_init_state=False,
+        is_first_context_chunk=False,
+    )
+
+    executor._synchronize_tp_reuse_limits([generation_request])
+
+    executor.dist.tp_allgather.assert_not_called()
+
+
+def test_connector_reuse_claim_limit_binding_can_be_cleared():
+    request = LlmRequest(
+        request_id=11,
+        max_new_tokens=1,
+        input_tokens=[1, 2],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+
+    assert request.prepopulated_prompt_len_limit is None
+    request.prepopulated_prompt_len_limit = 16
+    assert request.prepopulated_prompt_len_limit == 16
+    request.clear_prepopulated_prompt_len_limit()
+    assert request.prepopulated_prompt_len_limit is None
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

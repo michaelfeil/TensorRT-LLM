@@ -1653,8 +1653,10 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     PrefixReuseSummary summary;
 
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    auto const maxMatchedTokens
+        = llmRequest.getPrepopulatedPromptLenLimit().value_or(std::numeric_limits<SizeType32>::max());
     auto reuseMatches = findReusableBlockMatches(
-        blockKeys, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false, std::numeric_limits<SizeType32>::max());
+        blockKeys, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false, maxMatchedTokens);
 
     for (auto const& match : reuseMatches.matches)
     {
@@ -3728,19 +3730,26 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             // all unique tokens can over-credit one extra shared block.
             TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
             auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
+            auto reusableBlockLimit = maxRecoverableSharedBlocks;
+            if (auto const reuseLimit = req.getPrepopulatedPromptLenLimit(); reuseLimit.has_value())
+            {
+                TLLM_CHECK_WITH_INFO(*reuseLimit >= 0 && *reuseLimit % getTokensPerBlock() == 0,
+                    "Prefix reuse limit (%d) must be a non-negative multiple of tokens per block (%d)", *reuseLimit,
+                    getTokensPerBlock());
+                reusableBlockLimit = std::min(reusableBlockLimit, *reuseLimit / getTokensPerBlock());
+            }
             // Block (capacity) budget: only allocated reuse reduces free-pool demand. A free-but-cached
             // block still pulls one block from the free pool when reused, so crediting it here would
             // double-count the eviction policy's free count and over-admit requests. Only subtract from
             // shared blocks, since reusable blocks are always shared.
             auto const reusableAllocatedBlocks
-                = std::min({summary.reusableBlocksAllocated, numSharedBlocks, maxRecoverableSharedBlocks});
+                = std::min({summary.reusableBlocksAllocated, numSharedBlocks, reusableBlockLimit});
             numRequiredBlocks -= reusableAllocatedBlocks;
             // Token (compute) budget: all cached prefix blocks skip recompute regardless of ref state,
             // since the engine recovers their KV via prepopulatedPromptLen. This matches the accounting
             // in getRemainingBlocksToCompletion (GUARANTEED_NO_EVICT) so the micro batch scheduler does
             // not under-credit reuse and serialize context requests.
-            auto const reusableAllBlocks
-                = std::min({summary.reusableBlocksAll, numSharedBlocks, maxRecoverableSharedBlocks});
+            auto const reusableAllBlocks = std::min({summary.reusableBlocksAll, numSharedBlocks, reusableBlockLimit});
             req.setEstimatedReusableTokens(reusableAllBlocks * getTokensPerBlock());
         }
         return numRequiredBlocks;
@@ -3900,11 +3909,19 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         // Cap at (promptLen-1)/tpb to avoid over-counting when the prompt is exactly
         // block-aligned (last full block has not been committed to the tree yet).
         SizeType32 const maxRecoverableBlocks = (req.mPromptLen - 1) / getTokensPerBlock();
-        numReusableContextBlocks = std::min({summary.reusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
+        auto reusableBlockLimit = maxRecoverableBlocks;
+        if (auto const reuseLimit = req.getPrepopulatedPromptLenLimit(); reuseLimit.has_value())
+        {
+            TLLM_CHECK_WITH_INFO(*reuseLimit >= 0 && *reuseLimit % getTokensPerBlock() == 0,
+                "Prefix reuse limit (%d) must be a non-negative multiple of tokens per block (%d)", *reuseLimit,
+                getTokensPerBlock());
+            reusableBlockLimit = std::min(reusableBlockLimit, *reuseLimit / getTokensPerBlock());
+        }
+        numReusableContextBlocks = std::min({summary.reusableBlocksAllocated, numContextBlocks, reusableBlockLimit});
         // Token budget: count all reusable blocks (free or allocated). Cached tokens need
         // not be recomputed regardless of whether their blocks currently have active refs.
         req.setEstimatedReusableTokens(
-            std::min({summary.reusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
+            std::min({summary.reusableBlocksAll, numContextBlocks, reusableBlockLimit}) * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
             "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
@@ -4127,6 +4144,15 @@ void KVCacheManager::addSequenceBatch(
         TLLM_CHECK(emplaceDone);
 
         sequences[i] = &seqIt->second;
+        if (auto const reuseLimit = llmRequest.getPrepopulatedPromptLenLimit(); reuseLimit.has_value())
+        {
+            TLLM_CHECK_WITH_INFO(
+                *reuseLimit >= 0 && *reuseLimit < llmRequest.getPromptLen() && *reuseLimit % getTokensPerBlock() == 0,
+                "Prefix reuse limit (%d) for request %lu must be a non-negative multiple of tokens per block (%d) "
+                "and shorter than its prompt (%d)",
+                *reuseLimit, requestId, getTokensPerBlock(), llmRequest.getPromptLen());
+            sequences[i]->setCurrentPrepopulatedPromptLen(*reuseLimit);
+        }
     }
 
     // Track the minimum prepopulated length across all windows per sequence

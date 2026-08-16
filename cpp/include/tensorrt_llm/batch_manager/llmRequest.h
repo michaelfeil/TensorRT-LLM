@@ -932,6 +932,7 @@ public:
         mContextChunkSizeTarget = mPromptLen;
         mContextChunkSizeDraft = mPromptLen;
         mEstimatedReusableTokens = 0;
+        mPrepopulatedPromptLenLimit.reset();
         mSeqSlot.reset();
     }
 
@@ -1231,6 +1232,18 @@ public:
     void setEstimatedReusableTokens(SizeType32 estimatedReusableTokens) const noexcept
     {
         mEstimatedReusableTokens = estimatedReusableTokens;
+    }
+
+    /// @brief Return the cross-rank upper bound for prefix reuse, when one was established.
+    [[nodiscard]] std::optional<SizeType32> getPrepopulatedPromptLenLimit() const noexcept
+    {
+        return mPrepopulatedPromptLenLimit;
+    }
+
+    /// @brief Limit authoritative prefix reuse to a boundary shared by every participating rank.
+    void setPrepopulatedPromptLenLimit(std::optional<SizeType32> prepopulatedPromptLenLimit) noexcept
+    {
+        mPrepopulatedPromptLenLimit = prepopulatedPromptLenLimit;
     }
 
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
@@ -2086,6 +2099,11 @@ protected:
     // capacity-scheduler queries. Reset to 0 after addSequenceBatch sets
     // the authoritative mPrepopulatedPromptLen and advances context position.
     mutable SizeType32 mEstimatedReusableTokens{0};
+
+    // Tensor-parallel ranks can retain different locally reusable prefixes.
+    // The executor establishes their common boundary before scheduling so
+    // allocation and connector metadata stay rank-identical.
+    std::optional<SizeType32> mPrepopulatedPromptLenLimit{std::nullopt};
 
     SizeType32 mMaxSentTokenLen;
 

@@ -2425,6 +2425,85 @@ class PyExecutor:
         return (request.context_current_position, request.context_chunk_size,
                 request.prepopulated_prompt_len)
 
+    def _should_synchronize_tp_reuse_preview(self) -> bool:
+        """Whether connector-visible local reuse needs a TP-wide boundary."""
+        dist = getattr(self, "dist", None)
+        return (dist is not None and dist.tp_size > 1 and dist.pp_size == 1
+                and getattr(dist, "cp_size", 1) == 1
+                and not self.enable_attention_dp
+                and self.kv_connector_manager is not None and
+                self.kv_connector_manager.supports_schedulable_reuse_preview())
+
+    def _synchronize_tp_reuse_limits(self, requests: List[LlmRequest]) -> None:
+        """Constrain local prefix reuse to the minimum visible on every TP rank.
+
+        This collective runs only while a first context chunk is waiting to be
+        scheduled. Decode-only iterations remain collective-free.
+        """
+        if not self._should_synchronize_tp_reuse_preview():
+            return
+
+        active_sequence_owners = getattr(self.kv_cache_manager,
+                                         "_active_sequence_owners", {})
+        candidates = sorted(
+            (request for request in requests
+             if request.is_context_init_state and request.is_first_context_chunk
+             and request.request_id not in active_sequence_owners
+             and request.request_id not in self.inflight_req_ids),
+            key=lambda request: request.request_id)
+        if not candidates:
+            return
+
+        local_limits = []
+        local_error = None
+        estimate_with_summary = getattr(
+            self.kv_cache_manager, "estimate_reusable_prompt_len_with_summary",
+            None)
+        try:
+            for request in candidates:
+                request.clear_prepopulated_prompt_len_limit()
+                if estimate_with_summary is not None:
+                    reuse_limit, _ = estimate_with_summary(request)
+                else:
+                    reuse_limit = (self.kv_cache_manager.
+                                   estimate_reusable_prompt_len(request))
+                local_limits.append((request.request_id, int(reuse_limit)))
+        except Exception as error:
+            local_error = f"{type(error).__name__}: {error}"
+
+        gathered = self.dist.tp_allgather((tuple(local_limits), local_error))
+        errors = [(tp_rank, error)
+                  for tp_rank, (_, error) in enumerate(gathered)
+                  if error is not None]
+        if errors:
+            raise RuntimeError(
+                f"TP prefix-reuse preview failed on ranks {errors}")
+
+        expected_ids = [request.request_id for request in candidates]
+        gathered_ids = [[request_id for request_id, _ in limits]
+                        for limits, _ in gathered]
+        if any(request_ids != expected_ids for request_ids in gathered_ids):
+            raise RuntimeError("TP ranks disagree on prefix-reuse candidates: "
+                               f"{gathered_ids}")
+
+        divergent_limits = []
+        for request, rank_limits in zip(
+                candidates, zip(*(limits for limits, _ in gathered))):
+            limits = [limit for _, limit in rank_limits]
+            reuse_limit = min(limits)
+            request.prepopulated_prompt_len_limit = reuse_limit
+            # Re-probe the tree under the shared cap during capacity
+            # scheduling; a summary captured before consensus may extend past
+            # the boundary that all ranks can claim.
+            request.py_schedulable_reuse_summary = None
+            if min(limits) != max(limits):
+                divergent_limits.append(
+                    (request.request_id, min(limits), max(limits)))
+
+        if divergent_limits:
+            logger.info("TP prefix-reuse consensus constrained requests "
+                        f"{divergent_limits[:8]}")
+
     def _restore_schedulable_reuse_state(self, request: LlmRequest,
                                          state: Tuple[int, int, int]) -> None:
         context_current_position, context_chunk_size, prepopulated_prompt_len = state
@@ -2461,6 +2540,8 @@ class PyExecutor:
         if not self._should_apply_schedulable_reuse_preview():
             return {}
 
+        self._synchronize_tp_reuse_limits(requests)
+
         previewed_states: Dict[int, Tuple[int, int, int]] = {}
         estimate_with_summary = getattr(
             self.kv_cache_manager, "estimate_reusable_prompt_len_with_summary",
@@ -2469,7 +2550,12 @@ class PyExecutor:
             if not request.is_context_init_state or not request.is_first_context_chunk:
                 continue
 
-            if estimate_with_summary is not None:
+            tp_reuse_limit = getattr(request, "prepopulated_prompt_len_limit",
+                                     None)
+            if tp_reuse_limit is not None:
+                reusable_prompt_len = tp_reuse_limit
+                reuse_summary = request.py_schedulable_reuse_summary
+            elif estimate_with_summary is not None:
                 reusable_prompt_len, reuse_summary = estimate_with_summary(
                     request)
             else:
