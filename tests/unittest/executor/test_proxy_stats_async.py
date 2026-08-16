@@ -15,8 +15,11 @@
 
 import asyncio
 import json
+import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock, patch
 
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -74,3 +77,29 @@ def test_proxy_aget_stats_result_from_callback_thread_drains_async():
         return await _collect_async_stats(stats_result)
 
     assert asyncio.run(run()) == [payload]
+
+
+def test_proxy_starts_dispatch_result_thread_once_under_concurrent_submit():
+    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    proxy.dispatch_result_thread = None
+    proxy._dispatch_result_thread_lock = threading.Lock()
+    proxy._error_queue = MagicMock()
+    proxy._handle_background_error = MagicMock()
+    proxy.garbage_collection_gen0_threshold = 0
+    dispatch_thread = MagicMock()
+
+    def create_dispatch_thread(*args, **kwargs):
+        del args, kwargs
+        time.sleep(0.01)
+        return dispatch_thread
+
+    with patch(
+        "tensorrt_llm.executor.proxy.ManagedThread",
+        side_effect=create_dispatch_thread,
+    ) as managed_thread:
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            list(executor.map(lambda _: proxy._start_dispatch_threads(), range(32)))
+
+    managed_thread.assert_called_once()
+    dispatch_thread.start.assert_called_once()
+    assert proxy._handle_background_error.call_count == 32

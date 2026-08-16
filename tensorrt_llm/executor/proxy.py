@@ -146,6 +146,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             worker_kwargs["log_level"] = logger.level
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
+        self._dispatch_result_thread_lock = threading.Lock()
         self.rpc_client: Optional[RPCClient] = None
         self._start_executor_workers(worker_kwargs)
 
@@ -366,17 +367,16 @@ class GenerationExecutorProxy(GenerationExecutor):
     # have been removed as stats and kv_events are now fetched via RPC directly.
 
     def _start_dispatch_threads(self):
-        if self.dispatch_result_thread is None:
-
-            self.dispatch_result_thread = ManagedThread(
-                weakref.WeakMethod(self.dispatch_result_task),
-                error_queue=self._error_queue,
-                name="proxy_dispatch_result_thread",
-                context=customized_gc_thresholds(
-                    self.garbage_collection_gen0_threshold),
-            )
-
-            self.dispatch_result_thread.start()
+        with self._dispatch_result_thread_lock:
+            if self.dispatch_result_thread is None:
+                self.dispatch_result_thread = ManagedThread(
+                    weakref.WeakMethod(self.dispatch_result_task),
+                    error_queue=self._error_queue,
+                    name="proxy_dispatch_result_thread",
+                    context=customized_gc_thresholds(
+                        self.garbage_collection_gen0_threshold),
+                )
+                self.dispatch_result_thread.start()
 
         self._handle_background_error()
 
