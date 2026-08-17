@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import collections
 import os
 import pathlib
@@ -47,11 +50,7 @@ class _FakeKvCacheManagerImpl:
     num_pools = 1
     max_blocks_per_seq = 4
 
-    def __init__(self,
-                 events,
-                 *,
-                 max_num_blocks=8,
-                 indexer_pool_width=None):
+    def __init__(self, events, *, max_num_blocks=8, indexer_pool_width=None):
         self._events = events
         self.max_num_blocks = max_num_blocks
         self._indexer_pool_width = indexer_pool_width
@@ -95,8 +94,7 @@ def _patch_fake_kv_cache_cpp(monkeypatch,
 
     monkeypatch.setattr(resource_manager_module.torch.cuda, "mem_get_info",
                         lambda: (1 << 30, 2 << 30))
-    monkeypatch.setattr(resource_manager_module, "prefer_pinned",
-                        lambda: False)
+    monkeypatch.setattr(resource_manager_module, "prefer_pinned", lambda: False)
     monkeypatch.setattr(resource_manager_module, "KVCacheManagerCpp",
                         fake_kv_cache_manager_cpp)
 
@@ -108,19 +106,19 @@ def test_v1_kv_cache_manager_can_defer_secondary_pool_allocation(monkeypatch):
 
     assert KVCacheManager.supports_deferred_secondary_pool_allocation()
 
-    manager = KVCacheManager(
-        KvCacheConfig(max_tokens=64, enable_block_reuse=False),
-        CacheTypeCpp.SELF,
-        num_layers=1,
-        num_kv_heads=1,
-        head_dim=1,
-        tokens_per_block=8,
-        max_seq_len=64,
-        max_batch_size=1,
-        mapping=Mapping(world_size=1, rank=0),
-        dtype=DataType.HALF,
-        execution_stream=_FakeStream(),
-        defer_secondary_pool_allocation=True)
+    manager = KVCacheManager(KvCacheConfig(max_tokens=64,
+                                           enable_block_reuse=False),
+                             CacheTypeCpp.SELF,
+                             num_layers=1,
+                             num_kv_heads=1,
+                             head_dim=1,
+                             tokens_per_block=8,
+                             max_seq_len=64,
+                             max_batch_size=1,
+                             mapping=Mapping(world_size=1, rank=0),
+                             dtype=DataType.HALF,
+                             execution_stream=_FakeStream(),
+                             defer_secondary_pool_allocation=True)
 
     expected_primary_events = [
         "construct",
@@ -150,6 +148,17 @@ def test_v1_kv_cache_manager_can_defer_secondary_pool_allocation(monkeypatch):
 
     manager.shutdown()
     assert events[-1] == "release_pools"
+
+
+def test_kv_cache_manager_canonicalizes_secondary_staging_through_cpp_impl():
+    manager = object.__new__(KVCacheManager)
+    impl = MagicMock()
+    manager.impl = impl
+
+    manager.canonicalize_free_secondary_staging_block_order()
+
+    impl.canonicalize_free_secondary_staging_block_order.assert_called_once_with(
+    )
 
 
 def test_v1_kv_cache_creator_requires_all_managers_to_defer_secondary(
@@ -231,8 +240,7 @@ def test_create_py_executor_instance_allocates_secondary_before_warmup(
         def __init__(self, *args, **kwargs):
             events.append("py_executor_warmup")
 
-    monkeypatch.setattr(pyexecutor_util, "ResourceManager",
-                        FakeResourceManager)
+    monkeypatch.setattr(pyexecutor_util, "ResourceManager", FakeResourceManager)
     monkeypatch.setattr(pyexecutor_util, "SeqSlotManager",
                         lambda *args, **kwargs: object())
     monkeypatch.setattr(pyexecutor_util, "BindCapacityScheduler",
@@ -303,18 +311,17 @@ def test_v1_dsa_cache_manager_initializes_indexer_after_primary_pool(
         assert kwargs["enable_indexer_k_cache"]
         assert kwargs["indexer_k_cache_index_head_dim"] == index_head_dim
         events.append("construct")
-        return _FakeKvCacheManagerImpl(
-            events,
-            max_num_blocks=num_blocks,
-            indexer_pool_width=indexer_pool_width)
+        return _FakeKvCacheManagerImpl(events,
+                                       max_num_blocks=num_blocks,
+                                       indexer_pool_width=indexer_pool_width)
 
     _patch_fake_kv_cache_cpp(monkeypatch, events, fake_kv_cache_manager_cpp)
 
-    assert dsa_module.DSACacheManager.supports_deferred_secondary_pool_allocation()
+    assert dsa_module.DSACacheManager.supports_deferred_secondary_pool_allocation(
+    )
 
     cache_manager = dsa_module.DSACacheManager(
-        kv_cache_config=KvCacheConfig(max_tokens=64,
-                                      enable_block_reuse=False),
+        kv_cache_config=KvCacheConfig(max_tokens=64, enable_block_reuse=False),
         kv_cache_type=CacheTypeCpp.SELFKONLY,
         num_layers=1,
         num_kv_heads=1,

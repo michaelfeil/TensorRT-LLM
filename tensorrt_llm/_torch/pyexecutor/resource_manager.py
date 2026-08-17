@@ -1982,6 +1982,10 @@ class KVCacheManager(BaseResourceManager):
         """Release connector staging slots after terminal persistence completion."""
         self.impl.complete_persistence_leases(lease_ids)
 
+    def canonicalize_free_secondary_staging_block_order(self) -> None:
+        """Restore deterministic secondary staging allocation across TP ranks."""
+        self.impl.canonicalize_free_secondary_staging_block_order()
+
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         block_ids_per_seq_tensors = [
