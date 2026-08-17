@@ -13,7 +13,7 @@ set -ex
 # before the previous pin admits put to failover without that fix and can
 # crash the worker on a rail failure mid-write.
 UCX_VERSION="master"
-UCX_COMMIT="30a2390dfbca3b90d55cca6d518016ee1b384b8f"
+UCX_COMMIT="6ca3c5ae4484341a0ccfa7ea45e6cb7469d7fa0d"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 UCX_REPO="https://github.com/basetenlabs/ucx.git"
