@@ -1813,7 +1813,13 @@ def test_connector_manager_rewind_hides_unreported_speculative_block():
     kv_cache_manager.get_cache_indices.return_value = [10]
     kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
-    manager._run_on_leader = MagicMock(return_value=b"metadata")
+    manager._run_on_leader = MagicMock(return_value=(
+        True,
+        ConnectorWorkerMetadata(b"metadata"),
+        None,
+        None,
+        None,
+    ))
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
@@ -1845,7 +1851,13 @@ def test_connector_manager_same_block_rewinds_stay_state_only():
     kv_cache_manager.get_cache_indices.return_value = [10]
     kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
-    manager._run_on_leader = MagicMock(return_value=b"metadata")
+    manager._run_on_leader = MagicMock(return_value=(
+        True,
+        ConnectorWorkerMetadata(b"metadata"),
+        None,
+        None,
+        None,
+    ))
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()
@@ -1860,6 +1872,180 @@ def test_connector_manager_same_block_rewinds_stay_state_only():
     assert scheduler.advance_without_worker_metadata.call_count == 3
 
 
+def test_sparse_connector_ignores_unreported_speculative_rewind():
+    manager, scheduler = _make_generation_progress_manager()
+    worker = manager.worker
+    req, scheduled_batch = _make_generation_batch(10)
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.tokens_per_block = 32
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+
+    manager.build_scheduler_output(scheduled_batch,
+                                   kv_cache_manager,
+                                   generation_progress_events_enabled=True)
+    manager.handle_metadata()
+    scheduler.reset_mock()
+    worker.reset_mock()
+    kv_cache_manager.get_cache_indices.reset_mock()
+    kv_cache_manager.get_connector_cache_indices.reset_mock()
+    req.get_num_tokens.return_value = 11
+    req.get_tokens.return_value = list(range(11))
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+
+    manager.record_generation_progress(req,
+                                       kv_cache_manager,
+                                       rewind_required=True,
+                                       computed_tokens=10)
+    manager.build_scheduler_output(scheduled_batch,
+                                   kv_cache_manager,
+                                   generation_progress_events_enabled=True)
+    manager.handle_metadata()
+
+    kv_cache_manager.get_cache_indices.assert_not_called()
+    kv_cache_manager.get_connector_cache_indices.assert_not_called()
+    scheduler.on_rewind.assert_not_called()
+    scheduler.advance_without_worker_metadata.assert_not_called()
+    scheduler.build_connector_update.assert_not_called()
+    worker.bind_connector_meta.assert_not_called()
+
+
+def test_sparse_connector_invisible_rewind_does_not_force_worker_catchup():
+    manager, scheduler = _make_generation_progress_manager()
+    worker = manager.worker
+    req, scheduled_batch = _make_generation_batch(30)
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    scheduler.reset_mock()
+    worker.reset_mock()
+
+    # Advance the leader across a block boundary without worker metadata.
+    req.get_num_tokens.return_value = 33
+    req.get_tokens.return_value = list(range(33))
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    manager.record_generation_progress(req, kv_cache_manager, False, 32)
+    manager.build_scheduler_output(scheduled_batch,
+                                   kv_cache_manager,
+                                   generation_progress_events_enabled=True)
+    manager.handle_metadata()
+    scheduler.advance_without_worker_metadata.assert_called_once()
+    assert manager._worker_visible_progress[req.request_id] == (0, 0)
+    scheduler.reset_mock()
+    worker.reset_mock()
+    kv_cache_manager.get_cache_indices.reset_mock()
+    kv_cache_manager.get_connector_cache_indices.reset_mock()
+
+    # Rejected speculative tokens can transiently reserve another block, but the
+    # accepted request and connector-visible prefixes still retain two blocks.
+    req.get_num_tokens.return_value = 34
+    req.get_tokens.return_value = list(range(34))
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    manager.record_generation_progress(req, kv_cache_manager, True, 33)
+    with patch.object(kv_cache_connector, "mpi_broadcast") as broadcast:
+        manager.build_scheduler_output(scheduled_batch,
+                                       kv_cache_manager,
+                                       generation_progress_events_enabled=True)
+        manager.handle_metadata()
+
+    broadcast.assert_not_called()
+    assert not manager._force_metadata_exchange
+    kv_cache_manager.get_cache_indices.assert_not_called()
+    kv_cache_manager.get_connector_cache_indices.assert_not_called()
+    scheduler.on_rewind.assert_not_called()
+    scheduler.build_connector_update.assert_not_called()
+    scheduler.advance_without_worker_metadata.assert_not_called()
+    worker.bind_connector_meta.assert_not_called()
+
+
+def test_sparse_connector_rewind_trims_acknowledged_tokens():
+    manager, scheduler = _make_generation_progress_manager()
+    req, scheduled_batch = _make_generation_batch(10)
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    scheduler.reset_mock()
+    kv_cache_manager.get_cache_indices.reset_mock()
+    kv_cache_manager.get_connector_cache_indices.reset_mock()
+
+    req.get_num_tokens.return_value = 9
+    req.get_tokens.return_value = list(range(9))
+    manager.record_generation_progress(req, kv_cache_manager, True, 8)
+
+    kv_cache_manager.get_cache_indices.assert_called_once_with(req)
+    kv_cache_manager.get_connector_cache_indices.assert_called_once_with(req)
+    scheduler.on_rewind.assert_called_once_with(req, [10])
+    request_state = manager.scheduler_output_manager.requests[req.request_id]
+    assert request_state.tokens == list(range(9))
+    assert request_state.hash_probe_state is None
+
+
+def test_sparse_connector_rewind_trims_acknowledged_blocks():
+    manager, scheduler = _make_generation_progress_manager()
+    req, scheduled_batch = _make_generation_batch(33)
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    scheduler.reset_mock()
+    kv_cache_manager.get_cache_indices.reset_mock()
+    kv_cache_manager.get_connector_cache_indices.reset_mock()
+
+    req.get_num_tokens.return_value = 31
+    req.get_tokens.return_value = list(range(31))
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+    manager.record_generation_progress(req, kv_cache_manager, True, 30)
+
+    kv_cache_manager.get_cache_indices.assert_called_once_with(req)
+    kv_cache_manager.get_connector_cache_indices.assert_called_once_with(req)
+    scheduler.on_rewind.assert_called_once_with(req, [10])
+    request_state = manager.scheduler_output_manager.requests[req.request_id]
+    assert request_state.block_ids == [10]
+    assert request_state.hash_probe_state is None
+
+
+def test_sparse_connector_rewind_trims_speculative_block_at_exact_boundary():
+    manager, scheduler = _make_generation_progress_manager()
+    req, scheduled_batch = _make_generation_batch(32)
+    kv_cache_manager = MagicMock(tokens_per_block=32)
+    kv_cache_manager.get_cache_indices.return_value = [10, 11]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10, 11]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    _arm_generation_progress_fast_path(manager, scheduled_batch,
+                                       kv_cache_manager)
+    scheduler.reset_mock()
+    kv_cache_manager.get_cache_indices.reset_mock()
+    kv_cache_manager.get_connector_cache_indices.reset_mock()
+
+    # The newly sampled token is the next forward input and has no KV block yet.
+    # Rewinding rejected lookahead at the boundary frees the speculative block.
+    req.get_num_tokens.return_value = 33
+    req.get_tokens.return_value = list(range(33))
+    kv_cache_manager.get_cache_indices.return_value = [10]
+    kv_cache_manager.get_connector_cache_indices.return_value = [10]
+    manager.record_generation_progress(req, kv_cache_manager, True, 32)
+
+    kv_cache_manager.get_cache_indices.assert_called_once_with(req)
+    kv_cache_manager.get_connector_cache_indices.assert_called_once_with(req)
+    scheduler.on_rewind.assert_called_once_with(req, [10])
+    request_state = manager.scheduler_output_manager.requests[req.request_id]
+    assert request_state.block_ids == [10]
+    assert request_state.hash_probe_state is None
+
+
 def test_connector_manager_boundary_rewind_forces_one_exchange():
     worker = MagicMock(spec=KvCacheConnectorWorker)
     worker.supports_rank_local_metadata_skip.return_value = True
@@ -1871,7 +2057,13 @@ def test_connector_manager_boundary_rewind_forces_one_exchange():
     kv_cache_manager.get_cache_indices.return_value = [10]
     kv_cache_manager.get_connector_cache_indices.return_value = [10]
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
-    manager._run_on_leader = MagicMock(return_value=b"metadata")
+    manager._run_on_leader = MagicMock(return_value=(
+        True,
+        ConnectorWorkerMetadata(b"metadata"),
+        None,
+        None,
+        None,
+    ))
 
     manager.build_scheduler_output(scheduled_batch, kv_cache_manager)
     manager.handle_metadata()

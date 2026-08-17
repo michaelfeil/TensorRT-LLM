@@ -742,6 +742,19 @@ class KvCacheConnectorSchedulerOutputManager:
     def record_new_matched_tokens(self, request: LlmRequest, num_new_matched_tokens: int):
         self.external_loads[request.request_id] = num_new_matched_tokens
 
+    def rewind_may_affect_connector_state(
+        self, request_id: int, num_tokens: int, tokens_per_block: int
+    ) -> bool:
+        """Return whether a rewind can trim state already sent to the connector."""
+        request_state = self.requests.get(request_id)
+        if request_state is None:
+            return False
+        computed_tokens = max(num_tokens - 1, 0)
+        minimum_live_blocks = (computed_tokens + tokens_per_block - 1) // tokens_per_block
+        return num_tokens < len(request_state.tokens) or minimum_live_blocks < len(
+            request_state.block_ids
+        )
+
     def on_rewind(
         self,
         req: LlmRequest,
@@ -1489,14 +1502,27 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         block_size = kv_cache_manager.tokens_per_block
         # The final live token is the next-forward input and has no KV yet.
         completed_blocks = max(num_tokens - 1, 0) // block_size
-        live_block_ids = kv_cache_manager.get_connector_cache_indices(req)
-        live_block_object_ids = kv_cache_manager.get_cache_indices(req)
         progress = (completed_blocks, completed_blocks)
+        self._metadata_exchange_progress[req.request_id] = progress
+        self._generation_computed_tokens[req.request_id] = max(num_tokens - 1, 0)
+        # Progress events already dirtied any newly visible full-block boundary.
+        # A rejected suffix that cannot trim an acknowledged prefix needs no
+        # block-ID materialization or connector callback.
+        if (
+            self._generation_progress_events_enabled
+            and self._sparse_metadata_updates_enabled
+            and not self.scheduler_output_manager.rewind_may_affect_connector_state(
+                req.request_id, num_tokens, block_size
+            )
+        ):
+            # Speculative suffixes are invisible until an accepted full-block
+            # boundary. Rewinding only that suffix cannot change connector state.
+            return
         worker_visible_progress = self._worker_visible_progress.get(req.request_id)
         rewind_crossed_worker_boundary = worker_visible_progress != progress
         self._force_metadata_exchange |= rewind_crossed_worker_boundary
-        self._metadata_exchange_progress[req.request_id] = progress
-        self._generation_computed_tokens[req.request_id] = max(num_tokens - 1, 0)
+        live_block_ids = kv_cache_manager.get_connector_cache_indices(req)
+        live_block_object_ids = kv_cache_manager.get_cache_indices(req)
         scheduler_live_block_ids = None
         if self.scheduler is not None or self._uses_secondary_persistence_staging:
             scheduler_live_block_ids = self.scheduler_output_manager.on_rewind(
