@@ -898,6 +898,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._resolved_persistence_keys: Optional[List[int]] = None
         self._persistence_resolution_error: Optional[Tuple[str, str]] = None
         self._outstanding_persistence_lease_ids: Set[int] = set()
+        self._outstanding_persistence_lease_logical_descriptors: Dict[int, Tuple[int, int]] = {}
+        self._pending_terminal_persistence_lease_ids: List[int] = []
         self._kv_cache_manager: Optional["KVCacheManager"] = None
         if self._uses_secondary_persistence_staging:
             self.worker.bind_persistence_lease_manager(self)
@@ -949,6 +951,15 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 self._persistence_resolution_error = (type(error).__name__, str(error))
 
         self._outstanding_persistence_lease_ids.update(unique_lease_ids)
+        self._outstanding_persistence_lease_logical_descriptors.update(
+            {
+                int(lease.lease_id): (
+                    int(lease.block_hash),
+                    int(lease.secondary_block_index),
+                )
+                for lease in leases
+            }
+        )
         self._pending_persistence_leases.extend(leases)
         # refresh_blocks runs before build_scheduler_output. Force that update
         # through the existing metadata broadcast so resolution adds no
@@ -1015,6 +1026,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if lease_ids:
             self.complete_persistence_leases(lease_ids)
             self._outstanding_persistence_lease_ids.difference_update(lease_ids)
+            for lease_id in lease_ids:
+                del self._outstanding_persistence_lease_logical_descriptors[lease_id]
         self._canonicalize_free_secondary_staging_block_order()
         self._pending_persistence_leases = []
         self._resolved_persistence_keys = None
@@ -1053,6 +1066,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if tail_ids:
             self.complete_persistence_leases(tail_ids)
             self._outstanding_persistence_lease_ids.difference_update(tail_ids)
+            for lease_id in tail_ids:
+                del self._outstanding_persistence_lease_logical_descriptors[lease_id]
         self._canonicalize_free_secondary_staging_block_order()
         self._pending_persistence_tail_to_discard = []
         self._persistence_tail_discard_pending = False
@@ -1162,23 +1177,74 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return leader_prefix, self._resolved_persistence_keys
 
     def reap_completed_persistence_leases(self) -> None:
-        """Release terminal staging leases before the next scheduling pass."""
+        """Stage terminal leases for release at a replicated metadata boundary.
+
+        Persistence publication finishes on background threads, so its result
+        becomes visible at slightly different wall-clock times on each TP rank.
+        Releasing here would let one rank recycle a global secondary slot before
+        its peers and break the single-owner replicated host topology.  The next
+        non-skipped metadata exchange converges the logical terminal prefix and
+        releases every rank's local lease handles together.
+        """
         if not self._outstanding_persistence_lease_ids:
             return
 
-        terminal_ids = set(self.worker.poll_globally_completed_persistence_leases())
-        unknown_terminal = terminal_ids - self._outstanding_persistence_lease_ids
+        terminal_ids = [
+            int(lease_id) for lease_id in self.worker.poll_globally_completed_persistence_leases()
+        ]
+        terminal_set = set(terminal_ids)
+        if len(terminal_set) != len(terminal_ids):
+            raise RuntimeError(
+                f"Connector globally completed duplicate persistence lease IDs: {terminal_ids}"
+            )
+        unknown_terminal = terminal_set - self._outstanding_persistence_lease_ids
         if unknown_terminal:
             raise RuntimeError(
                 "Connector globally completed unknown persistence lease IDs: "
                 f"{sorted(unknown_terminal)}"
             )
-        if not terminal_ids:
-            return
+        duplicate_terminal = terminal_set & set(self._pending_terminal_persistence_lease_ids)
+        if duplicate_terminal:
+            raise RuntimeError(
+                "Connector repeated terminal persistence lease IDs before release: "
+                f"{sorted(duplicate_terminal)}"
+            )
+        self._pending_terminal_persistence_lease_ids.extend(terminal_ids)
 
-        ordered_terminal_ids = sorted(terminal_ids)
-        self.complete_persistence_leases(ordered_terminal_ids)
-        self._outstanding_persistence_lease_ids.difference_update(terminal_ids)
+    def _pending_terminal_persistence_logical_descriptors(
+        self,
+    ) -> List[Tuple[int, int]]:
+        return [
+            self._outstanding_persistence_lease_logical_descriptors[lease_id]
+            for lease_id in self._pending_terminal_persistence_lease_ids
+        ]
+
+    def _release_converged_terminal_persistence_prefix(
+        self, rank_logical_descriptors: List[List[Tuple[int, int]]]
+    ) -> None:
+        """Release only the terminal logical prefix visible on every TP rank."""
+        if not rank_logical_descriptors:
+            raise RuntimeError("Terminal persistence convergence requires at least one rank")
+        common_count = min(len(value) for value in rank_logical_descriptors)
+        if common_count == 0:
+            return
+        leader_prefix = rank_logical_descriptors[0][:common_count]
+        for rank, descriptors in enumerate(rank_logical_descriptors[1:], start=1):
+            logical_prefix = descriptors[:common_count]
+            if logical_prefix != leader_prefix:
+                raise RuntimeError(
+                    "Terminal persistence prefixes diverged across ranks: "
+                    f"rank={rank}, lengths="
+                    f"{[len(value) for value in rank_logical_descriptors]}, "
+                    f"leader={leader_prefix}, rank_value={logical_prefix}"
+                )
+
+        local_terminal_ids = self._pending_terminal_persistence_lease_ids[:common_count]
+        self.complete_persistence_leases(local_terminal_ids)
+        self._outstanding_persistence_lease_ids.difference_update(local_terminal_ids)
+        for lease_id in local_terminal_ids:
+            del self._outstanding_persistence_lease_logical_descriptors[lease_id]
+        del self._pending_terminal_persistence_lease_ids[:common_count]
 
     def shutdown(self) -> None:
         if self._is_shutdown:
@@ -1639,7 +1705,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             local_descriptors = self._persistence_lease_descriptors(
                 self._pending_persistence_leases
             )
-            rank_descriptors = mpi_allgather(local_descriptors)
+            local_terminal_logical_descriptors = (
+                self._pending_terminal_persistence_logical_descriptors()
+            )
+            rank_persistence_state = mpi_allgather(
+                (local_descriptors, local_terminal_logical_descriptors)
+            )
+            rank_descriptors = [state[0] for state in rank_persistence_state]
+            rank_terminal_logical_descriptors = [state[1] for state in rank_persistence_state]
             if leader_descriptors is None:
                 if any(rank_descriptors):
                     leader_descriptors, persistence_keys = self._converge_persistence_lease_prefix(
@@ -1663,6 +1736,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     leader_descriptors,
                     persistence_keys,
                 )
+            self._release_converged_terminal_persistence_prefix(rank_terminal_logical_descriptors)
 
             if isinstance(update, ConnectorWorkerMetadata):
                 metadata = update.metadata

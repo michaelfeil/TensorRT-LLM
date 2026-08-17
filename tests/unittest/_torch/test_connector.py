@@ -24,15 +24,16 @@ import pytest
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests, ConnectorStateOnly, ConnectorWorkerMetadata,
-    KvCacheConnectorManager, KvCacheConnectorSchedulerOutputManager,
-    KvCacheConnectorWorker)
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
-                                                        LlmRequestState,
-                                                        SamplingConfig)
+    AsyncRequests,
+    ConnectorStateOnly,
+    ConnectorWorkerMetadata,
+    KvCacheConnectorManager,
+    KvCacheConnectorSchedulerOutputManager,
+    KvCacheConnectorWorker,
+)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
-                                                             KVCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -460,11 +461,106 @@ def test_persistence_staging_reaps_coordinated_terminal_lease_without_mpi():
         manager.reap_completed_persistence_leases()
 
     allgather.assert_not_called()
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+    assert manager._pending_terminal_persistence_lease_ids == [7]
+
+    manager._release_converged_terminal_persistence_prefix([[(101, 3)]])
+
     kv_cache_manager.complete_persistence_leases.assert_called_once_with([7])
+    assert manager._pending_terminal_persistence_lease_ids == []
 
     worker.poll_globally_completed_persistence_leases.reset_mock()
     manager.reap_completed_persistence_leases()
     worker.poll_globally_completed_persistence_leases.assert_not_called()
+
+
+def test_persistence_staging_waits_for_every_rank_before_recycling_slot():
+    manager, worker, _, kv_cache_manager = _make_persistence_staging_manager()
+    lease = _persistence_lease()
+    manager.add_persistence_leases([lease])
+    manager.mark_persistence_leases_submitted([7])
+    worker.poll_globally_completed_persistence_leases.return_value = [7]
+    manager.reap_completed_persistence_leases()
+
+    manager._release_converged_terminal_persistence_prefix([[(101, 3)], []])
+
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+    assert manager._pending_terminal_persistence_lease_ids == [7]
+
+    manager._release_converged_terminal_persistence_prefix([[(101, 3)],
+                                                            [(101, 3)]])
+
+    kv_cache_manager.complete_persistence_leases.assert_called_once_with([7])
+    assert manager._outstanding_persistence_lease_ids == set()
+    assert manager._outstanding_persistence_lease_logical_descriptors == {}
+
+
+def test_persistence_staging_releases_only_common_terminal_prefix():
+    manager, worker, _, kv_cache_manager = _make_persistence_staging_manager()
+    leases = [
+        _persistence_lease(lease_id=7, block_hash=101, secondary_block_index=3),
+        _persistence_lease(lease_id=8, block_hash=102, secondary_block_index=4),
+    ]
+    manager.add_persistence_leases(leases)
+    manager.mark_persistence_leases_submitted([7, 8])
+    worker.poll_globally_completed_persistence_leases.return_value = [7, 8]
+    manager.reap_completed_persistence_leases()
+
+    manager._release_converged_terminal_persistence_prefix(
+        [[(101, 3), (102, 4)], [(101, 3)]]
+    )
+
+    kv_cache_manager.complete_persistence_leases.assert_called_once_with([7])
+    assert manager._pending_terminal_persistence_lease_ids == [8]
+    assert manager._outstanding_persistence_lease_ids == {8}
+    assert manager._outstanding_persistence_lease_logical_descriptors == {8: (102, 4)}
+
+
+def test_persistence_staging_rejects_divergent_terminal_prefix():
+    manager, worker, _, kv_cache_manager = _make_persistence_staging_manager()
+    leases = [
+        _persistence_lease(lease_id=7, block_hash=101, secondary_block_index=3),
+        _persistence_lease(lease_id=8, block_hash=102, secondary_block_index=4),
+    ]
+    manager.add_persistence_leases(leases)
+    manager.mark_persistence_leases_submitted([7, 8])
+    worker.poll_globally_completed_persistence_leases.return_value = [7, 8]
+    manager.reap_completed_persistence_leases()
+
+    with pytest.raises(RuntimeError, match="Terminal persistence prefixes diverged"):
+        manager._release_converged_terminal_persistence_prefix(
+            [[(101, 3), (102, 4)], [(101, 3), (999, 4)]]
+        )
+
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+    assert manager._pending_terminal_persistence_lease_ids == [7, 8]
+
+
+def test_metadata_exchange_recycles_globally_terminal_persistence_prefix():
+    manager, worker, scheduler, kv_cache_manager = (
+        _make_persistence_staging_manager())
+    lease = _persistence_lease()
+    manager.add_persistence_leases([lease])
+    manager.mark_persistence_leases_submitted([7])
+    worker.poll_globally_completed_persistence_leases.return_value = [7]
+    manager.reap_completed_persistence_leases()
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    scheduler.build_connector_meta.return_value = b"metadata"
+
+    with patch.object(
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
+    ), patch.object(
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[([], [(101, 3)]), ([], [(101, 3)])],
+    ):
+        manager.handle_metadata()
+
+    kv_cache_manager.complete_persistence_leases.assert_called_once_with([7])
+    assert manager._pending_terminal_persistence_lease_ids == []
 
 
 def _persistence_lease(
@@ -513,7 +609,7 @@ def test_persistence_staging_snapshots_keys_before_metadata_build():
             side_effect=lambda value, root: value,
     ) as broadcast, patch(
             "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
-            return_value=[descriptors],
+            return_value=[(descriptors, [])],
     ) as allgather:
         manager.handle_metadata()
 
@@ -522,7 +618,7 @@ def test_persistence_staging_snapshots_keys_before_metadata_build():
     scheduler.build_connector_meta.assert_called_once_with("scheduler-output")
     scheduler.resolve_persistence_keys.assert_called_once_with([17], [101])
     broadcast.assert_called_once()
-    allgather.assert_called_once_with(descriptors)
+    allgather.assert_called_once_with((descriptors, []))
 
 
 def test_state_only_connector_update_skips_worker_bind_and_hooks():
@@ -569,7 +665,7 @@ def test_state_only_connector_update_broadcasts_persistence_keys():
     ), patch.object(
             kv_cache_connector,
             "mpi_allgather",
-            return_value=[descriptors],
+            return_value=[(descriptors, [])],
     ):
         manager.handle_metadata()
 
@@ -647,7 +743,7 @@ def test_persistence_staging_accepts_rank_local_handles_and_priority():
     ), patch.object(
             kv_cache_connector,
             "mpi_allgather",
-            return_value=[descriptors, remote_descriptors],
+            return_value=[(descriptors, []), (remote_descriptors, [])],
     ):
         manager.handle_metadata()
 
@@ -677,7 +773,10 @@ def test_persistence_staging_rejects_content_or_secondary_slot_divergence(
     ), patch.object(
             kv_cache_connector,
             "mpi_allgather",
-            return_value=[descriptors, [tuple(remote_descriptor)]],
+            return_value=[
+                (descriptors, []),
+                ([tuple(remote_descriptor)], []),
+            ],
     ):
         with pytest.raises(RuntimeError, match="diverged across ranks"):
             manager.handle_metadata()
@@ -703,11 +802,11 @@ def test_persistence_staging_releases_rank_tail_when_leader_is_empty():
     ), patch.object(
             kv_cache_connector,
             "mpi_allgather",
-            return_value=[[], divergent],
+            return_value=[([], []), (divergent, [])],
     ) as allgather:
         manager.handle_metadata()
 
-    allgather.assert_called_once_with([])
+    allgather.assert_called_once_with(([], []))
     assert manager._resolved_persistence_keys is None
     assert manager._persistence_tail_discard_pending
     manager._synchronize_persistence_discard = MagicMock()
@@ -749,7 +848,7 @@ def test_persistence_staging_converges_to_common_content_and_slot_prefix():
     ), patch.object(
             kv_cache_connector,
             "mpi_allgather",
-            return_value=[descriptors, remote_prefix],
+            return_value=[(descriptors, []), (remote_prefix, [])],
     ):
         manager.handle_metadata()
 
@@ -794,7 +893,7 @@ def test_persistence_staging_failed_d2h_readiness_keeps_tail_staged():
     ), patch.object(
             kv_cache_connector,
             "mpi_allgather",
-            return_value=[descriptors, descriptors[:1]],
+            return_value=[(descriptors, []), (descriptors[:1], [])],
     ):
         manager.handle_metadata()
 
@@ -849,7 +948,7 @@ def test_persistence_staging_drops_unpublishable_rank_local_batch_after_barrier(
     ), patch.object(
             kv_cache_connector,
             "mpi_allgather",
-            return_value=[descriptors, []],
+            return_value=[(descriptors, []), ([], [])],
     ):
         manager.handle_metadata()
 
@@ -885,7 +984,7 @@ def test_persistence_staging_accepts_rank_local_lease_ids():
     ), patch.object(
             kv_cache_connector,
             "mpi_allgather",
-            return_value=[descriptors, remote_descriptors],
+            return_value=[(descriptors, []), (remote_descriptors, [])],
     ):
         manager.handle_metadata()
 
