@@ -58,6 +58,9 @@ public:
 
     /// @brief Check if a block is currently in a free queue
     virtual bool isBlockFree(BlockPtr const& block) const = 0;
+
+    /// @brief Reset and canonicalize a non-reusable free staging level.
+    virtual void canonicalizeFreeStagingBlockOrder(SizeType32 cacheLevel) = 0;
 };
 
 struct ExpiringBlockComparator
@@ -101,6 +104,8 @@ public:
     bool verifyQueueIntegrity() const override;
 
     bool isBlockFree(BlockPtr const& block) const override;
+
+    void canonicalizeFreeStagingBlockOrder(SizeType32 cacheLevel) override;
 
 private:
     /// @brief A fixed-size container supporting both non-negative and negative indexing.

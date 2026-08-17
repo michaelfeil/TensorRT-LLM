@@ -628,8 +628,9 @@ def test_persistence_staging_broadcasts_resolution_error_and_retains_batch():
     assert manager._resolved_persistence_keys is None
 
 
-def test_persistence_staging_rejects_rank_divergence():
-    manager, _, scheduler, _ = _make_persistence_staging_manager()
+def test_persistence_staging_accepts_rank_local_handles_and_priority():
+    manager, _, scheduler, kv_cache_manager = _make_persistence_staging_manager(
+    )
     lease = _persistence_lease()
     scheduler.resolve_persistence_keys.side_effect = None
     scheduler.resolve_persistence_keys.return_value = [202]
@@ -637,19 +638,54 @@ def test_persistence_staging_rejects_rank_divergence():
     manager._scheduler_output = "scheduler-output"
     manager._metadata_pending = True
     descriptors = manager._persistence_lease_descriptors([lease])
-    divergent = [(*descriptors[0][:-1], descriptors[0][-1] + 1)]
+    remote_descriptors = [(99, 1234, descriptors[0][2], descriptors[0][3], 7)]
 
-    with patch(
-            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+    with patch.object(
+            kv_cache_connector,
+            "mpi_broadcast",
             side_effect=lambda value, root: value,
-    ), patch(
-            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
-            return_value=[descriptors, divergent],
+    ), patch.object(
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[descriptors, remote_descriptors],
+    ):
+        manager.handle_metadata()
+
+    assert manager.get_resolved_pending_persistence_leases() == ([lease], [202])
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+
+
+@pytest.mark.parametrize("field_index", [2, 3])
+def test_persistence_staging_rejects_content_or_secondary_slot_divergence(
+        field_index):
+    manager, worker, scheduler, kv_cache_manager = (
+        _make_persistence_staging_manager())
+    lease = _persistence_lease()
+    scheduler.resolve_persistence_keys.side_effect = None
+    scheduler.resolve_persistence_keys.return_value = [201]
+    manager.add_persistence_leases([lease])
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+    descriptors = manager._persistence_lease_descriptors([lease])
+    remote_descriptor = list(descriptors[0])
+    remote_descriptor[field_index] += 1
+
+    with patch.object(
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
+    ), patch.object(
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[descriptors, [tuple(remote_descriptor)]],
     ):
         with pytest.raises(RuntimeError, match="diverged across ranks"):
             manager.handle_metadata()
 
-    assert manager.has_pending_persistence_leases()
+    assert manager._pending_persistence_leases == [lease]
+    assert manager._outstanding_persistence_lease_ids == {7}
+    kv_cache_manager.complete_persistence_leases.assert_not_called()
+    worker.submit_pending_persistence_leases.assert_not_called()
 
 
 def test_persistence_staging_releases_rank_tail_when_leader_is_empty():
@@ -660,11 +696,13 @@ def test_persistence_staging_releases_rank_tail_when_leader_is_empty():
     scheduler.build_connector_meta.return_value = b"metadata"
     divergent = manager._persistence_lease_descriptors([_persistence_lease()])
 
-    with patch(
-            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_broadcast",
+    with patch.object(
+            kv_cache_connector,
+            "mpi_broadcast",
             side_effect=lambda value, root: value,
-    ), patch(
-            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather",
+    ), patch.object(
+            kv_cache_connector,
+            "mpi_allgather",
             return_value=[[], divergent],
     ) as allgather:
         manager.handle_metadata()
@@ -678,11 +716,13 @@ def test_persistence_staging_releases_rank_tail_when_leader_is_empty():
 
     manager._synchronize_persistence_discard.assert_called_once()
     kv_cache_manager.complete_persistence_leases.assert_not_called()
+    kv_cache_manager.canonicalize_free_secondary_staging_block_order.assert_called_once_with(
+    )
     worker.submit_pending_persistence_leases.assert_not_called()
     assert not manager._persistence_tail_discard_pending
 
 
-def test_persistence_staging_converges_to_common_logical_prefix():
+def test_persistence_staging_converges_to_common_content_and_slot_prefix():
     manager, worker, scheduler, kv_cache_manager = (
         _make_persistence_staging_manager())
     leases = [
@@ -700,61 +740,35 @@ def test_persistence_staging_converges_to_common_logical_prefix():
     manager._scheduler_output = "scheduler-output"
     manager._metadata_pending = True
     descriptors = manager._persistence_lease_descriptors(leases)
+    remote_prefix = [(99, 1234, descriptors[0][2], descriptors[0][3], 7)]
 
     with patch.object(
-        kv_cache_connector,
-        "mpi_broadcast",
-        side_effect=lambda value, root: value,
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
     ), patch.object(
-        kv_cache_connector,
-        "mpi_allgather",
-        return_value=[descriptors, descriptors[:1]],
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[descriptors, remote_prefix],
     ):
         manager.handle_metadata()
 
     assert manager.get_resolved_pending_persistence_leases() == ([leases[0]],
-                                                                  [201])
+                                                                 [201])
     assert manager._pending_persistence_tail_to_discard == [leases[1]]
     assert manager._persistence_tail_discard_pending
     assert manager._outstanding_persistence_lease_ids == {7, 8}
-    kv_cache_manager.complete_persistence_leases.assert_not_called()
     scheduler.retire_persistence_identities.assert_called_once_with([(18, 102)])
-    stream = MagicMock()
-    d2h_complete = MagicMock()
-    call_order = []
-    d2h_complete.record.side_effect = lambda _stream: call_order.append("record")
-    d2h_complete.synchronize.side_effect = lambda: call_order.append("synchronize")
-    kv_cache_manager.complete_persistence_leases.side_effect = (
-        lambda _lease_ids: call_order.append("release-tail")
-    )
+    manager._synchronize_persistence_discard = MagicMock()
     worker.submit_pending_persistence_leases.side_effect = (
-        lambda _: (
-            call_order.append("submit-prefix"),
-            manager.mark_persistence_leases_submitted([7]),
-        )
-    )
+        lambda _: manager.mark_persistence_leases_submitted([7]))
 
-    with patch.object(
-        kv_cache_connector.torch.cuda,
-        "Event",
-        return_value=d2h_complete,
-    ), patch.object(
-        kv_cache_connector,
-        "mpi_allgather",
-        side_effect=lambda value: (call_order.append("all-rank-ready"), [value, value])[1],
-    ):
-        manager.submit_pending_persistence_leases(stream)
+    manager.submit_pending_persistence_leases(MagicMock())
 
-    d2h_complete.record.assert_called_once_with(stream)
-    d2h_complete.synchronize.assert_called_once_with()
-    assert call_order == [
-        "record",
-        "synchronize",
-        "all-rank-ready",
-        "release-tail",
-        "submit-prefix",
-    ]
+    manager._synchronize_persistence_discard.assert_called_once()
     kv_cache_manager.complete_persistence_leases.assert_called_once_with([8])
+    kv_cache_manager.canonicalize_free_secondary_staging_block_order.assert_called_once_with(
+    )
     assert manager._outstanding_persistence_lease_ids == {7}
     assert not manager._persistence_tail_discard_pending
 
@@ -763,13 +777,8 @@ def test_persistence_staging_failed_d2h_readiness_keeps_tail_staged():
     manager, worker, scheduler, kv_cache_manager = (
         _make_persistence_staging_manager())
     leases = [
-        _persistence_lease(lease_id=7, source_block_id=17, block_hash=101),
-        _persistence_lease(
-            lease_id=8,
-            source_block_id=18,
-            block_hash=102,
-            secondary_block_index=4,
-        ),
+        _persistence_lease(lease_id=7, block_hash=101),
+        _persistence_lease(lease_id=8, block_hash=102, secondary_block_index=4),
     ]
     scheduler.resolve_persistence_keys.side_effect = None
     scheduler.resolve_persistence_keys.return_value = [201, 202]
@@ -779,22 +788,23 @@ def test_persistence_staging_failed_d2h_readiness_keeps_tail_staged():
     descriptors = manager._persistence_lease_descriptors(leases)
 
     with patch.object(
-        kv_cache_connector,
-        "mpi_broadcast",
-        side_effect=lambda value, root: value,
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
     ), patch.object(
-        kv_cache_connector,
-        "mpi_allgather",
-        return_value=[descriptors, descriptors[:1]],
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[descriptors, descriptors[:1]],
     ):
         manager.handle_metadata()
 
     with patch.object(kv_cache_connector.torch.cuda, "Event"), patch.object(
-        kv_cache_connector,
-        "mpi_allgather",
-        return_value=[(True, None), (False, "rank 1 D2H failed")],
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[(True, None), (False, "rank 1 D2H failed")],
     ):
-        with pytest.raises(RuntimeError, match="before every rank's D2H copy is safe"):
+        with pytest.raises(RuntimeError,
+                           match="before every rank's D2H copy is safe"):
             manager.submit_pending_persistence_leases(MagicMock())
 
     assert manager._pending_persistence_leases == [leases[0]]
@@ -815,29 +825,31 @@ def test_persistence_staging_empty_rank_joins_unpublishable_batch_barrier():
     manager._synchronize_persistence_discard.assert_called_once()
     assert manager._drop_pending_persistence_reason is None
     kv_cache_manager.complete_persistence_leases.assert_not_called()
+    kv_cache_manager.canonicalize_free_secondary_staging_block_order.assert_called_once_with(
+    )
     worker.submit_pending_persistence_leases.assert_not_called()
 
 
-def test_persistence_staging_drops_unpublishable_batch_after_d2h_barrier():
+def test_persistence_staging_drops_unpublishable_rank_local_batch_after_barrier(
+):
     manager, worker, scheduler, kv_cache_manager = (
         _make_persistence_staging_manager())
     lease = _persistence_lease()
     scheduler.resolve_persistence_keys.side_effect = RuntimeError(
-        "no canonical G2PB persistence key is attached to TRT block"
-    )
+        "no canonical G2PB persistence key is attached to TRT block")
     manager.add_persistence_leases([lease])
     manager._scheduler_output = "scheduler-output"
     manager._metadata_pending = True
     descriptors = manager._persistence_lease_descriptors([lease])
 
     with patch.object(
-        kv_cache_connector,
-        "mpi_broadcast",
-        side_effect=lambda value, root: value,
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
     ), patch.object(
-        kv_cache_connector,
-        "mpi_allgather",
-        return_value=[descriptors, []],
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[descriptors, []],
     ):
         manager.handle_metadata()
 
@@ -847,14 +859,16 @@ def test_persistence_staging_drops_unpublishable_batch_after_d2h_barrier():
 
     manager._synchronize_persistence_discard.assert_called_once()
     kv_cache_manager.complete_persistence_leases.assert_called_once_with([7])
+    kv_cache_manager.canonicalize_free_secondary_staging_block_order.assert_called_once_with(
+    )
     worker.submit_pending_persistence_leases.assert_not_called()
     assert not manager.has_pending_persistence_leases()
     assert manager._drop_pending_persistence_reason is None
 
 
 def test_persistence_staging_accepts_rank_local_lease_ids():
-    manager, _, scheduler, kv_cache_manager = (
-        _make_persistence_staging_manager())
+    manager, _, scheduler, kv_cache_manager = _make_persistence_staging_manager(
+    )
     lease = _persistence_lease(lease_id=7)
     scheduler.resolve_persistence_keys.side_effect = None
     scheduler.resolve_persistence_keys.return_value = [201]
@@ -865,13 +879,13 @@ def test_persistence_staging_accepts_rank_local_lease_ids():
     remote_descriptors = [(99, *descriptors[0][1:])]
 
     with patch.object(
-        kv_cache_connector,
-        "mpi_broadcast",
-        side_effect=lambda value, root: value,
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
     ), patch.object(
-        kv_cache_connector,
-        "mpi_allgather",
-        return_value=[descriptors, remote_descriptors],
+            kv_cache_connector,
+            "mpi_allgather",
+            return_value=[descriptors, remote_descriptors],
     ):
         manager.handle_metadata()
 

@@ -1081,6 +1081,9 @@ public:
     //! Release secondary-pool staging leases after connector persistence reaches a terminal state.
     void completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds);
 
+    //! Canonicalize free secondary staging slots after replicated TP ranks discard unequal lease batches.
+    void canonicalizeFreeSecondaryStagingBlockOrder();
+
     //! \brief Get iteration stats (deltas since last call) for this window. Resets internal delta snapshots.
     [[nodiscard]] KvCacheIterationStats getAndResetIterationStats();
 
@@ -1716,6 +1719,9 @@ public:
     //! Release connector persistence staging leases after terminal completion.
     void completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds);
 
+    //! Canonicalize free secondary staging slots after replicated TP ranks discard unequal lease batches.
+    void canonicalizeFreeSecondaryStagingBlockOrder();
+
     //! \brief Get per-window-size iteration stats. Resets delta snapshots for each window.
     [[nodiscard]] std::map<SizeType32, KvCacheIterationStats> getAndResetIterationStats();
 
@@ -2196,6 +2202,11 @@ public:
     virtual void completePersistenceLeases(std::vector<std::uint64_t> const& /*leaseIds*/)
     {
         TLLM_THROW("completePersistenceLeases is not implemented for this KV cache manager.");
+    }
+
+    virtual void canonicalizeFreeSecondaryStagingBlockOrder()
+    {
+        TLLM_THROW("canonicalizeFreeSecondaryStagingBlockOrder is not implemented for this KV cache manager.");
     }
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
@@ -2743,6 +2754,11 @@ public:
     void completePersistenceLeases(std::vector<std::uint64_t> const& leaseIds) override
     {
         mBlockManager.completePersistenceLeases(leaseIds);
+    }
+
+    void canonicalizeFreeSecondaryStagingBlockOrder() override
+    {
+        mBlockManager.canonicalizeFreeSecondaryStagingBlockOrder();
     }
 
     void flushPendingPersistenceRetirements() override

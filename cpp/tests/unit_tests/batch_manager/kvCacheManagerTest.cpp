@@ -10353,6 +10353,7 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_SecondaryPersistenceStagingLeaseLife
     mgr->completePersistenceLeases({lease.leaseId});
     EXPECT_EQ(mgr->getBlockManager().getNumFreeSecondaryBlocks(), 1);
     EXPECT_TRUE(leasedBlock->getUniqueTokens().empty());
+    EXPECT_NO_THROW(mgr->canonicalizeFreeSecondaryStagingBlockOrder());
     EXPECT_THROW(mgr->completePersistenceLeases({lease.leaseId}), std::exception);
     EXPECT_TRUE(mgr->getBlockManager().verifyQueueIntegrity(windowSize));
 

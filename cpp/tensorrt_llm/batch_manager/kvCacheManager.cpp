@@ -1527,6 +1527,17 @@ void WindowBlockManager::completePersistenceLeases(std::vector<std::uint64_t> co
     }
 }
 
+void WindowBlockManager::canonicalizeFreeSecondaryStagingBlockOrder()
+{
+    // A metadata boundary may expose a longer D2H tail on one TP rank. Those
+    // local leases correspond to slots that are already free on shorter ranks.
+    // Re-sort all free secondary slots after every rank releases its local tail
+    // so the next replicated allocation selects the same index everywhere.
+    // Connector staging slots do not remain reusable after publication, so
+    // their rank-local retention metadata can be reset safely.
+    mEvictionPolicy->canonicalizeFreeStagingBlockOrder(kSecondaryLevel);
+}
+
 void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape,
     SizeType32 beamIdx, SizeType32 blockIdx, KVCacheBlock::IdType blockId) const
 {
@@ -3441,6 +3452,13 @@ void BlockManager::completePersistenceLeases(std::vector<std::uint64_t> const& l
     TLLM_CHECK_WITH_INFO(mWindowBlockManagers.size() == 1,
         "Persistence staging lease completion is only supported for a single window size.");
     mWindowBlockManagers.begin()->second.completePersistenceLeases(leaseIds);
+}
+
+void BlockManager::canonicalizeFreeSecondaryStagingBlockOrder()
+{
+    TLLM_CHECK_WITH_INFO(mWindowBlockManagers.size() == 1,
+        "Persistence staging free-slot canonicalization is only supported for a single window size.");
+    mWindowBlockManagers.begin()->second.canonicalizeFreeSecondaryStagingBlockOrder();
 }
 
 void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)

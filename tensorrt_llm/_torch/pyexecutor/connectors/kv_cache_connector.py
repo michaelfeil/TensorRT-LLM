@@ -880,9 +880,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._generation_progress_fast_path_armed = False
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
         self._pending_persistence_leases: List[KvCachePersistenceLease] = []
-        self._pending_persistence_tail_to_discard: List[
-            KvCachePersistenceLease
-        ] = []
+        self._pending_persistence_tail_to_discard: List[KvCachePersistenceLease] = []
         self._persistence_tail_discard_pending = False
         self._resolved_persistence_keys: Optional[List[int]] = None
         self._persistence_resolution_error: Optional[Tuple[str, str]] = None
@@ -999,12 +997,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         unknown_lease_ids = set(lease_ids) - self._outstanding_persistence_lease_ids
         if unknown_lease_ids:
             raise RuntimeError(
-                "Cannot discard unknown persistence lease IDs: "
-                f"{sorted(unknown_lease_ids)}"
+                f"Cannot discard unknown persistence lease IDs: {sorted(unknown_lease_ids)}"
             )
         if lease_ids:
             self.complete_persistence_leases(lease_ids)
             self._outstanding_persistence_lease_ids.difference_update(lease_ids)
+        self._canonicalize_free_secondary_staging_block_order()
         self._pending_persistence_leases = []
         self._resolved_persistence_keys = None
         self._persistence_resolution_error = None
@@ -1033,10 +1031,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def _discard_persistence_lease_tail(self) -> None:
         if not self._persistence_tail_discard_pending:
             raise RuntimeError("No persistence lease tail is pending discard")
-        tail_ids = [
-            int(lease.lease_id)
-            for lease in self._pending_persistence_tail_to_discard
-        ]
+        tail_ids = [int(lease.lease_id) for lease in self._pending_persistence_tail_to_discard]
         unknown_tail_ids = set(tail_ids) - self._outstanding_persistence_lease_ids
         if unknown_tail_ids:
             raise RuntimeError(
@@ -1045,6 +1040,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if tail_ids:
             self.complete_persistence_leases(tail_ids)
             self._outstanding_persistence_lease_ids.difference_update(tail_ids)
+        self._canonicalize_free_secondary_staging_block_order()
         self._pending_persistence_tail_to_discard = []
         self._persistence_tail_discard_pending = False
 
@@ -1084,6 +1080,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             raise RuntimeError("Persistence lease completion requires a bound KV cache manager")
         self._kv_cache_manager.complete_persistence_leases(lease_ids)
 
+    def _canonicalize_free_secondary_staging_block_order(self) -> None:
+        """Realign replicated TP staging-slot allocation after a discard."""
+        if self._kv_cache_manager is None:
+            raise RuntimeError(
+                "Persistence staging canonicalization requires a bound KV cache manager"
+            )
+        self._kv_cache_manager.canonicalize_free_secondary_staging_block_order()
+
     def _converge_persistence_lease_prefix(
         self,
         rank_descriptors: List[List[Tuple[int, int, int, int, int]]],
@@ -1097,20 +1101,22 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         shorter staging tail for one allocation even though all ranks evicted
         the same logical block order. Publishing only the common prefix is
         safe; a rank-local tail has not been submitted to the connector yet and
-        can be released just like an unsuccessful native offload.
+        can be released like an unsuccessful native offload. C++ canonicalizes
+        the free secondary-slot order after release so future TP allocations
+        remain aligned.
 
-        Lease IDs are deliberately excluded from the logical comparison. They
-        are rank-local handles and can differ after one rank rolled back a
-        longer tail in an earlier batch.
+        Lease and source block IDs are rank-local handles. Priority is also
+        owner-local metadata. The framework hash proves logical contents and
+        the global secondary index proves every rank refers to the same slot.
         """
         if not rank_descriptors:
             raise RuntimeError("Persistence lease convergence requires at least one rank")
 
         common_count = min(len(descriptors) for descriptors in rank_descriptors)
         leader_prefix = leader_descriptors[:common_count]
-        leader_logical_prefix = [descriptor[1:] for descriptor in leader_prefix]
+        leader_logical_prefix = [descriptor[2:4] for descriptor in leader_prefix]
         for rank, descriptors in enumerate(rank_descriptors):
-            logical_prefix = [descriptor[1:] for descriptor in descriptors[:common_count]]
+            logical_prefix = [descriptor[2:4] for descriptor in descriptors[:common_count]]
             if logical_prefix == leader_logical_prefix:
                 continue
             first_mismatch = next(
@@ -1131,22 +1137,15 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         local_tail = self._pending_persistence_leases[common_count:]
         if self.scheduler is not None and local_tail:
             self.scheduler.retire_persistence_identities(
-                [
-                    (int(lease.source_block_id), int(lease.block_hash))
-                    for lease in local_tail
-                ]
+                [(int(lease.source_block_id), int(lease.block_hash)) for lease in local_tail]
             )
         self._pending_persistence_tail_to_discard = list(local_tail)
         self._persistence_tail_discard_pending = any(
             len(descriptors) != common_count for descriptors in rank_descriptors
         )
-        self._pending_persistence_leases = self._pending_persistence_leases[
-            :common_count
-        ]
+        self._pending_persistence_leases = self._pending_persistence_leases[:common_count]
 
-        self._resolved_persistence_keys = [
-            int(key) for key in persistence_keys[:common_count]
-        ]
+        self._resolved_persistence_keys = [int(key) for key in persistence_keys[:common_count]]
         return leader_prefix, self._resolved_persistence_keys
 
     def reap_completed_persistence_leases(self) -> None:
@@ -1566,16 +1565,22 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                         update = build_update()
                         return True, update, None, None, None
                     descriptors = self._persistence_lease_descriptors(leases)
+                    if self._drop_pending_persistence_reason is not None:
+                        update = build_update()
+                        return (
+                            True,
+                            update,
+                            descriptors,
+                            None,
+                            self._drop_pending_persistence_reason,
+                        )
                     if self._persistence_resolution_error is not None:
                         error_type, error_message = self._persistence_resolution_error
                         discardable_identity_errors = (
                             "persistence hash mismatch",
                             "no canonical G2PB persistence key is attached to TRT block",
                         )
-                        if any(
-                            marker in error_message
-                            for marker in discardable_identity_errors
-                        ):
+                        if any(marker in error_message for marker in discardable_identity_errors):
                             update = build_update()
                             return True, update, descriptors, None, error_message
                         return False, error_type, error_message, None, None
@@ -1611,29 +1616,26 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             rank_descriptors = mpi_allgather(local_descriptors)
             if leader_descriptors is None:
                 if any(rank_descriptors):
-                    leader_descriptors, persistence_keys = (
-                        self._converge_persistence_lease_prefix(
-                            rank_descriptors,
-                            [],
-                            [],
-                        )
+                    leader_descriptors, persistence_keys = self._converge_persistence_lease_prefix(
+                        rank_descriptors,
+                        [],
+                        [],
                     )
                 self._resolved_persistence_keys = None
             elif persistence_keys is None:
                 # Identity resolution failed on the leader, so nothing in this
                 # batch is publishable. Every rank drops its complete local
-                # batch after the shared D2H safety barrier.
+                # batch after the shared D2H safety barrier. C++ canonicalizes
+                # free secondary-slot order after the rank-local releases.
                 if drop_persistence_reason is None:
                     raise RuntimeError("Unpublishable persistence batch has no failure reason")
                 self._resolved_persistence_keys = None
                 self._drop_pending_persistence_reason = drop_persistence_reason
             else:
-                leader_descriptors, persistence_keys = (
-                    self._converge_persistence_lease_prefix(
-                        rank_descriptors,
-                        leader_descriptors,
-                        persistence_keys,
-                    )
+                leader_descriptors, persistence_keys = self._converge_persistence_lease_prefix(
+                    rank_descriptors,
+                    leader_descriptors,
+                    persistence_keys,
                 )
 
             if isinstance(update, ConnectorWorkerMetadata):

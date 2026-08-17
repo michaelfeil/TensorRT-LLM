@@ -147,6 +147,39 @@ bool LRUEvictionPolicy::isBlockFree(BlockPtr const& block) const
     return mFreeBlockIterators[id] != std::nullopt;
 }
 
+void LRUEvictionPolicy::canonicalizeFreeStagingBlockOrder(SizeType32 cacheLevel)
+{
+    TLLM_CHECK_WITH_INFO(cacheLevel >= 0 && cacheLevel < static_cast<SizeType32>(mFreeQueues.size()),
+        "Cannot canonicalize invalid cache level %d.", cacheLevel);
+    auto& priorityQueues = mFreeQueues[cacheLevel];
+    auto& canonicalQueue = priorityQueues[defaultPriorityIdx];
+    for (SizeType32 priorityIdx = 0; priorityIdx < kNumPriorities; ++priorityIdx)
+    {
+        if (priorityIdx == defaultPriorityIdx)
+        {
+            continue;
+        }
+        auto& queue = priorityQueues[priorityIdx];
+        // std::list::splice preserves iterators, including mFreeBlockIterators.
+        canonicalQueue.splice(canonicalQueue.end(), queue);
+    }
+    for (auto const& block : canonicalQueue)
+    {
+        // Erase before clearing expiration because the heap comparator reads it.
+        mExpiringBlockHeap.erase(block);
+        block->setPriority(kDefaultPriority);
+        block->setDurationMs(std::nullopt);
+        block->setExpirationTime(std::nullopt);
+    }
+    canonicalQueue.sort(
+        [](BlockPtr const& lhs, BlockPtr const& rhs)
+        {
+            auto const lhsIndex = lhs->getMemoryPoolBlockIndex();
+            auto const rhsIndex = rhs->getMemoryPoolBlockIndex();
+            return lhsIndex != rhsIndex ? lhsIndex < rhsIndex : lhs->getBlockId() < rhs->getBlockId();
+        });
+}
+
 std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
     SizeType32 const level = wantPlaceholder ? kPlaceholderLevel : cacheLevel;

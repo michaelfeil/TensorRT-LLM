@@ -20,6 +20,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -116,6 +117,71 @@ TEST_F(LRUPolicyTest, ReleaseBlockTest)
     policy->releaseBlock(origPrimaryBlock);
 
     EXPECT_NE(origPrimaryBlock->getBlockId(), std::get<0>(policy->getFreeBlock(0))->getBlockId());
+}
+
+TEST_F(LRUPolicyTest, CanonicalizeFreeStagingBlockOrderAcrossRankLocalPriorities)
+{
+    auto makePolicy = []()
+    {
+        auto rankPolicy = std::make_shared<MockLRUPolicy>();
+        std::vector<BlockPtr> blocks;
+        for (KVCacheBlock::IdType blockId = 0; blockId < NUM_PRIMARY_BLOCKS; ++blockId)
+        {
+            blocks.push_back(std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{blockId, false}));
+        }
+        for (KVCacheBlock::IdType blockId = 0; blockId < NUM_SECONDARY_BLOCKS; ++blockId)
+        {
+            blocks.push_back(
+                std::make_shared<KVCacheBlock>(NUM_PRIMARY_BLOCKS + blockId, tk::KVCacheIndex{blockId, true}));
+        }
+        rankPolicy->initialize(blocks, {NUM_PRIMARY_BLOCKS, NUM_SECONDARY_BLOCKS}, std::nullopt);
+        return rankPolicy;
+    };
+    auto rank0 = makePolicy();
+    auto rank1 = makePolicy();
+    std::vector<BlockPtr> rank0Blocks;
+    std::vector<BlockPtr> rank1Blocks;
+    for (int index = 0; index < NUM_SECONDARY_BLOCKS; ++index)
+    {
+        rank0Blocks.push_back(std::get<0>(rank0->getFreeBlock(1)));
+        rank0->claimBlock(rank0Blocks.back());
+        rank1Blocks.push_back(std::get<0>(rank1->getFreeBlock(1)));
+        rank1->claimBlock(rank1Blocks.back());
+    }
+
+    rank0->claimBlock(rank0Blocks[0], KvCacheRetentionConfig::kMaxRetentionPriority, std::nullopt);
+    rank1->claimBlock(rank1Blocks[1], KvCacheRetentionConfig::kMaxRetentionPriority, std::nullopt);
+    rank0->claimBlock(rank0Blocks[2], KvCacheRetentionConfig::kDefaultRetentionPriority, std::chrono::milliseconds{5});
+    rank1->claimBlock(rank1Blocks[3], KvCacheRetentionConfig::kDefaultRetentionPriority, std::chrono::milliseconds{5});
+    for (auto const index : {3, 1, 0, 2})
+    {
+        rank0->releaseBlock(rank0Blocks[index]);
+    }
+    for (auto const index : {2, 0, 3, 1})
+    {
+        rank1->releaseBlock(rank1Blocks[index]);
+    }
+
+    rank0->canonicalizeFreeStagingBlockOrder(1);
+    rank1->canonicalizeFreeStagingBlockOrder(1);
+
+    for (int expectedIndex = 0; expectedIndex < NUM_SECONDARY_BLOCKS; ++expectedIndex)
+    {
+        auto rank0Block = std::get<0>(rank0->getFreeBlock(1));
+        auto rank1Block = std::get<0>(rank1->getFreeBlock(1));
+        EXPECT_EQ(rank0Block->getMemoryPoolBlockIndex(), expectedIndex);
+        EXPECT_EQ(rank1Block->getMemoryPoolBlockIndex(), expectedIndex);
+        for (auto const& block : {rank0Block, rank1Block})
+        {
+            EXPECT_EQ(block->getPriority(), KvCacheRetentionConfig::kDefaultRetentionPriority);
+            EXPECT_FALSE(block->getDurationMs().has_value());
+            EXPECT_FALSE(block->getExpirationTime().has_value());
+        }
+        rank0->claimBlock(rank0Block);
+        rank1->claimBlock(rank1Block);
+    }
+    EXPECT_TRUE(rank0->verifyQueueIntegrity());
+    EXPECT_TRUE(rank1->verifyQueueIntegrity());
 }
 
 TEST_F(LRUPolicyTest, PooledPlaceholderReleaseReturnsToPlaceholderQueue)
