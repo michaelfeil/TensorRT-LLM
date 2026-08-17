@@ -87,6 +87,7 @@ class B10CacheTransferAgent(BaseTransferAgent):
         send_admission_bypass_bytes: Optional[int] = None,
     ):
         self.name = name
+        self._device_id = torch.cuda.current_device() if torch.cuda.is_available() else None
         self._advertised_ifname = b10_net._advertised_ifname_from_ucx_net_devices()
         b10_net._augment_ucx_net_devices_for_sockaddr()
         self._ucxx = ucxx_module or b10_net._load_ucxx_module()
@@ -328,6 +329,8 @@ class B10CacheTransferAgent(BaseTransferAgent):
         self._loop_thread.join(timeout=10)
 
     def _run_loop(self) -> None:
+        if self._device_id is not None:
+            torch.cuda.set_device(self._device_id)
         asyncio.set_event_loop(self._core.loop)
         self._loop_started.set()
         try:

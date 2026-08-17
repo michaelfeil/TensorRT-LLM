@@ -128,6 +128,24 @@ def _make_uninitialized_b10_agent(
     return agent
 
 
+def test_b10_agent_loop_uses_rank_cuda_device(monkeypatch):
+    agent = B10CacheTransferAgent.__new__(B10CacheTransferAgent)
+    agent._device_id = 3
+    agent._loop_started = Mock()
+    agent._core = types.SimpleNamespace(loop=Mock())
+    set_devices = []
+    monkeypatch.setattr(torch.cuda, "set_device", set_devices.append)
+    monkeypatch.setattr(asyncio, "set_event_loop", Mock())
+    monkeypatch.setattr(asyncio, "all_tasks", Mock(return_value=set()))
+
+    agent._run_loop()
+
+    assert set_devices == [3]
+    agent._loop_started.set.assert_called_once_with()
+    agent._core.loop.run_forever.assert_called_once_with()
+    agent._core.loop.close.assert_called_once_with()
+
+
 @pytest.mark.asyncio
 async def test_b10_lock_with_timeout_scopes_ownership():
     lock = asyncio.Lock()
