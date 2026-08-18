@@ -24,6 +24,21 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from tensorrt_llm import logger
 
 
+def _format_endpoint_handles(endpoint: Any) -> str:
+    """The UCX pointers by which UCX's own logs name an endpoint.
+
+    UCX identifies an endpoint in its diagnostics only as `worker %p ... ep %p`
+    (e.g. `ucp_worker.c: keepalive failed on ep 0x.. lane[n]`). Emitting the
+    same two pointers next to a peer's name is what makes those lines
+    attributable. Never raises: this only ever decorates a log line, and a
+    closed endpoint must not turn that into a failure.
+    """
+    try:
+        return f"ucp_ep=0x{endpoint.ucp_endpoint:x} ucp_worker=0x{endpoint.ucp_worker:x}"
+    except Exception as exc:
+        return f"ucp_ep=unavailable ({type(exc).__name__})"
+
+
 def _abort_endpoint_background(endpoint: Any) -> None:
     def abort() -> None:
         try:

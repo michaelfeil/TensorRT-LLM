@@ -51,6 +51,17 @@ _TRACE_LEVEL_DEBUG = "debug"
 # load); the startup budget must comfortably exceed that.
 _DEFAULT_AGENT_STARTUP_TIMEOUT_S = 120.0
 
+# How often each agent restates its live endpoint -> peer table.
+#
+# Endpoints are logged when created, but UCX endpoint diagnostics repeat for
+# the life of the process: a keepalive that has been failing for hours points
+# at an endpoint whose creation line has long since aged out of the log store,
+# leaving the pointer unattributable exactly when it matters. Restating the
+# table bounds how far back a query has to reach to name a peer. Five minutes
+# is one line per rank per five minutes and sits inside any usable retention
+# window; 0 disables it.
+_DEFAULT_ENDPOINT_INVENTORY_INTERVAL_S = 300.0
+
 
 def _trace_transfer_level_from_env() -> str:
     value = os.getenv(_TRACE_TRANSFERS_ENV, _TRACE_LEVEL_NONE).lower()
@@ -88,6 +99,7 @@ class B10AgentConfig:
     recv_scratch_metadata_max_spans: Optional[int]
     trace_transfer_level: str
     startup_timeout_s: float
+    endpoint_inventory_interval_s: float
 
     @classmethod
     def from_env(
@@ -193,6 +205,12 @@ class B10AgentConfig:
         )
         if startup_timeout_s <= 0:
             raise ValueError("startup_timeout_s must be positive")
+        endpoint_inventory_interval_s = float(
+            os.getenv(
+                "TRTLLM_B10_UCXX_ENDPOINT_INVENTORY_INTERVAL_S",
+                str(_DEFAULT_ENDPOINT_INVENTORY_INTERVAL_S),
+            )
+        )
         return cls(
             port=port,
             endpoint_pool_size=endpoint_pool_size,
@@ -211,4 +229,5 @@ class B10AgentConfig:
             recv_scratch_metadata_max_spans=scratch_metadata_max_spans,
             trace_transfer_level=_trace_transfer_level_from_env(),
             startup_timeout_s=startup_timeout_s,
+            endpoint_inventory_interval_s=endpoint_inventory_interval_s,
         )

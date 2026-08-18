@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.b10.am import B10AmDispatcher
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
     _acquire_with_timeout,
     _await_detached_with_timeout,
+    _format_endpoint_handles,
     _is_retryable_endpoint_error,
     _lock_with_timeout,
     _run_limited,
@@ -387,6 +388,12 @@ class SendPipeline:
             # this; self-contained so replies never depend on registration-
             # plane state. Stable per process, computed once.
             "src_worker_address": self._get_local_worker_address(),
+            # Diagnostic only, and deliberately not derivable from the address
+            # blob above: the receiver knows a sender solely by that opaque
+            # blob, so without this its endpoint logs cannot name the pod on
+            # the other end. Constant per process, and small next to the packed
+            # descriptor arrays this control already carries.
+            "src_identity": self._core.local_identity,
         }
         # plan.dst_descs is the array-backed view carried from
         # _reorder_desc_pairs_for_contiguity, so the encoding below is
@@ -704,9 +711,12 @@ class SendPipeline:
         # NIC failover handles) or a peer that stopped answering (which it
         # cannot). Both otherwise surface as the same timeout/endpoint error.
         cause_detail = "" if cancelled else f" {b10_net.classify_transfer_failure_cause()}"
+        remote = self._endpoints._remote_agents.get(plan.remote_name)
+        remote_host = f"{remote.host}:{remote.port}" if remote is not None else "unregistered"
         logger.warning(
             f"B10 send transfer {plan.transfer_id} {ctx.status}: "
-            f"remote={plan.remote_name} slot_index={lease.slot_index} "
+            f"remote={plan.remote_name} remote_host={remote_host} "
+            f"{_format_endpoint_handles(lease.endpoint)} slot_index={lease.slot_index} "
             f"endpoint_generation={lease.endpoint_generation} "
             f"descs={plan.desc_count} data_chunks={plan.wire_chunk_count} "
             f"total_bytes={plan.total_bytes} {failure_detail}"

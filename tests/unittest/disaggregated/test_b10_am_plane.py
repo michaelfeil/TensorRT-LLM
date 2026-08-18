@@ -543,6 +543,7 @@ def _control_ctx(request_id, endpoint_generation, sender=b"sender-a", transfer_i
         endpoint_generation=endpoint_generation,
         transfer_id=transfer_id,
         src_worker_address=sender,
+        src_identity=f"agent=test-{sender.decode()} pid=0",
         attempt_key=(sender, transfer_id),
         deadline=None,
         endpoint=None,
@@ -718,7 +719,7 @@ def test_handler_releases_the_attempt_slot_when_connecting_back_fails():
     """
 
     async def scenario():
-        async def refuse_connect(_address, _deadline):
+        async def refuse_connect(_ctx):
             raise TimeoutError("reply endpoint timed out")
 
         pipeline = _write_handler_pipeline(refuse_connect, asyncio.get_running_loop())
@@ -749,7 +750,7 @@ def test_handler_yields_to_an_attempt_that_took_over_while_connecting():
     async def scenario():
         connected = asyncio.Event()
 
-        async def slow_connect(_address, _deadline):
+        async def slow_connect(_ctx):
             await connected.wait()
             return object()
 

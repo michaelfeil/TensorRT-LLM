@@ -56,8 +56,12 @@ class _AgentCore:
         staging_buffer_slots: asyncio.BoundedSemaphore,
         recv_scratch_buffer_pool: _CudaScratchBufferPool,
         cuda_copy_streams: _CudaCopyStreamPool,
+        local_identity: str = "",
     ):
         self.config = config
+        # Advertised on every control message so peers can name this process in
+        # their endpoint logs; see net.local_process_identity.
+        self.local_identity = local_identity
         self.loop = loop
         self.transfer_ids = transfer_ids
         self.staging_buffer_pool = staging_buffer_pool

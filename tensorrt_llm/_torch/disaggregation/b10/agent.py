@@ -141,6 +141,7 @@ class B10CacheTransferAgent(BaseTransferAgent):
             staging_buffer_slots=staging_buffer_slots,
             recv_scratch_buffer_pool=recv_scratch_buffer_pool,
             cuda_copy_streams=_CudaCopyStreamPool(),
+            local_identity=b10_net.local_process_identity(name),
         )
         self._endpoints = EndpointPool(
             self._core,
@@ -193,6 +194,7 @@ class B10CacheTransferAgent(BaseTransferAgent):
             raise
         logger.info(
             f"B10 UCXX agent ready: name={self.name} "
+            f"local[{self._core.local_identity}] "
             f"host={self._descriptor.host} port={self._descriptor.port} "
             f"advertised_ifname={self._advertised_ifname} "
             f"transfer_timeout_s={self._core.transfer_timeout_s} "
@@ -363,6 +365,8 @@ class B10CacheTransferAgent(BaseTransferAgent):
                 "B10 ucxx module has no register_am_host_allocator; AM "
                 "receives use ucxx-internal buffers plus a staging copy"
             )
+        if self._core.config.endpoint_inventory_interval_s > 0:
+            self._core.loop.create_task(self._log_endpoint_inventory_forever())
         return B10AgentDescriptor(
             name=self.name,
             host=self._resolve_advertised_host(),
@@ -370,6 +374,27 @@ class B10CacheTransferAgent(BaseTransferAgent):
             features=(_FEATURE_PACKED_DESCS,),
             worker_address=bytes(self._ucxx.get_worker_address()),
         )
+
+    async def _log_endpoint_inventory_forever(self) -> None:
+        """Restate the live endpoint -> peer table on a slow cadence.
+
+        Creation-time logging alone leaves a long-lived endpoint unnameable:
+        UCX keeps reporting a failing endpoint by pointer indefinitely, while
+        the line that named it ages out. Silent when there is nothing open, so
+        an idle rank costs nothing.
+        """
+        interval_s = self._core.config.endpoint_inventory_interval_s
+        while not self._core.shutdown:
+            await asyncio.sleep(interval_s)
+            try:
+                entries = self._endpoints.endpoint_inventory() + self._recv.endpoint_inventory()
+                if entries:
+                    logger.info(
+                        f"B10 endpoint inventory: local[{self._core.local_identity}] "
+                        f"count={len(entries)} || " + " || ".join(entries)
+                    )
+            except Exception as exc:
+                logger.debug(f"B10 endpoint inventory failed: {type(exc).__name__}: {exc}")
 
     def _resolve_advertised_host(self) -> str:
         # The advertised host is informational for the AM wire plane (peers
@@ -394,8 +419,8 @@ class B10CacheTransferAgent(BaseTransferAgent):
             return "0.0.0.0"  # nosec B104 - advertised value, not a bind address
 
     async def _shutdown_async(self) -> None:
-        for address, endpoint in list(self._recv._reply_endpoints.items()):
-            self._recv._drop_reply_endpoint(address, endpoint)
+        for address, record in list(self._recv._reply_endpoints.items()):
+            self._recv._drop_reply_endpoint(address, record.endpoint)
         for name in list(self._endpoints._remote_slots):
             await self._endpoints._drop_remote_slots(name)
         self._dispatcher.detach()

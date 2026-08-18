@@ -1653,8 +1653,13 @@ def _make_send_control_fixture():
     )
     lease = types.SimpleNamespace(endpoint_generation=2)
     # _make_send_control needs the pipeline's local worker address (carried
-    # in-control for the receiver's reverse READY/RESULT endpoint).
-    pipeline = types.SimpleNamespace(_get_local_worker_address=lambda: b"test-worker-address")
+    # in-control for the receiver's reverse READY/RESULT endpoint) and this
+    # process's identity (so the receiver can name the sender in its endpoint
+    # logs — the worker address alone is opaque).
+    pipeline = types.SimpleNamespace(
+        _get_local_worker_address=lambda: b"test-worker-address",
+        _core=types.SimpleNamespace(local_identity="agent=test pid=0"),
+    )
     return pipeline, plan, lease, dst_descs
 
 

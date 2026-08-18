@@ -39,6 +39,7 @@ from tensorrt_llm._torch.disaggregation.b10.am import B10AmDispatcher
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
     _abort_endpoint_background,
     _await_detached_with_timeout,
+    _format_endpoint_handles,
     _gather_cancel_on_failure,
     _lock_with_timeout,
     _run_limited,
@@ -347,6 +348,20 @@ class _RecvRequestActivity:
 
 
 @dataclass(slots=True)
+class _ReplyEndpoint:
+    """A cached reverse endpoint and the peer identity it was opened for.
+
+    The identity is carried alongside rather than looked up on demand because
+    the only key the receive side holds for a sender is an opaque worker
+    address; once the endpoint exists there is nothing left to derive a name
+    from.
+    """
+
+    endpoint: Any
+    identity: str
+
+
+@dataclass(slots=True)
 class _RecvTransfer:
     """Mutable state shared by the phases of one incoming WRITE."""
 
@@ -362,6 +377,11 @@ class _RecvTransfer:
     # reverse endpoint (`endpoint`, assigned right after validation) used
     # for READY/RESULT.
     src_worker_address: bytes
+    # Self-description the sender put in the control message (pod, pid, agent
+    # name). The worker address above is opaque, so this is the only thing
+    # that makes a reverse endpoint - and any UCX diagnostic naming it -
+    # attributable to a peer. "unknown" when the sender predates the field.
+    src_identity: str
     dst_type: str
     dst_descs: _DescArrayView
     transfer_chunks: list[_TransferChunk]
@@ -433,7 +453,7 @@ class RecvPipeline:
         # Worker-address endpoints, same as the send side, so replies are
         # failover-capable too. An entry is dropped when a reply send fails;
         # the next transfer from that sender recreates it.
-        self._reply_endpoints: dict[bytes, Any] = {}
+        self._reply_endpoints: dict[bytes, _ReplyEndpoint] = {}
         dispatcher.set_control_handler(self._on_am_control)
         self._incoming_write_listener: Optional[Callable[[int, bool], None]] = None
         # Predicate answering "is this request still expecting data?". Installed
@@ -714,22 +734,48 @@ class RecvPipeline:
                     f"{_format_staging_pool_state(self._core.staging_buffer_pool)}"
                 )
 
-    async def _get_reply_endpoint(self, src_worker_address: bytes, deadline: Any) -> Any:
-        endpoint = self._reply_endpoints.get(src_worker_address)
-        if endpoint is None:
-            address = self._ucxx.get_ucx_address_from_buffer(src_worker_address)
+    async def _get_reply_endpoint(self, ctx: _RecvTransfer) -> Any:
+        record = self._reply_endpoints.get(ctx.src_worker_address)
+        if record is None:
+            address = self._ucxx.get_ucx_address_from_buffer(ctx.src_worker_address)
             endpoint = await _await_detached_with_timeout(
                 self._ucxx.create_endpoint_from_worker_address(address),
-                deadline.remaining_s(),
+                ctx.deadline.remaining_s(),
                 on_late_result=_abort_endpoint_background,
             )
-            self._reply_endpoints[src_worker_address] = endpoint
-        return endpoint
+            record = _ReplyEndpoint(endpoint=endpoint, identity=ctx.src_identity)
+            self._reply_endpoints[ctx.src_worker_address] = record
+            # The receive side learns a sender only as an opaque worker
+            # address, so this is the sole point where a reverse endpoint's
+            # ucp_ep_h and the pod behind it are both in hand. UCX keepalive
+            # and failover diagnostics name endpoints by pointer only.
+            logger.info(
+                f"B10 reply endpoint created: peer[{ctx.src_identity}] "
+                f"{_format_endpoint_handles(endpoint)} "
+                f"inbound_ucp_ep=0x{ctx.src_ep_handle:x} "
+                f"reply_endpoints={len(self._reply_endpoints)}"
+            )
+        return record.endpoint
 
     def _drop_reply_endpoint(self, src_worker_address: bytes, endpoint: Any) -> None:
-        if self._reply_endpoints.get(src_worker_address) is endpoint:
+        record = self._reply_endpoints.get(src_worker_address)
+        if record is not None and record.endpoint is endpoint:
             self._reply_endpoints.pop(src_worker_address, None)
+            # Pointers get recycled, so a mapping logged above stays truthful
+            # only until here. Debug, not info: a flapping peer drops and
+            # recreates on every failed reply.
+            logger.debug(
+                f"B10 reply endpoint dropped: peer[{record.identity}] "
+                f"{_format_endpoint_handles(endpoint)}"
+            )
         _abort_endpoint_background(endpoint)
+
+    def endpoint_inventory(self) -> list[str]:
+        """One `peer -> ucp_ep` line per live reverse endpoint."""
+        return [
+            f"peer[{record.identity}] {_format_endpoint_handles(record.endpoint)}"
+            for record in self._reply_endpoints.values()
+        ]
 
     async def _handle_incoming_write(self, src_ep_handle: int, control: dict[str, Any]) -> None:
         ctx = self._validate_and_prepare(src_ep_handle, control)
@@ -790,7 +836,7 @@ class RecvPipeline:
         # back to it times out, and a slot left behind would make every later
         # attempt of this transfer look like a duplicate forever.
         try:
-            ctx.endpoint = await self._get_reply_endpoint(ctx.src_worker_address, ctx.deadline)
+            ctx.endpoint = await self._get_reply_endpoint(ctx)
         except BaseException:
             self._requests.end_attempt(ctx.attempt_key, ctx.endpoint_generation)
             raise
@@ -899,6 +945,7 @@ class RecvPipeline:
             endpoint_generation=endpoint_generation,
             src_ep_handle=src_ep_handle,
             src_worker_address=bytes(src_worker_address),
+            src_identity=str(control.get("src_identity") or "unknown"),
             dst_type=dst_type,
             dst_descs=dst_descs,
             transfer_chunks=_transfer_chunks_from_control(control, dst_descs),
@@ -1455,7 +1502,9 @@ class RecvPipeline:
             await self._send_reply_am(ctx, _AM_KIND_RESULT, {"ok": False, "error": str(exc)})
         except Exception as reply_exc:
             logger.warning(
-                f"B10 failed to send failure RESULT for transfer {ctx.transfer_id}: {reply_exc}"
+                f"B10 failed to send failure RESULT for transfer {ctx.transfer_id} "
+                f"to peer[{ctx.src_identity}] "
+                f"{_format_endpoint_handles(ctx.endpoint)}: {reply_exc}"
             )
 
     def _finish_transfer(self, ctx: _RecvTransfer) -> None:

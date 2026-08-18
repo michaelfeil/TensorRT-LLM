@@ -24,9 +24,11 @@ from __future__ import annotations
 from functools import partial
 from typing import Any
 
+from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.b10.async_utils import (
     _abort_endpoint_background,
     _await_detached_with_timeout,
+    _format_endpoint_handles,
     _TransferDeadline,
 )
 from tensorrt_llm._torch.disaggregation.b10.core import _AgentCore
@@ -151,7 +153,33 @@ class EndpointPool:
                 deadline.remaining_s(),
                 on_late_result=_abort_endpoint_background,
             )
+            # The only place the ucp_ep_h is knowable together with the peer it
+            # points at. UCX's own endpoint-level diagnostics (keepalive
+            # failures, failover reconfiguration) identify an endpoint by that
+            # pointer alone, so without this line they cannot be attributed to
+            # a peer.
+            logger.info(
+                f"B10 send endpoint created: remote={remote.name} "
+                f"remote_host={remote.host}:{remote.port} "
+                f"slot_generation={slot.generation} "
+                f"{_format_endpoint_handles(slot.endpoint)}"
+            )
         return slot.endpoint
+
+    def endpoint_inventory(self) -> list[str]:
+        """One `peer -> ucp_ep` line per live send endpoint."""
+        lines = []
+        for remote_name, slots in self._remote_slots.items():
+            remote = self._remote_agents.get(remote_name)
+            host = f"{remote.host}:{remote.port}" if remote is not None else "unregistered"
+            for slot_index, slot in enumerate(slots):
+                if slot.endpoint is not None:
+                    lines.append(
+                        f"remote={remote_name} remote_host={host} slot={slot_index} "
+                        f"generation={slot.generation} "
+                        f"{_format_endpoint_handles(slot.endpoint)}"
+                    )
+        return lines
 
     def _retire_endpoint_slot(
         self, remote_name: str, slot_index: int, slot: _EndpointSlot, endpoint: Any

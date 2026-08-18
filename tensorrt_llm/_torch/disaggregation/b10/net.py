@@ -167,6 +167,31 @@ def _bind_ucxx_python_future_notifier(ucxx_module: Any) -> None:
     ctx.start_notifier_thread()
 
 
+def local_process_identity(agent_name: str) -> str:
+    """Human-joinable identity for this process, advertised to peers.
+
+    UCX names endpoints only by pointer: a keepalive failure reports
+    `worker 0x.. ep 0x.. lane[n]` and nothing about who is on the other end.
+    The pointer is joinable to a peer only if something logs the mapping, and
+    the peer is nameable only if it says who it is. This is the "says who it
+    is" half - it rides every control message so a receiver can name a sender
+    it has never registered.
+
+    In Kubernetes HOSTNAME is the pod name, which is exactly the identifier
+    log queries are already filtered by. NODE_NAME has no default and only
+    appears if the deployment maps it through the downward API; it is omitted
+    rather than guessed at when absent.
+    """
+    parts = [f"agent={agent_name}", f"pid={os.getpid()}"]
+    pod = os.getenv("HOSTNAME")
+    if pod:
+        parts.append(f"pod={pod}")
+    node = os.getenv("NODE_NAME")
+    if node:
+        parts.append(f"node={node}")
+    return " ".join(parts)
+
+
 def _timeout_ms(timeout_s: Optional[float]) -> Optional[int]:
     if timeout_s is None:
         return None
