@@ -24,16 +24,15 @@ import pytest
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests,
-    ConnectorStateOnly,
-    ConnectorWorkerMetadata,
-    KvCacheConnectorManager,
-    KvCacheConnectorSchedulerOutputManager,
-    KvCacheConnectorWorker,
-)
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+    AsyncRequests, ConnectorStateOnly, ConnectorWorkerMetadata,
+    KvCacheConnectorManager, KvCacheConnectorSchedulerOutputManager,
+    KvCacheConnectorWorker)
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState,
+                                                        SamplingConfig)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
+                                                             KVCacheManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
