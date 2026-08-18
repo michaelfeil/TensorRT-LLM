@@ -1732,33 +1732,36 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     f"{update}: {leader_descriptors}"
                 )
 
-            local_descriptors = self._persistence_lease_descriptors(
-                self._pending_persistence_leases
-            )
-            rank_descriptors = mpi_allgather(local_descriptors)
-            if leader_descriptors is None:
-                if any(rank_descriptors):
+            if self._uses_secondary_persistence_staging:
+                local_descriptors = self._persistence_lease_descriptors(
+                    self._pending_persistence_leases
+                )
+                rank_descriptors = mpi_allgather(local_descriptors)
+                if leader_descriptors is None:
+                    if any(rank_descriptors):
+                        leader_descriptors, persistence_keys = (
+                            self._converge_persistence_lease_prefix(
+                                rank_descriptors,
+                                [],
+                                [],
+                            )
+                        )
+                    self._resolved_persistence_keys = None
+                elif persistence_keys is None:
+                    # Identity resolution failed on the leader, so nothing in this
+                    # batch is publishable. Every rank drops its complete local
+                    # batch after the shared D2H safety barrier. C++ canonicalizes
+                    # free secondary-slot order after the rank-local releases.
+                    if drop_persistence_reason is None:
+                        raise RuntimeError("Unpublishable persistence batch has no failure reason")
+                    self._resolved_persistence_keys = None
+                    self._drop_pending_persistence_reason = drop_persistence_reason
+                else:
                     leader_descriptors, persistence_keys = self._converge_persistence_lease_prefix(
                         rank_descriptors,
-                        [],
-                        [],
+                        leader_descriptors,
+                        persistence_keys,
                     )
-                self._resolved_persistence_keys = None
-            elif persistence_keys is None:
-                # Identity resolution failed on the leader, so nothing in this
-                # batch is publishable. Every rank drops its complete local
-                # batch after the shared D2H safety barrier. C++ canonicalizes
-                # free secondary-slot order after the rank-local releases.
-                if drop_persistence_reason is None:
-                    raise RuntimeError("Unpublishable persistence batch has no failure reason")
-                self._resolved_persistence_keys = None
-                self._drop_pending_persistence_reason = drop_persistence_reason
-            else:
-                leader_descriptors, persistence_keys = self._converge_persistence_lease_prefix(
-                    rank_descriptors,
-                    leader_descriptors,
-                    persistence_keys,
-                )
             if isinstance(update, ConnectorWorkerMetadata):
                 metadata = update.metadata
                 worker_metadata_available = True
@@ -1787,7 +1790,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def start_worker_batch(self, scheduled_requests: ScheduledRequests) -> bool:
         """Run metadata-driven worker hooks for the next forward pass."""
-        if self._sparse_metadata_updates_enabled and not self._worker_batch_hooks_pending:
+        if not self._worker_batch_hooks_pending:
             self._worker_batch_hooks_active = False
             return False
 

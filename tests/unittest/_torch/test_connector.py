@@ -756,6 +756,65 @@ def test_persistence_staging_snapshots_keys_before_metadata_build():
     allgather.assert_called_once_with(descriptors)
 
 
+def test_connector_without_persistence_staging_skips_lease_allgather():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = False
+    scheduler = MagicMock()
+    scheduler.build_connector_meta.return_value = b"metadata"
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    manager._scheduler_output = "scheduler-output"
+    manager._metadata_pending = True
+
+    with patch.object(
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
+    ), patch.object(kv_cache_connector, "mpi_allgather") as allgather:
+        manager.handle_metadata()
+
+    allgather.assert_not_called()
+    worker.bind_connector_meta.assert_called_once_with(b"metadata")
+
+
+def test_rank_local_metadata_skip_does_not_reuse_worker_hooks():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    worker.supports_rank_local_metadata_skip.return_value = True
+    worker.supports_sparse_metadata_updates.return_value = False
+    worker.uses_secondary_kv_pool_as_persistence_staging.return_value = False
+    scheduler = MagicMock()
+    scheduler.build_connector_meta.return_value = b"first-metadata"
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+    scheduled_batch = ScheduledRequests()
+    manager._scheduler_output = "first-output"
+    manager._metadata_pending = True
+
+    with patch.object(
+            kv_cache_connector,
+            "mpi_broadcast",
+            side_effect=lambda value, root: value,
+    ), patch.object(kv_cache_connector.torch.cuda,
+                    "current_stream") as current_stream:
+        manager.handle_metadata()
+        assert manager.start_worker_batch(scheduled_batch)
+
+    current_stream.assert_called_once()
+    worker.start_load_kv.assert_called_once()
+    worker.start_load_kv.reset_mock()
+    manager._scheduler_output = "state-only-output"
+    manager._metadata_pending = True
+    manager._skip_metadata_exchange = True
+
+    manager.handle_metadata()
+    with patch.object(kv_cache_connector.torch.cuda,
+                      "current_stream") as current_stream:
+        assert not manager.start_worker_batch(scheduled_batch)
+
+    scheduler.advance_without_worker_metadata.assert_called_once_with(
+        "state-only-output")
+    current_stream.assert_not_called()
+    worker.start_load_kv.assert_not_called()
+
+
 def test_state_only_connector_update_skips_worker_bind_and_hooks():
     worker = MagicMock(spec=KvCacheConnectorWorker)
     worker.supports_rank_local_metadata_skip.return_value = True
