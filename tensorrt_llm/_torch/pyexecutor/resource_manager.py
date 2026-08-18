@@ -1065,6 +1065,13 @@ class KVCacheManager(BaseResourceManager):
         if self.kv_cache_type == CacheTypeCpp.CROSS:
             return self._prepare_cross_resources(scheduled_batch)
 
+        # Context admission is rank-consistent and can evict enough primary
+        # blocks to exhaust staging. Pure decode must not add a collective.
+        if (self.kv_connector_manager is not None
+                and scheduled_batch.context_requests):
+            self.kv_connector_manager.synchronize_terminal_persistence_leases_before_allocation(
+            )
+
         is_star_cp = ('cp_type' in self.mapping.cp_config
                       and CpType.STAR == self.mapping.cp_config['cp_type'])
         with request_context(self.is_draft, scheduled_batch):

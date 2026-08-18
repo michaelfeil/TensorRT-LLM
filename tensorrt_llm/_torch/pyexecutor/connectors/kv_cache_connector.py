@@ -899,6 +899,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._persistence_resolution_error: Optional[Tuple[str, str]] = None
         self._outstanding_persistence_lease_ids: Set[int] = set()
         self._outstanding_persistence_lease_logical_descriptors: Dict[int, Tuple[int, int]] = {}
+        self._rank_converged_outstanding_persistence_lease_count = 0
         self._pending_terminal_persistence_lease_ids: List[int] = []
         self._kv_cache_manager: Optional["KVCacheManager"] = None
         if self._uses_secondary_persistence_staging:
@@ -1003,6 +1004,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 "Submitted persistence lease IDs do not match the pending batch: "
                 f"submitted={lease_ids}, pending={pending_lease_ids}"
             )
+        self._rank_converged_outstanding_persistence_lease_count += len(lease_ids)
         self._pending_persistence_leases = []
         self._resolved_persistence_keys = None
         self._persistence_resolution_error = None
@@ -1177,14 +1179,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return leader_prefix, self._resolved_persistence_keys
 
     def reap_completed_persistence_leases(self) -> None:
-        """Stage terminal leases for release at a replicated metadata boundary.
+        """Stage terminal leases for release before the next KV allocation.
 
         Persistence publication finishes on background threads, so its result
         becomes visible at slightly different wall-clock times on each TP rank.
         Releasing here would let one rank recycle a global secondary slot before
         its peers and break the single-owner replicated host topology.  The next
-        non-skipped metadata exchange converges the logical terminal prefix and
-        releases every rank's local lease handles together.
+        allocation boundary converges the logical terminal prefix and releases
+        every rank's local lease handles together.
         """
         if not self._outstanding_persistence_lease_ids:
             return
@@ -1210,6 +1212,33 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 f"{sorted(duplicate_terminal)}"
             )
         self._pending_terminal_persistence_lease_ids.extend(terminal_ids)
+
+    def synchronize_terminal_persistence_leases_before_allocation(self) -> None:
+        """Recycle terminal staging slots at the next allocation boundary."""
+        outstanding_count = self._rank_converged_outstanding_persistence_lease_count
+        if outstanding_count == 0:
+            return
+        if self._pending_persistence_leases or self._persistence_tail_discard_pending:
+            raise RuntimeError(
+                "Terminal persistence convergence reached allocation with an "
+                "unsubmitted persistence batch"
+            )
+        local_descriptors = self._pending_terminal_persistence_logical_descriptors()
+        if len(local_descriptors) > outstanding_count:
+            raise RuntimeError(
+                "Terminal persistence descriptors exceed the rank-converged "
+                f"outstanding lease count: terminal={len(local_descriptors)}, "
+                f"outstanding={outstanding_count}"
+            )
+        rank_logical_descriptors = mpi_allgather(local_descriptors)
+        if any(len(descriptors) > outstanding_count for descriptors in rank_logical_descriptors):
+            raise RuntimeError(
+                "A rank reported more terminal persistence descriptors than "
+                f"the rank-converged outstanding lease count: ranks="
+                f"{[len(descriptors) for descriptors in rank_logical_descriptors]}, "
+                f"outstanding={outstanding_count}"
+            )
+        self._release_converged_terminal_persistence_prefix(rank_logical_descriptors)
 
     def _pending_terminal_persistence_logical_descriptors(
         self,
@@ -1245,6 +1274,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         for lease_id in local_terminal_ids:
             del self._outstanding_persistence_lease_logical_descriptors[lease_id]
         del self._pending_terminal_persistence_lease_ids[:common_count]
+        self._rank_converged_outstanding_persistence_lease_count -= common_count
 
     def shutdown(self) -> None:
         if self._is_shutdown:
@@ -1705,14 +1735,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             local_descriptors = self._persistence_lease_descriptors(
                 self._pending_persistence_leases
             )
-            local_terminal_logical_descriptors = (
-                self._pending_terminal_persistence_logical_descriptors()
-            )
-            rank_persistence_state = mpi_allgather(
-                (local_descriptors, local_terminal_logical_descriptors)
-            )
-            rank_descriptors = [state[0] for state in rank_persistence_state]
-            rank_terminal_logical_descriptors = [state[1] for state in rank_persistence_state]
+            rank_descriptors = mpi_allgather(local_descriptors)
             if leader_descriptors is None:
                 if any(rank_descriptors):
                     leader_descriptors, persistence_keys = self._converge_persistence_lease_prefix(
@@ -1736,8 +1759,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     leader_descriptors,
                     persistence_keys,
                 )
-            self._release_converged_terminal_persistence_prefix(rank_terminal_logical_descriptors)
-
             if isinstance(update, ConnectorWorkerMetadata):
                 metadata = update.metadata
                 worker_metadata_available = True
