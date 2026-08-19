@@ -16,7 +16,6 @@
 import asyncio
 import json
 import threading
-import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
@@ -87,18 +86,18 @@ def test_proxy_starts_dispatch_result_thread_once_under_concurrent_submit():
     proxy._handle_background_error = MagicMock()
     proxy.garbage_collection_gen0_threshold = 0
     dispatch_thread = MagicMock()
+    submit_barrier = threading.Barrier(16)
 
-    def create_dispatch_thread(*args, **kwargs):
-        del args, kwargs
-        time.sleep(0.01)
-        return dispatch_thread
+    def start_dispatch_thread(_):
+        submit_barrier.wait()
+        proxy._start_dispatch_threads()
 
     with patch(
         "tensorrt_llm.executor.proxy.ManagedThread",
-        side_effect=create_dispatch_thread,
+        return_value=dispatch_thread,
     ) as managed_thread:
         with ThreadPoolExecutor(max_workers=16) as executor:
-            list(executor.map(lambda _: proxy._start_dispatch_threads(), range(32)))
+            list(executor.map(start_dispatch_thread, range(32)))
 
     managed_thread.assert_called_once()
     dispatch_thread.start.assert_called_once()
