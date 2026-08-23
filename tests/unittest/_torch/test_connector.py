@@ -254,6 +254,72 @@ def test_connector_manager_does_not_enter_payload_collective_on_stream_failure(
     worker.finalize_finished_loads.assert_not_called()
 
 
+def test_connector_manager_bounds_oscillating_finalization_skew():
+    """Alternating skew kinds must not restart the convergence deadline."""
+    worker = MagicMock()
+    worker.requires_load_finalization = True
+    worker.get_finished.return_value = ([], [])
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    manager.new_async_requests.loading[42] = MagicMock(request_id=42)
+
+    ready_not_intersected = [([], [42], (42, "ready")), ([], [], (42, "ready"))]
+    mixed_presence = [([], [], (42, "ready")), ([], [], None)]
+    order_divergence = [([], [], (42, "ready")), ([], [], (43, "ready"))]
+    timeout = KvCacheConnectorManager._FINALIZATION_SKEW_TIMEOUT_S
+
+    allgather_path = ("tensorrt_llm._torch.pyexecutor.connectors."
+                      "kv_cache_connector.mpi_allgather")
+    time_path = ("tensorrt_llm._torch.pyexecutor.connectors."
+                 "kv_cache_connector.time.monotonic")
+    with patch(time_path) as monotonic:
+        monotonic.return_value = 0.0
+        with patch(allgather_path, return_value=ready_not_intersected):
+            manager.get_finished()
+        monotonic.return_value = timeout * 0.5
+        with patch(allgather_path, return_value=mixed_presence):
+            manager.get_finished()
+        monotonic.return_value = timeout * 0.9
+        with patch(allgather_path, return_value=order_divergence):
+            manager.get_finished()
+        monotonic.return_value = timeout + 1.0
+        with (
+                patch(allgather_path, return_value=mixed_presence),
+                pytest.raises(RuntimeError, match="did not converge"),
+        ):
+            manager.get_finished()
+    worker.finalize_finished_loads.assert_not_called()
+
+
+def test_connector_manager_drops_unknown_ids_without_stranding_loads():
+    """An ID reported while no longer pending is dropped loudly, and later
+    loads still reach finalization (a stranded armed/pending request would
+    deadlock the replica)."""
+    worker = MagicMock()
+    worker.requires_load_finalization = True
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    manager.new_async_requests.loading[42] = MagicMock(request_id=42)
+
+    allgather_path = ("tensorrt_llm._torch.pyexecutor.connectors."
+                      "kv_cache_connector.mpi_allgather")
+
+    # The connector reports an ID that was never started here: it must be
+    # dropped without crashing the poll.
+    worker.get_finished.return_value = ([], [99])
+    with patch(allgather_path, return_value=[([], [], None), ([], [], None)]):
+        assert manager.get_finished() == []
+
+    # The legitimate load still converges and finalizes.
+    worker.get_finished.return_value = ([], [42])
+    ready_everywhere = [([], [42], (42, "ready")), ([], [42], (42, "ready"))]
+    with patch(allgather_path, return_value=ready_everywhere):
+        assert manager.get_finished() == []
+    stream = MagicMock()
+    with patch(allgather_path, return_value=[None, None]):
+        manager.finalize_armed_loads(stream)
+    worker.finalize_finished_loads.assert_called_once_with([42], stream)
+    assert manager._armed_load_finalizations == {}
+
+
 def test_connector_manager_get_finished_skips_empty_poll():
     worker = MagicMock()
     manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
