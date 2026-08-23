@@ -2026,8 +2026,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         now = time.monotonic()
         since = self._finalization_skew_since.get(key)
         if since is None:
+            # Inherit the earliest outstanding timestamp so skew that
+            # oscillates between kinds (presence/order/intersect) cannot
+            # restart the clock and evade the global deadline.
+            since = min(self._finalization_skew_since.values(), default=now)
             self._finalization_skew_since.clear()
-            self._finalization_skew_since[key] = now
+            self._finalization_skew_since[key] = since
             logger.warning(
                 f"[rank {mpi_rank()}] KV connector finalization skew began for {key}: "
                 f"statuses={statuses} "
@@ -2036,7 +2040,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 f"new_loading={sorted(self.new_async_requests.loading)} "
                 f"armed={dict(self._armed_load_finalizations)}"
             )
-            return
         if now - since > self._FINALIZATION_SKEW_TIMEOUT_S:
             raise RuntimeError(
                 "KV connector load-finalization consensus did not converge for "
