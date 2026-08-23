@@ -1913,7 +1913,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # A connector report for an ID no longer pending is a contract
         # violation; surface it loudly but do not crash the event loop.
         unknown_saving = [i for i in finished_saving if i not in self.pending_async_requests.saving]
-        unknown_loading = [i for i in finished_loading if i not in self.pending_async_requests.loading]
+        unknown_loading = [
+            i for i in finished_loading if i not in self.pending_async_requests.loading
+        ]
         if unknown_saving or unknown_loading:
             logger.warning(
                 f"[rank {mpi_rank()}] KV connector reported IDs that are not pending: "
@@ -1974,7 +1976,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     elif all(state == "ready" for state in preparation_states):
                         if request_id in intersect_finished_loading:
                             if self._finalization_skew_since:
-                                skew_key, skew_since = next(iter(self._finalization_skew_since.items()))
+                                skew_key, skew_since = next(
+                                    iter(self._finalization_skew_since.items())
+                                )
                                 logger.warning(
                                     f"[rank {mpi_rank()}] KV connector finalization skew converged "
                                     f"for {skew_key} after {time.monotonic() - skew_since:.3f}s; "
