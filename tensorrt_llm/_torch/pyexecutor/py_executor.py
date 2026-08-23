@@ -2635,6 +2635,10 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.finalize_armed_loads(
+                        self.execution_stream)
+
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests_after_transfer_cleanup(
                 )
@@ -3222,6 +3226,9 @@ class PyExecutor:
             self.kv_cache_manager.prefetch_for_context_tokens(candidates)
 
     def _prepare_and_schedule_batch(self):
+        if self.kv_connector_manager:
+            self.kv_connector_manager.finalize_armed_loads(
+                self.execution_stream)
         if not self._request_observer_initialized:
             self._request_observer_initialized = True
             self.request_observer = maybe_create_b10_pyexecutor_observer(

@@ -118,6 +118,8 @@ ConnectorUpdate = ConnectorStateOnly | ConnectorWorkerMetadata
 
 
 class KvCacheConnectorWorker(ABC):
+    requires_load_finalization: bool = False
+
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
         self._metadata = None
@@ -323,6 +325,27 @@ class KvCacheConnectorWorker(ABC):
         will only take action based on these returned IDs once they've
         been returned by ALL workers. This allows some workers to take
         longer than others to complete the operations.
+        """
+
+    def get_load_finalization_status(self) -> Optional[Tuple[int, str]]:
+        """Return local readiness for a load requiring TP-wide finalization.
+
+        Most connectors complete their payload transfer before returning an ID
+        from :meth:`get_finished` and therefore return ``None``. A connector
+        with an asynchronous preparation phase may return ``(request_id,
+        status)`` for its deterministic queue head, where status is one of
+        ``pending``, ``ready``, or ``failed``. The manager combines this value
+        across TP ranks before invoking :meth:`finalize_finished_loads`.
+        """
+        return None
+
+    def finalize_finished_loads(self, request_ids: List[int], stream: torch.cuda.Stream) -> None:
+        """Synchronously finalize globally-ready loads before rescheduling.
+
+        This hook runs with the same ordered request IDs on every TP rank after
+        host-side consensus and before the requests return to ``CONTEXT_INIT``.
+        Connectors may fence ``stream`` and launch required payload collectives
+        here. The default is a no-op for already-complete loads.
         """
 
 
@@ -875,6 +898,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         # Requests that have finished loading asynchronously.
         self.finished_async_loading_requests = dict()
+
+        # TP consensus arms these loads at the post-forward completion poll.
+        # Payload collectives are deferred to the next executor-iteration
+        # boundary, where the previous TRT execution stream can be quiesced.
+        self._armed_load_finalizations: Dict[int, bool] = {}
 
         self._scheduler_output = None
         self._metadata_pending = False
@@ -1889,11 +1917,51 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         finished_saving = list(self.local_finished_async_requests.saving_ids)
         finished_loading = list(self.local_finished_async_requests.loading_ids)
 
-        all_results = mpi_allgather((finished_saving, finished_loading))
+        local_finalization_status = (
+            self.worker.get_load_finalization_status()
+            if self.worker.requires_load_finalization is True
+            else None
+        )
+        all_results = mpi_allgather((finished_saving, finished_loading, local_finalization_status))
 
         # Find only the requests that have been reported complete by all workers.
         intersect_finished_saving = set.intersection(*[set(res[0]) for res in all_results])
         intersect_finished_loading = set.intersection(*[set(res[1]) for res in all_results])
+
+        finalization_statuses = [result[2] for result in all_results]
+        if any(status is not None for status in finalization_statuses):
+            if any(status is None for status in finalization_statuses):
+                raise RuntimeError(
+                    "KV connector load-finalization queues diverged across TP ranks: "
+                    f"{finalization_statuses}"
+                )
+            request_ids = {status[0] for status in finalization_statuses}
+            if len(request_ids) != 1:
+                raise RuntimeError(
+                    "KV connector load-finalization request order diverged across TP ranks: "
+                    f"{finalization_statuses}"
+                )
+            request_id = next(iter(request_ids))
+            preparation_states = [status[1] for status in finalization_statuses]
+            unknown_states = set(preparation_states) - {"pending", "ready", "failed"}
+            if unknown_states:
+                raise RuntimeError(
+                    "KV connector returned invalid load-finalization states: "
+                    f"{sorted(unknown_states)}"
+                )
+            if "failed" in preparation_states:
+                self._armed_load_finalizations[request_id] = True
+            if all(state == "ready" for state in preparation_states):
+                if request_id not in intersect_finished_loading:
+                    raise RuntimeError(
+                        "KV connector reported globally-ready finalization before every "
+                        f"rank returned request {request_id} as locally finished"
+                    )
+                self._armed_load_finalizations[request_id] = False
+
+        # Keep an armed load out of CONTEXT_INIT until its payload collective
+        # has completed at the next executor-iteration boundary.
+        intersect_finished_loading -= set(self._armed_load_finalizations)
 
         # Remove these requests from our list of locally finished requests.
         all_finished = self.local_finished_async_requests.extract_by_id(
@@ -1916,6 +1984,44 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.
         return list(all_finished.saving.values())
+
+    def finalize_armed_loads(self, stream: torch.cuda.Stream) -> None:
+        """Finalize TP-consensed loads before scheduling the next forward."""
+        if not self._armed_load_finalizations:
+            return
+
+        request_ids = sorted(self._armed_load_finalizations)
+        failed_request_ids = [
+            request_id for request_id in request_ids if self._armed_load_finalizations[request_id]
+        ]
+        stream_sync_error = None
+        try:
+            stream.synchronize()
+        except RuntimeError as error:
+            stream_sync_error = repr(error)
+        stream_sync_errors = mpi_allgather(stream_sync_error)
+        if any(error is not None for error in stream_sync_errors):
+            raise RuntimeError(
+                "KV connector could not quiesce the prior TRT iteration on every TP rank: "
+                f"{stream_sync_errors}"
+            )
+
+        self.worker.finalize_finished_loads(request_ids, stream)
+        if failed_request_ids:
+            raise RuntimeError(
+                f"KV connector load preparation failed for requests {failed_request_ids}"
+            )
+
+        finalized = self.local_finished_async_requests.extract_by_id(set(), set(request_ids))
+        if set(finalized.loading) != set(request_ids):
+            raise RuntimeError(
+                "KV connector finalized loads missing from the local completion set: "
+                f"expected={request_ids}, actual={sorted(finalized.loading)}"
+            )
+        for request_id, req in finalized.loading.items():
+            req.state = LlmRequestState.CONTEXT_INIT
+            self.finished_async_loading_requests[request_id] = req
+        self._armed_load_finalizations.clear()
 
     def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]):
         self._generation_progress_fast_path_armed = False

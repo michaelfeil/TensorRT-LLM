@@ -175,6 +175,85 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
     run_across_mpi(mpi_pool_executor, test, 2)
 
 
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_connector_manager_finalizes_load_only_after_all_ranks_ready(
+        mpi_pool_executor):
+
+    def test():
+        worker = MagicMock()
+        worker.requires_load_finalization = True
+        scheduler = MagicMock() if mpi_rank() == 0 else None
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+        req = MagicMock(request_id=42)
+        manager.new_async_requests.loading[42] = req
+
+        worker.get_finished.return_value = (([], [42]) if mpi_rank() == 0 else
+                                            ([], []))
+        worker.get_load_finalization_status.return_value = (
+            42, "ready" if mpi_rank() == 0 else "pending")
+        with patch("torch.cuda.current_stream") as current_stream:
+            assert manager.get_finished() == []
+            worker.finalize_finished_loads.assert_not_called()
+            current_stream.assert_not_called()
+        assert req.state != LlmRequestState.CONTEXT_INIT
+
+        worker.get_finished.return_value = (([], []) if mpi_rank() == 0 else
+                                            ([], [42]))
+        worker.get_load_finalization_status.return_value = (42, "ready")
+        stream = MagicMock()
+        assert manager.get_finished() == []
+        worker.finalize_finished_loads.assert_not_called()
+        assert req.state != LlmRequestState.CONTEXT_INIT
+        manager.finalize_armed_loads(stream)
+        worker.finalize_finished_loads.assert_called_once_with([42], stream)
+        assert req.state == LlmRequestState.CONTEXT_INIT
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_connector_manager_enters_symmetric_finalization_on_peer_failure():
+    worker = MagicMock()
+    worker.requires_load_finalization = True
+    worker.get_finished.return_value = ([], [])
+    worker.get_load_finalization_status.return_value = (42, "pending")
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    manager.new_async_requests.loading[42] = MagicMock(request_id=42)
+    stream = MagicMock()
+
+    results = [([], [], (42, "pending")), ([], [], (42, "failed"))]
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.connectors."
+            "kv_cache_connector.mpi_allgather",
+            return_value=results):
+        manager.get_finished()
+
+    worker.finalize_finished_loads.assert_not_called()
+    with pytest.raises(RuntimeError, match="load preparation failed"):
+        manager.finalize_armed_loads(stream)
+    worker.finalize_finished_loads.assert_called_once_with([42], stream)
+
+
+def test_connector_manager_does_not_enter_payload_collective_on_stream_failure(
+):
+    worker = MagicMock()
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    manager._armed_load_finalizations[42] = False
+    stream = MagicMock()
+    stream.synchronize.side_effect = RuntimeError("prior forward failed")
+
+    with (
+            patch(
+                "tensorrt_llm._torch.pyexecutor.connectors."
+                "kv_cache_connector.mpi_allgather",
+                return_value=["prior forward failed", None]),
+            pytest.raises(RuntimeError, match="could not quiesce"),
+    ):
+        manager.finalize_armed_loads(stream)
+
+    worker.finalize_finished_loads.assert_not_called()
+
+
 def test_connector_manager_get_finished_skips_empty_poll():
     worker = MagicMock()
     manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
