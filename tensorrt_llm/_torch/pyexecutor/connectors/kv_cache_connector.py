@@ -34,6 +34,7 @@ The Connector API is split into two parts:
 To implement a custom KV connector, you need to implement both the scheduler and worker-side interfaces.
 """
 
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -903,6 +904,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Payload collectives are deferred to the next executor-iteration
         # boundary, where the previous TRT execution stream can be quiesced.
         self._armed_load_finalizations: Dict[int, bool] = {}
+        # Transient TP skew on finalization consensus, keyed by (kind, id).
+        # Cleared whenever consensus converges; bounded by the timeout below.
+        self._finalization_skew_since: Dict[Tuple[str, int], float] = {}
 
         self._scheduler_output = None
         self._metadata_pending = False
@@ -1906,6 +1910,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
 
         # Remove the requests from our pending list that have finished locally.
+        # A connector report for an ID no longer pending is a contract
+        # violation; surface it loudly but do not crash the event loop.
+        unknown_saving = [i for i in finished_saving if i not in self.pending_async_requests.saving]
+        unknown_loading = [i for i in finished_loading if i not in self.pending_async_requests.loading]
+        if unknown_saving or unknown_loading:
+            logger.warning(
+                f"[rank {mpi_rank()}] KV connector reported IDs that are not pending: "
+                f"saving={unknown_saving} loading={unknown_loading} "
+                f"pending_saving={sorted(self.pending_async_requests.saving)} "
+                f"pending_loading={sorted(self.pending_async_requests.loading)} "
+                f"local_loading={sorted(self.local_finished_async_requests.loading)}"
+            )
+            finished_saving = [i for i in finished_saving if i not in unknown_saving]
+            finished_loading = [i for i in finished_loading if i not in unknown_loading]
         new_local_finished_async_requests = self.pending_async_requests.extract_by_id(
             finished_saving, finished_loading
         )
@@ -1929,35 +1947,49 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         intersect_finished_loading = set.intersection(*[set(res[1]) for res in all_results])
 
         finalization_statuses = [result[2] for result in all_results]
+        finalization_skew_key = None
         if any(status is not None for status in finalization_statuses):
             if any(status is None for status in finalization_statuses):
-                raise RuntimeError(
-                    "KV connector load-finalization queues diverged across TP ranks: "
-                    f"{finalization_statuses}"
-                )
-            request_ids = {status[0] for status in finalization_statuses}
-            if len(request_ids) != 1:
-                raise RuntimeError(
-                    "KV connector load-finalization request order diverged across TP ranks: "
-                    f"{finalization_statuses}"
-                )
-            request_id = next(iter(request_ids))
-            preparation_states = [status[1] for status in finalization_statuses]
-            unknown_states = set(preparation_states) - {"pending", "ready", "failed"}
-            if unknown_states:
-                raise RuntimeError(
-                    "KV connector returned invalid load-finalization states: "
-                    f"{sorted(unknown_states)}"
-                )
-            if "failed" in preparation_states:
-                self._armed_load_finalizations[request_id] = True
-            if all(state == "ready" for state in preparation_states):
-                if request_id not in intersect_finished_loading:
-                    raise RuntimeError(
-                        "KV connector reported globally-ready finalization before every "
-                        f"rank returned request {request_id} as locally finished"
-                    )
-                self._armed_load_finalizations[request_id] = False
+                # Normal scheduling skew: a rank can observe the wire-ordered
+                # queue head before every rank has locally announced the load.
+                # Wait for convergence; genuine divergence trips the bounded
+                # timeout below.
+                known_ids = sorted(s[0] for s in finalization_statuses if s is not None)
+                finalization_skew_key = ("presence", known_ids[0])
+            else:
+                request_ids = {status[0] for status in finalization_statuses}
+                if len(request_ids) != 1:
+                    finalization_skew_key = ("order", min(request_ids))
+                else:
+                    request_id = next(iter(request_ids))
+                    preparation_states = [status[1] for status in finalization_statuses]
+                    unknown_states = set(preparation_states) - {"pending", "ready", "failed"}
+                    if unknown_states:
+                        raise RuntimeError(
+                            "KV connector returned invalid load-finalization states: "
+                            f"{sorted(unknown_states)}"
+                        )
+                    if "failed" in preparation_states:
+                        self._armed_load_finalizations[request_id] = True
+                    elif all(state == "ready" for state in preparation_states):
+                        if request_id in intersect_finished_loading:
+                            if self._finalization_skew_since:
+                                skew_key, skew_since = next(iter(self._finalization_skew_since.items()))
+                                logger.warning(
+                                    f"[rank {mpi_rank()}] KV connector finalization skew converged "
+                                    f"for {skew_key} after {time.monotonic() - skew_since:.3f}s; "
+                                    f"arming request {request_id}"
+                                )
+                            self._armed_load_finalizations[request_id] = False
+                        else:
+                            # Every rank prepared the payload but at least one
+                            # manager has not yet accepted the load locally;
+                            # the connector re-reports until it converges.
+                            finalization_skew_key = ("intersect", request_id)
+        if finalization_skew_key is None:
+            self._finalization_skew_since.clear()
+        else:
+            self._note_finalization_skew(finalization_skew_key, finalization_statuses)
 
         # Keep an armed load out of CONTEXT_INIT until its payload collective
         # has completed at the next executor-iteration boundary.
@@ -1984,6 +2016,32 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.
         return list(all_finished.saving.values())
+
+    # A load that stays skewed this long is treated as true divergence and the
+    # worker fail-stops. All ranks act on the same allgathered inputs, so any
+    # rank that raises brings the replica down before NCCL can wedge.
+    _FINALIZATION_SKEW_TIMEOUT_S = 120.0
+
+    def _note_finalization_skew(self, key, statuses) -> None:
+        now = time.monotonic()
+        since = self._finalization_skew_since.get(key)
+        if since is None:
+            self._finalization_skew_since.clear()
+            self._finalization_skew_since[key] = now
+            logger.warning(
+                f"[rank {mpi_rank()}] KV connector finalization skew began for {key}: "
+                f"statuses={statuses} "
+                f"local_loading={sorted(self.local_finished_async_requests.loading)} "
+                f"pending_loading={sorted(self.pending_async_requests.loading)} "
+                f"new_loading={sorted(self.new_async_requests.loading)} "
+                f"armed={dict(self._armed_load_finalizations)}"
+            )
+            return
+        if now - since > self._FINALIZATION_SKEW_TIMEOUT_S:
+            raise RuntimeError(
+                "KV connector load-finalization consensus did not converge for "
+                f"{key} within {self._FINALIZATION_SKEW_TIMEOUT_S:.0f}s: {statuses}"
+            )
 
     def finalize_armed_loads(self, stream: torch.cuda.Stream) -> None:
         """Finalize TP-consensed loads before scheduling the next forward."""
