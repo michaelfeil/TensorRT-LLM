@@ -1987,16 +1987,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                             "KV connector returned invalid load-finalization states: "
                             f"{sorted(unknown_states)}"
                         )
+                    sequence_ids = {status[2] for status in finalization_statuses}
+                    plan_fingerprints = {status[3] for status in finalization_statuses}
+                    if len(sequence_ids) != 1 or len(plan_fingerprints) != 1:
+                        raise RuntimeError(
+                            "KV connector ranks reached different load plans: "
+                            f"{finalization_statuses}"
+                        )
                     if "failed" in preparation_states:
                         self._armed_load_finalizations[request_id] = True
                     elif all(state == "ready" for state in preparation_states):
-                        sequence_ids = {status[2] for status in finalization_statuses}
-                        plan_fingerprints = {status[3] for status in finalization_statuses}
-                        if len(sequence_ids) != 1 or len(plan_fingerprints) != 1:
-                            raise RuntimeError(
-                                "KV connector ranks reached different ready load plans: "
-                                f"{finalization_statuses}"
-                            )
                         if request_id in intersect_finished_loading:
                             if self._finalization_skew_since:
                                 skew_key, skew_since = next(
