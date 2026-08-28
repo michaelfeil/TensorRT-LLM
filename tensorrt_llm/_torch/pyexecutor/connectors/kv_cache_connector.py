@@ -1987,32 +1987,42 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                             "KV connector returned invalid load-finalization states: "
                             f"{sorted(unknown_states)}"
                         )
-                    sequence_ids = {status[2] for status in finalization_statuses}
-                    plan_fingerprints = {status[3] for status in finalization_statuses}
-                    if len(sequence_ids) != 1 or len(plan_fingerprints) != 1:
-                        raise RuntimeError(
-                            "KV connector ranks reached different load plans: "
-                            f"{finalization_statuses}"
-                        )
-                    if "failed" in preparation_states:
-                        self._armed_load_finalizations[request_id] = True
-                    elif all(state == "ready" for state in preparation_states):
-                        if request_id in intersect_finished_loading:
-                            if self._finalization_skew_since:
-                                skew_key, skew_since = next(
-                                    iter(self._finalization_skew_since.items())
-                                )
-                                logger.warning(
-                                    f"[rank {mpi_rank()}] KV connector finalization skew converged "
-                                    f"for {skew_key} after {time.monotonic() - skew_since:.3f}s; "
-                                    f"arming request {request_id}"
-                                )
-                            self._armed_load_finalizations[request_id] = False
-                        else:
-                            # Every rank prepared the payload but at least one
-                            # manager has not yet accepted the load locally;
-                            # the connector re-reports until it converges.
-                            finalization_skew_key = ("intersect", request_id)
+                    # A rank that has announced the TRT request but has not yet
+                    # received its wire-ordered transfer plan reports the
+                    # explicit no-plan sentinel (sequence=0, fingerprint=0).
+                    # This is normal bounded delivery skew, especially at
+                    # larger TP sizes. Do not compare or arm a peer failure
+                    # until every rank can identify the plan being finalized.
+                    missing_plans = any(status[3] == 0 for status in finalization_statuses)
+                    if missing_plans:
+                        finalization_skew_key = ("plan", request_id)
+                    else:
+                        sequence_ids = {status[2] for status in finalization_statuses}
+                        plan_fingerprints = {status[3] for status in finalization_statuses}
+                        if len(sequence_ids) != 1 or len(plan_fingerprints) != 1:
+                            raise RuntimeError(
+                                "KV connector ranks reached different load plans: "
+                                f"{finalization_statuses}"
+                            )
+                        if "failed" in preparation_states:
+                            self._armed_load_finalizations[request_id] = True
+                        elif all(state == "ready" for state in preparation_states):
+                            if request_id in intersect_finished_loading:
+                                if self._finalization_skew_since:
+                                    skew_key, skew_since = next(
+                                        iter(self._finalization_skew_since.items())
+                                    )
+                                    logger.warning(
+                                        f"[rank {mpi_rank()}] KV connector finalization skew converged "
+                                        f"for {skew_key} after {time.monotonic() - skew_since:.3f}s; "
+                                        f"arming request {request_id}"
+                                    )
+                                self._armed_load_finalizations[request_id] = False
+                            else:
+                                # Every rank prepared the payload but at least one
+                                # manager has not yet accepted the load locally;
+                                # the connector re-reports until it converges.
+                                finalization_skew_key = ("intersect", request_id)
         if finalization_skew_key is None:
             self._finalization_skew_since.clear()
         else:

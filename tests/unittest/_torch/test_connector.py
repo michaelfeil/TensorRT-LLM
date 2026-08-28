@@ -24,15 +24,16 @@ import pytest
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests, ConnectorStateOnly, ConnectorWorkerMetadata,
-    KvCacheConnectorManager, KvCacheConnectorSchedulerOutputManager,
-    KvCacheConnectorWorker)
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
-                                                        LlmRequestState,
-                                                        SamplingConfig)
+    AsyncRequests,
+    ConnectorStateOnly,
+    ConnectorWorkerMetadata,
+    KvCacheConnectorManager,
+    KvCacheConnectorSchedulerOutputManager,
+    KvCacheConnectorWorker,
+)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
-                                                             KVCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -258,6 +259,29 @@ def test_connector_manager_rejects_divergent_failed_plan_before_arming():
         manager.get_finished()
 
     assert manager._armed_load_finalizations == {}
+    worker.finalize_finished_loads.assert_not_called()
+
+
+def test_connector_manager_tolerates_missing_plan_during_tp_delivery_skew():
+    worker = MagicMock()
+    worker.requires_load_finalization = True
+    worker.get_finished.return_value = ([], [])
+    worker.get_load_finalization_status.return_value = (42, "pending", 0, 0)
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    manager.new_async_requests.loading[42] = MagicMock(request_id=42)
+
+    delivering = [([], [], (42, "pending", 0, 0)),
+                  ([], [], (42, "pending", 7, 0x1234)),
+                  ([], [], (42, "pending", 0, 0)),
+                  ([], [], (42, "pending", 0, 0))]
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.connectors."
+            "kv_cache_connector.mpi_allgather",
+            return_value=delivering):
+        assert manager.get_finished() == []
+
+    assert manager._armed_load_finalizations == {}
+    assert list(manager._finalization_skew_since) == [("plan", 42)]
     worker.finalize_finished_loads.assert_not_called()
 
 
