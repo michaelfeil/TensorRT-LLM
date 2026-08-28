@@ -328,25 +328,35 @@ class KvCacheConnectorWorker(ABC):
         longer than others to complete the operations.
         """
 
-    def get_load_finalization_status(self) -> Optional[Tuple[int, str]]:
+    def mark_store_phase_complete(self, request_ids: List[int]) -> None:
+        """Notify the worker that final Store metadata has been delivered.
+
+        Connectors that dynamically append asynchronous Store operations may
+        use this boundary to avoid acknowledging request completion while a
+        final metadata batch is still in flight.
+        """
+
+    def get_load_finalization_status(self) -> Optional[Tuple[int, str, int, int]]:
         """Return local readiness for a load requiring TP-wide finalization.
 
         Most connectors complete their payload transfer before returning an ID
         from :meth:`get_finished` and therefore return ``None``. A connector
         with an asynchronous preparation phase may return ``(request_id,
-        status)`` for its deterministic queue head, where status is one of
-        ``pending``, ``ready``, or ``failed``. The manager combines this value
-        across TP ranks before invoking :meth:`finalize_finished_loads`.
+        status, sequence_id, plan_fingerprint)`` for its deterministic queue
+        head, where status is one of ``pending``, ``ready``, or ``failed``.
+        The manager validates this value across TP ranks before invoking
+        :meth:`finalize_finished_loads`.
         """
         return None
 
     def finalize_finished_loads(self, request_ids: List[int], stream: torch.cuda.Stream) -> None:
-        """Synchronously finalize globally-ready loads before rescheduling.
+        """Enqueue globally-ready load finalization before rescheduling.
 
         This hook runs with the same ordered request IDs on every TP rank after
         host-side consensus and before the requests return to ``CONTEXT_INIT``.
-        Connectors may fence ``stream`` and launch required payload collectives
-        here. The default is a no-op for already-complete loads.
+        Connectors may enqueue payload collectives on ``stream``; subsequent
+        forward work on the same stream then waits without a CPU fence. The
+        default is a no-op for already-complete loads.
         """
 
 
@@ -1818,6 +1828,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         if worker_metadata_available:
             self.worker.bind_connector_meta(metadata)
+            store_phase_complete_ids = sorted(
+                set(self.new_async_requests.saving_ids)
+                | set(self.pending_async_requests.saving_ids)
+            )
+            if store_phase_complete_ids:
+                self.worker.mark_store_phase_complete(store_phase_complete_ids)
             self._worker_batch_hooks_pending = True
 
     def start_worker_batch(self, scheduled_requests: ScheduledRequests) -> bool:
@@ -1974,6 +1990,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     if "failed" in preparation_states:
                         self._armed_load_finalizations[request_id] = True
                     elif all(state == "ready" for state in preparation_states):
+                        sequence_ids = {status[2] for status in finalization_statuses}
+                        plan_fingerprints = {status[3] for status in finalization_statuses}
+                        if len(sequence_ids) != 1 or len(plan_fingerprints) != 1:
+                            raise RuntimeError(
+                                "KV connector ranks reached different ready load plans: "
+                                f"{finalization_statuses}"
+                            )
                         if request_id in intersect_finished_loading:
                             if self._finalization_skew_since:
                                 skew_key, skew_since = next(
@@ -2059,18 +2082,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         failed_request_ids = [
             request_id for request_id in request_ids if self._armed_load_finalizations[request_id]
         ]
-        stream_sync_error = None
-        try:
-            stream.synchronize()
-        except RuntimeError as error:
-            stream_sync_error = repr(error)
-        stream_sync_errors = mpi_allgather(stream_sync_error)
-        if any(error is not None for error in stream_sync_errors):
-            raise RuntimeError(
-                "KV connector could not quiesce the prior TRT iteration on every TP rank: "
-                f"{stream_sync_errors}"
-            )
-
+        # Finalization runs on the executor thread before the next forward.
+        # The connector enqueues its collective on this execution stream, so
+        # CUDA stream order replaces the former CPU-wide synchronization.
         self.worker.finalize_finished_loads(request_ids, stream)
         if failed_request_ids:
             raise RuntimeError(
