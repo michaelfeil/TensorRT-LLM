@@ -989,6 +989,16 @@ def test_connector_without_persistence_staging_skips_lease_allgather():
     worker.bind_connector_meta.assert_called_once_with(b"metadata")
 
 
+def test_connector_manager_forwards_pending_offloads_on_execution_stream():
+    worker = MagicMock(spec=KvCacheConnectorWorker)
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+    stream = MagicMock(spec=torch.cuda.Stream)
+
+    manager.submit_pending_offloads(stream)
+
+    worker.submit_pending_offloads.assert_called_once_with(stream)
+
+
 def test_worker_store_phase_closes_after_metadata_bind():
     worker = MagicMock(spec=KvCacheConnectorWorker)
     worker.uses_secondary_kv_pool_as_persistence_staging.return_value = False

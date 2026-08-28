@@ -228,6 +228,10 @@ class KvCacheConnectorWorker(ABC):
             "Secondary-pool persistence staging requires pre-forward lease submission"
         )
 
+    def submit_pending_offloads(self, stream: torch.cuda.Stream) -> None:
+        """Submit post-forward Store work before the next forward starts."""
+        return
+
     def request_finished_without_save(self, request_id: int) -> None:
         """Retire rank-local request state without dispatching persistence.
 
@@ -1141,6 +1145,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.worker.submit_pending_persistence_leases(stream)
         if self.has_pending_persistence_leases():
             raise RuntimeError("Persistence staging worker did not drain all pending leases")
+
+    def submit_pending_offloads(self, stream: torch.cuda.Stream) -> None:
+        self.worker.submit_pending_offloads(stream)
 
     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
         """Bind terminal lease completion to the cache manager that owns the slots."""

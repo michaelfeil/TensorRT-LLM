@@ -3639,6 +3639,13 @@ class PyExecutor:
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
+                    # Metadata exchange is collective even when this rank has
+                    # no locally queueable work. Submit Store operations on
+                    # every rank before the rank-local can_queue branch;
+                    # otherwise a transfer can wait forever for the idle
+                    # rank's worker half.
+                    self.kv_connector_manager.submit_pending_offloads(
+                        self.execution_stream)
 
                 if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
@@ -4044,6 +4051,11 @@ class PyExecutor:
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
+                    # Keep TP offload progress outside the rank-local
+                    # can_queue branch. All ranks received the shared Store
+                    # plan and all must submit their worker half.
+                    self.kv_connector_manager.submit_pending_offloads(
+                        self.execution_stream)
 
                 if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
